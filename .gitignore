@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+*.so
+
+# CUDA / CuTeDSL compilation artifacts
+*.cubin
+*.ptx
+*.sass
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude local settings
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# JIT cache
+/tmp/
+
+profile/*
+
+dev_docs/*
+docs/*
