@@ -64,6 +64,7 @@ def bsa_attn_fwd(
     q2k_block_index: torch.Tensor,
     block_sparse_num: int,
     block_sizes: torch.Tensor,
+    q2k_block_nums: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     pack_gqa: Optional[bool] = None,
     return_lse: bool = False,
@@ -79,7 +80,11 @@ def bsa_attn_fwd(
         q2k_block_index: Block sparse index tensor (batch, num_heads, num_q_blocks, max_kv_blocks), int32.
             For each (batch, head, q_block), the first block_sparse_num entries are the KV block indices to attend to.
         block_sparse_num: Number of KV blocks each Q block attends to. Must be even and >= 2.
+            Ignored when q2k_block_nums is provided.
         block_sizes: Actual token count per KV block (num_kv_blocks,), int32. Used for masking padding positions.
+        q2k_block_nums: Per-(batch, head, q_block) number of KV blocks to attend to,
+            (batch, num_heads, num_q_blocks) int32, each value even and >= 2.
+            When None, uses fixed block_sparse_num for all Q blocks.
         softmax_scale: Softmax scale (default: 1/sqrt(head_dim))
         pack_gqa: Whether to pack GQA heads
         return_lse: Whether to return log-sum-exp
@@ -105,14 +110,21 @@ def bsa_attn_fwd(
     assert num_head % num_head_kv == 0
 
     # Block-sparse parameter validation
-    assert block_sparse_num >= 2 and block_sparse_num % 2 == 0, (
-        f"block_sparse_num={block_sparse_num} must be even and >= 2"
-    )
     assert q2k_block_index.dtype == torch.int32, "q2k_block_index must be int32"
     assert block_sizes.dtype == torch.int32, "block_sizes must be int32"
-    assert q2k_block_index.shape[-1] >= block_sparse_num, (
-        f"q2k_block_index last dim ({q2k_block_index.shape[-1]}) must be >= block_sparse_num ({block_sparse_num})"
-    )
+    if q2k_block_nums is not None:
+        q2k_block_nums = maybe_contiguous(q2k_block_nums)
+        assert q2k_block_nums.dtype == torch.int32, "q2k_block_nums must be int32"
+        assert q2k_block_nums.ndim == 3, (
+            f"q2k_block_nums must be 3D (batch, num_heads, num_q_blocks), got {q2k_block_nums.ndim}D"
+        )
+    else:
+        assert block_sparse_num >= 2 and block_sparse_num % 2 == 0, (
+            f"block_sparse_num={block_sparse_num} must be even and >= 2"
+        )
+        assert q2k_block_index.shape[-1] >= block_sparse_num, (
+            f"q2k_block_index last dim ({q2k_block_index.shape[-1]}) must be >= block_sparse_num ({block_sparse_num})"
+        )
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
@@ -159,6 +171,8 @@ def bsa_attn_fwd(
         else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     )
 
+    has_variable_block_nums = q2k_block_nums is not None
+
     compile_key = (
         dtype,
         head_dim,
@@ -172,6 +186,7 @@ def bsa_attn_fwd(
         use_2cta_instrs,
         use_clc_scheduler,
         fa_logging.get_fa_log_level(),
+        has_variable_block_nums,
     )
 
     if compile_key not in bsa_attn_fwd.compile_cache:
@@ -181,6 +196,7 @@ def bsa_attn_fwd(
         lse_tensor = to_cute_tensor(lse, assumed_align=4) if lse is not None else None
         block_index_tensor = to_cute_tensor(q2k_block_index)
         block_sizes_tensor = to_cute_tensor(block_sizes)
+        block_nums_tensor = to_cute_tensor(q2k_block_nums) if has_variable_block_nums else None
 
         fa_fwd = FlashAttentionForwardSm100(
             head_dim,
@@ -205,6 +221,7 @@ def bsa_attn_fwd(
             block_index_tensor,
             block_sizes_tensor,
             block_sparse_num,
+            block_nums_tensor,
             current_stream,
             options="--enable-tvm-ffi",
         )
@@ -221,6 +238,7 @@ def bsa_attn_fwd(
                 q2k_block_index.detach(),
                 block_sizes.detach(),
                 block_sparse_num,
+                q2k_block_nums.detach() if has_variable_block_nums else None,
                 current_stream,
             )
 

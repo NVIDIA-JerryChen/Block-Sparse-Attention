@@ -64,6 +64,10 @@ k = torch.randn(1, 1024, 8, 128, device="cuda", dtype=torch.bfloat16)
 v = torch.randn(1, 1024, 8, 128, device="cuda", dtype=torch.bfloat16)
 
 out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes)
+
+# Variable per-Q-block KV block counts
+out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, 0, block_sizes,
+                         q2k_block_nums=q2k_block_nums)
 ```
 
 ## Data Layout
@@ -73,9 +77,10 @@ out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes)
 | `q` | (batch, seqlen_q, num_heads, head_dim) | bf16/fp16 | Query |
 | `k` | (batch, seqlen_k, num_heads_kv, head_dim) | bf16/fp16 | Key |
 | `v` | (batch, seqlen_k, num_heads_kv, head_dim) | bf16/fp16 | Value |
-| `q2k_block_index` | (batch, num_heads, num_q_blocks, max_kv_blocks) | int32 | Per Q-block KV block indices (first `block_sparse_num` entries valid) |
-| `block_sparse_num` | scalar | int | Number of KV blocks per Q block (even, >= 2) |
+| `q2k_block_index` | (batch, num_heads, num_q_blocks, max_kv_blocks) | int32 | Per Q-block KV block indices |
+| `block_sparse_num` | scalar | int | Number of KV blocks per Q block (even, >= 2). Ignored when `q2k_block_nums` is provided |
 | `block_sizes` | (num_kv_blocks,) | int32 | Actual token count per KV block |
+| `q2k_block_nums` | (batch, num_heads, num_q_blocks) | int32 | Optional. Per-Q-block KV block count (each value even, >= 2). When provided, `block_sparse_num` is ignored |
 
 ## Tests
 

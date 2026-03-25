@@ -241,6 +241,7 @@ class FlashAttentionForwardSm100:
         mBlockIndex: cute.Tensor,  # (batch, heads, num_q_blocks, max_kv_blocks), int32
         mBlockSizes: cute.Tensor,  # (num_kv_blocks,), int32
         block_sparse_num: Int32,   # runtime scalar, even, >= 2
+        mBlockNums: Optional[cute.Tensor],  # (batch, heads, num_q_blocks), int32 or None
         stream: cuda.CUstream,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
@@ -557,6 +558,7 @@ class FlashAttentionForwardSm100:
             mBlockIndex,
             mBlockSizes,
             block_sparse_num,
+            mBlockNums,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -593,6 +595,7 @@ class FlashAttentionForwardSm100:
         mBlockIndex: cute.Tensor,
         mBlockSizes: cute.Tensor,
         block_sparse_num: Int32,
+        mBlockNums: Optional[cute.Tensor],
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -872,6 +875,7 @@ class FlashAttentionForwardSm100:
                 tile_scheduler,
                 mBlockIndex,
                 block_sparse_num,
+                mBlockNums,
             )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -903,6 +907,7 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 tile_scheduler,
                 block_sparse_num,
+                mBlockNums,
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
@@ -956,6 +961,7 @@ class FlashAttentionForwardSm100:
                 mBlockIndex=mBlockIndex,
                 mBlockSizes=mBlockSizes,
                 block_sparse_num=block_sparse_num,
+                mBlockNums=mBlockNums,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -1000,6 +1006,7 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 tile_scheduler,
                 block_sparse_num,
+                mBlockNums,
             )
             tmem_alloc_barrier.arrive()
 
@@ -1070,6 +1077,7 @@ class FlashAttentionForwardSm100:
         tile_scheduler: TileSchedulerProtocol,
         mBlockIndex: cute.Tensor,
         block_sparse_num: Int32,
+        mBlockNums: Optional[cute.Tensor],
     ):
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
         tidx = cute.arch.thread_idx()[0] % num_load_threads
@@ -1139,7 +1147,7 @@ class FlashAttentionForwardSm100:
 
             # n_block(i): maps logical index i to actual KV block index via q2k_block_index
             n_block = partial(block_info.get_n_block_idx, mBlockIndex, batch_idx, head_idx, m_block)
-            block_iter_count = block_sparse_num  # runtime Int32, even, >= 2
+            block_iter_count = mBlockNums[batch_idx, head_idx, m_block] if const_expr(mBlockNums is not None) else block_sparse_num
 
             load_K(block=n_block(block_iter_count - 1), producer_state=kv_producer_state, page_idx=None)  # K0
             if const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]:
@@ -1203,6 +1211,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
         block_sparse_num: Int32,
+        mBlockNums: Optional[cute.Tensor],
     ):
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
@@ -1255,13 +1264,18 @@ class FlashAttentionForwardSm100:
             pipeline.PipelineUserType.Consumer, self.kv_stage
         )
         P_full_O_rescaled_phase = Int32(0)
+        # Pipeline s_p_o phases for stage 0 and stage 1.
+        # Must persist across tiles (like FA's P_full_O_rescaled_phase)
+        # so that mbarrier phase stays in sync when block_iter_count varies.
+        phase_s0 = Int32(0)
+        phase_s1 = Int32(0)
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls()
 
-            block_iter_count = block_sparse_num
+            block_iter_count = mBlockNums[batch_idx, head_idx, m_block] if const_expr(mBlockNums is not None) else block_sparse_num
             process_tile = True
 
             if process_tile and is_leader_cta:
@@ -1305,8 +1319,6 @@ class FlashAttentionForwardSm100:
                 block_loop_count = block_iter_count - 2
                 O_acc_s0 = False  # per-stage accumulate flags
                 O_acc_s1 = False
-                phase_s0 = Int32(0)
-                phase_s1 = Int32(0)
                 # Pre-declare loop variables for DSL type tracking
                 Vi_index = mma_kv_consumer_state.index
                 Vi_phase = mma_kv_consumer_state.phase
@@ -1386,6 +1398,9 @@ class FlashAttentionForwardSm100:
                     pipeline_o_acc.producer_commit_w_index(epi_s)
                     pipeline_kv.consumer_release(mma_kv_consumer_state)
                     mma_kv_consumer_state.advance()
+                # Epilogue did one acquire per stage; advance phases for next tile
+                phase_s0 ^= 1
+                phase_s1 ^= 1
 
             # Advance to next tile
             work_tile = tile_scheduler.consumer_advance()
@@ -1418,6 +1433,7 @@ class FlashAttentionForwardSm100:
         mBlockIndex: cute.Tensor,
         mBlockSizes: cute.Tensor,
         block_sparse_num: Int32,
+        mBlockNums: Optional[cute.Tensor],
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -1517,7 +1533,7 @@ class FlashAttentionForwardSm100:
                 # block_iter_count is even: each WG processes exactly half the blocks
                 # WG0 (stage=0): logical indices N-1, N-3, ... (stride 2)
                 # WG1 (stage=1): logical indices N-2, N-4, ... (stride 2)
-                block_iter_count = block_sparse_num
+                block_iter_count = mBlockNums[batch_idx, head_idx, m_block] if const_expr(mBlockNums is not None) else block_sparse_num
                 wg_count = block_iter_count // 2
                 # logical_first is the first logical index for this WG
                 logical_first = block_iter_count - 1 - stage
@@ -1674,6 +1690,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
         block_sparse_num: Int32,
+        mBlockNums: Optional[cute.Tensor],
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -1732,7 +1749,7 @@ class FlashAttentionForwardSm100:
 
                 tSrScale_t2r = cute.make_fragment(tSrScale_t2r_shape, Float32)
                 # q_stage=1 correction loop
-                block_iter_count = block_sparse_num
+                block_iter_count = mBlockNums[batch_idx, head_idx, m_block] if const_expr(mBlockNums is not None) else block_sparse_num
                 corr_pair_count = (block_iter_count - 2) // 2
                 # Paired rescale loop (same structure as q_stage=2)
                 for i in cutlass.range(corr_pair_count, unroll=1):

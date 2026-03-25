@@ -77,23 +77,74 @@ def make_random_block_sparse_args(batch_size, seqlen_q, seqlen_k, nheads, tile_m
     return q2k_block_index, block_sparse_num, block_sizes
 
 
+def make_random_variable_block_sparse_args(batch_size, seqlen_q, seqlen_k, nheads, tile_m=128, tile_n=128, device="cuda"):
+    """Create random block-sparse args with per-(batch, head, q_block) variable block counts.
+
+    Each Q block gets a random even block_sparse_num in [min_bsn, max_even].
+    q2k_block_index is padded to max_kv_blocks (max_even) with zeros (unused entries).
+    Returns q2k_block_index, q2k_block_nums, block_sizes.
+    """
+    num_q_blocks = (seqlen_q + tile_m - 1) // tile_m
+    num_kv_blocks = (seqlen_k + tile_n - 1) // tile_n
+    assert num_kv_blocks >= 2, f"num_kv_blocks={num_kv_blocks} must be >= 2"
+
+    max_even = num_kv_blocks if num_kv_blocks % 2 == 0 else num_kv_blocks - 1
+    min_bsn = min(4, max_even)
+    possible_counts = list(range(min_bsn, max_even + 1, 2))
+
+    # Per-(b, h, m) random block count
+    q2k_block_nums = torch.empty(batch_size, nheads, num_q_blocks, dtype=torch.int32, device=device)
+    q2k_block_index = torch.zeros(batch_size, nheads, num_q_blocks, max_even,
+                                   dtype=torch.int32, device=device)
+    for b in range(batch_size):
+        for h in range(nheads):
+            for m in range(num_q_blocks):
+                bsn = possible_counts[torch.randint(len(possible_counts), (1,)).item()]
+                q2k_block_nums[b, h, m] = bsn
+                perm = torch.randperm(num_kv_blocks, device=device)[:bsn]
+                q2k_block_index[b, h, m, :bsn] = perm.to(torch.int32)
+
+    block_sizes = torch.randint(1, tile_n + 1, (num_kv_blocks,), dtype=torch.int32, device=device)
+    last_block_actual = seqlen_k - (num_kv_blocks - 1) * tile_n
+    if last_block_actual < tile_n:
+        block_sizes[-1] = min(block_sizes[-1].item(), last_block_actual)
+
+    return q2k_block_index, q2k_block_nums, block_sizes
+
+
 def block_sparse_to_attn_bias(q2k_block_index, block_sparse_num, block_sizes,
-                               seqlen_q, seqlen_k, tile_m=128, tile_n=128):
+                               seqlen_q, seqlen_k, tile_m=128, tile_n=128,
+                               q2k_block_nums=None):
     """Convert block-sparse args to additive attention bias for reference.
 
     Returns attn_bias (batch, nheads, seqlen_q, seqlen_k) float32:
         0.0 for attended positions, -inf for masked.
+
+    When q2k_block_nums is provided, each (batch, head, q_block) uses its own
+    block count instead of the fixed block_sparse_num.
     """
-    batch_size, nheads, num_q_blocks, _ = q2k_block_index.shape
+    batch_size, nheads, num_q_blocks, max_kv_blocks = q2k_block_index.shape
     num_kv_blocks = block_sizes.shape[0]
     device = q2k_block_index.device
 
     col_idx = torch.arange(tile_n, device=device)
     block_valid = col_idx.unsqueeze(0) < block_sizes.unsqueeze(1)  # (num_kv_blocks, tile_n)
 
-    block_attended = torch.zeros(batch_size, nheads, num_q_blocks, num_kv_blocks,
-                                  dtype=torch.bool, device=device)
-    block_attended.scatter_(3, q2k_block_index.long(), True)
+    if q2k_block_nums is None:
+        # Fixed block_sparse_num: all entries up to block_sparse_num are valid
+        block_attended = torch.zeros(batch_size, nheads, num_q_blocks, num_kv_blocks,
+                                      dtype=torch.bool, device=device)
+        block_attended.scatter_(3, q2k_block_index[..., :block_sparse_num].long(), True)
+    else:
+        # Variable per-(b,h,m) block counts
+        block_attended = torch.zeros(batch_size, nheads, num_q_blocks, num_kv_blocks,
+                                      dtype=torch.bool, device=device)
+        for b in range(batch_size):
+            for h in range(nheads):
+                for m in range(num_q_blocks):
+                    bsn = q2k_block_nums[b, h, m].item()
+                    indices = q2k_block_index[b, h, m, :bsn].long()
+                    block_attended[b, h, m].scatter_(0, indices, True)
 
     # (batch, nheads, num_q_blocks, num_kv_blocks, tile_n) -> clip to seqlen_k
     token_valid = (block_attended.unsqueeze(-1) & block_valid).reshape(
@@ -112,9 +163,39 @@ def block_sparse_to_attn_bias(q2k_block_index, block_sparse_num, block_sizes,
     return attn_bias
 
 
+def pack_gqa_attn_bias(attn_bias_kv, nheads, qhead_per_kvhead, seqlen_q):
+    """Unpack packed-GQA attention bias to per-Q-head layout.
+
+    attn_bias_kv: (bs, nheads_kv, seqlen_q_packed, seqlen_k)
+      where seqlen_q_packed = seqlen_q * qhead_per_kvhead, and packed row r
+      maps to seq_pos = r // qhead_per_kvhead, head_off = r % qhead_per_kvhead.
+
+    Returns: (bs, nheads, seqlen_q, seqlen_k)
+    """
+    bs, nheads_kv, seqlen_q_packed, seqlen_k = attn_bias_kv.shape
+    # Build index: for each packed row r, compute seq_pos
+    r = torch.arange(seqlen_q_packed, device=attn_bias_kv.device)
+    seq_pos = r // qhead_per_kvhead  # (seqlen_q_packed,)
+    head_off = r % qhead_per_kvhead  # (seqlen_q_packed,)
+    # Expand nheads_kv to nheads: h_q = h_kv * qhead_per_kvhead + head_off
+    # For each h_kv, select rows where head_off matches and gather by seq_pos
+    attn_bias = torch.full((bs, nheads, seqlen_q, seqlen_k), float("-inf"),
+                           device=attn_bias_kv.device, dtype=attn_bias_kv.dtype)
+    valid = seq_pos < seqlen_q
+    for h_off in range(qhead_per_kvhead):
+        mask = (head_off == h_off) & valid  # (seqlen_q_packed,)
+        src_rows = r[mask]        # packed row indices with this head_off
+        dst_rows = seq_pos[mask]  # corresponding seq positions
+        for h_kv in range(nheads_kv):
+            h_q = h_kv * qhead_per_kvhead + h_off
+            attn_bias[:, h_q, dst_rows] = attn_bias_kv[:, h_kv, src_rows]
+    return attn_bias
+
+
 # ============== Correctness helpers ==============
 
-def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloat16):
+def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloat16,
+                  use_variable_block_nums=False):
     """Run a single correctness test with random block-sparse pattern.
 
     Tolerance (from FA4 test_flash_attn.py):
@@ -140,34 +221,24 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
     nheads_q2k = nheads_kv if pack_gqa else nheads
     seqlen_q_q2k = seqlen_q * qhead_per_kvhead if pack_gqa else seqlen_q
 
-    q2k_block_index, block_sparse_num, block_sizes = make_random_block_sparse_args(
-        bs, seqlen_q_q2k, seqlen_k, nheads_q2k, device=device,
-    )
+    q2k_block_nums = None
+    if use_variable_block_nums:
+        q2k_block_index, q2k_block_nums, block_sizes = make_random_variable_block_sparse_args(
+            bs, seqlen_q_q2k, seqlen_k, nheads_q2k, device=device,
+        )
+        block_sparse_num = 0  # unused when q2k_block_nums is provided
+    else:
+        q2k_block_index, block_sparse_num, block_sizes = make_random_block_sparse_args(
+            bs, seqlen_q_q2k, seqlen_k, nheads_q2k, device=device,
+        )
 
     # Build attn_bias at (bs, nheads_q, seqlen_q, seqlen_k) for the reference.
     # Expand nheads_kv → nheads_q: all Q heads in the same KV group share the same pattern.
     attn_bias_kv = block_sparse_to_attn_bias(
         q2k_block_index, block_sparse_num, block_sizes, seqlen_q_q2k, seqlen_k,
+        q2k_block_nums=q2k_block_nums,
     )
-    if pack_gqa:
-        # attn_bias_kv: (bs, nheads_kv, seqlen_q_packed, seqlen_k)
-        # Need to unpack to (bs, nheads_q, seqlen_q, seqlen_k)
-        # In pack_gqa, packed row r maps to: seq_pos = r // qhpkv, head_off = r % qhpkv
-        attn_bias = torch.full((bs, nheads, seqlen_q, seqlen_k), float("-inf"),
-                               device=device, dtype=torch.float32)
-        for h_kv in range(nheads_kv):
-            for h_off in range(qhead_per_kvhead):
-                h_q = h_kv * qhead_per_kvhead + h_off
-                for m in range((seqlen_q_q2k + 127) // 128):
-                    eff_start = m * 128
-                    eff_end = min((m + 1) * 128, seqlen_q_q2k)
-                    for r in range(eff_start, eff_end):
-                        seq_pos = r // qhead_per_kvhead
-                        r_head_off = r % qhead_per_kvhead
-                        if seq_pos < seqlen_q and r_head_off == h_off:
-                            attn_bias[:, h_q, seq_pos] = attn_bias_kv[:, h_kv, r]
-    else:
-        attn_bias = attn_bias_kv
+    attn_bias = pack_gqa_attn_bias(attn_bias_kv, nheads, qhead_per_kvhead, seqlen_q) if pack_gqa else attn_bias_kv
 
     out_ref, _ = attention_ref(q_ref, k_ref, v_ref, None, None, attn_bias=attn_bias, causal=False)
     out_pt, _ = attention_ref(
@@ -178,17 +249,19 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
     fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
     rtol = 2
 
-    out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes)
+    out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes,
+                             q2k_block_nums=q2k_block_nums)
 
     kernel_diff = (out - out_ref).abs().max().item()
     pt_diff = (out_pt - out_ref).abs().max().item()
     tol = rtol * pt_diff + fwd_atol
     passed = kernel_diff <= tol
 
+    mode_str = "var_bsn" if use_variable_block_nums else f"sparse_num={block_sparse_num}"
     tag = "PASS" if passed else "FAIL"
     print(
         f"  {tag} bs={bs} sq={seqlen_q} sk={seqlen_k} h={nheads}/{nheads_kv} d={d} "
-        f"sparse_num={block_sparse_num}: "
+        f"{mode_str}: "
         f"kernel={kernel_diff:.6f} pt={pt_diff:.6f} tol={tol:.6f}"
     )
     assert passed, f"kernel_diff={kernel_diff} > tol={tol}"
@@ -199,6 +272,7 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "gqa", "mqa"])
 @pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("use_variable_block_nums", [False, True])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -217,11 +291,12 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
         (4096, 4096),
     ],
 )
-def test_flash_fwd_sm100(seqlen_q, seqlen_k, d, mha_type, dtype):
+def test_flash_fwd_sm100(seqlen_q, seqlen_k, d, mha_type, dtype, use_variable_block_nums):
     batch_size = 4 if seqlen_k <= 2048 else 2
     nheads = 6
     nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
-    _test_single(batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype)
+    _test_single(batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype,
+                  use_variable_block_nums=use_variable_block_nums)
 
 
 # ============== Quick test (make tt) ==============
@@ -242,6 +317,16 @@ def run_quick_tests():
     ]
     for bs, sq, sk, hq, hk, d in configs:
         _test_single(bs, sq, sk, hq, hk, d)
+    print("-" * 70)
+    print("Variable block_sparse_num tests")
+    var_configs = [
+        (1, 64, 512, 4, 4, 128),
+        (1, 256, 512, 4, 4, 128),
+        (1, 128, 640, 4, 4, 128),
+        (1, 64, 256, 8, 1, 128),
+    ]
+    for bs, sq, sk, hq, hk, d in var_configs:
+        _test_single(bs, sq, sk, hq, hk, d, use_variable_block_nums=True)
     print("=" * 70)
     print("All quick tests passed.")
 

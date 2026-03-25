@@ -37,9 +37,12 @@ make profile
 Tensor layout: `(batch, seqlen, num_heads, head_dim)`, last dim contiguous, 16-byte aligned.
 
 #### Block-Sparse Parameters (mandatory)
-- `q2k_block_index`: `(batch, num_heads, num_q_blocks, max_kv_blocks)` int32 — per Q-block list of KV block indices to attend to (first `block_sparse_num` entries valid)
-- `block_sparse_num`: int (runtime, even, >= 2) — number of KV blocks each Q block attends to
+- `q2k_block_index`: `(batch, num_heads, num_q_blocks, max_kv_blocks)` int32 — per Q-block list of KV block indices to attend to
+- `block_sparse_num`: int (runtime, even, >= 2) — number of KV blocks each Q block attends to. Ignored when `q2k_block_nums` is provided
 - `block_sizes`: `(num_kv_blocks,)` int32 — actual token count per KV block (for masking padding positions within a tile)
+
+#### Variable Block-Sparse Parameters (optional)
+- `q2k_block_nums`: `(batch, num_heads, num_q_blocks)` int32 — per-Q-block number of KV blocks to attend to (each value must be even and >= 2). When provided, `block_sparse_num` is ignored, and for each `(batch, head, m_block)` the first `q2k_block_nums[batch, head, m_block]` entries in `q2k_block_index` are valid
 
 For dense (full) attention, construct `q2k_block_index = [0,1,...,N-1]` for all Q blocks, `block_sparse_num = N`, and `block_sizes = [tile_n]*N` (with last block adjusted for seqlen remainder). See `make_dense_block_sparse_args()` in `test_flash_fwd.py`.
 
@@ -72,6 +75,7 @@ For dense (full) attention, construct `q2k_block_index = [0,1,...,N-1]` for all 
 
 - Compile-time constants use `cutlass.Constexpr[type]` for kernel specialization
 - `block_sparse_num` is a runtime `Int32` parameter (not compile-time); different values do not require recompilation
+- `q2k_block_nums` enables per-Q-block variable KV block counts; uses a separate compile path (`has_variable_block_nums` in compile key). Pipeline phases (`phase_s0`/`phase_s1`) persist across tiles to handle variable `block_iter_count` in persistent scheduling
 - Forward execution: load Q tile → loop over K/V blocks selected by `q2k_block_index` (pipelined) → online softmax with per-block `block_sizes` masking → store O and LSE
 - Load order for N KV blocks: K[idx(N-1)], Q, K[idx(N-2)], {V[idx(N-1-i)], K[idx(N-3-i)]}×(N-2), V[idx(1)], V[idx(0)] — where `idx(i) = q2k_block_index[batch, head, m_block, i]`
 - 2CTA instructions (hdim=128): WIP, not yet functional for block-sparse. 
