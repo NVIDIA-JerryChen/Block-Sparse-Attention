@@ -80,7 +80,7 @@ out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, 0, block_sizes,
 | `q2k_block_index` | (batch, num_heads, num_q_blocks, max_kv_blocks) | int32 | Per Q-block KV block indices |
 | `block_sparse_num` | scalar | int | Number of KV blocks per Q block (even, >= 2). Ignored when `q2k_block_nums` is provided |
 | `block_sizes` | (num_kv_blocks,) | int32 | Actual token count per KV block |
-| `q2k_block_nums` | (batch, num_heads, num_q_blocks) | int32 | Optional. Per-Q-block KV block count (each value even, >= 2). When provided, `block_sparse_num` is ignored |
+| `q2k_block_nums` | (batch, num_heads, num_q_blocks) | int32 | Optional. Per-Q-block KV block count (each value >= 1, odd values supported). When provided, `block_sparse_num` is ignored |
 
 ## Tests
 

@@ -1146,8 +1146,15 @@ class FlashAttentionForwardSm100:
             )
 
             # n_block(i): maps logical index i to actual KV block index via q2k_block_index
-            n_block = partial(block_info.get_n_block_idx, mBlockIndex, batch_idx, head_idx, m_block)
-            block_iter_count = mBlockNums[batch_idx, head_idx, m_block] if const_expr(mBlockNums is not None) else block_sparse_num
+            # When mBlockNums is provided, raw count may be odd; round up to even for kernel loops.
+            # max_i clamps phantom block indices to the last valid entry.
+            if const_expr(mBlockNums is not None):
+                raw_block_count = mBlockNums[batch_idx, head_idx, m_block]
+                block_iter_count = (raw_block_count + 1) & ~1
+                n_block = partial(block_info.get_n_block_idx, mBlockIndex, batch_idx, head_idx, m_block, max_i=raw_block_count - 1)
+            else:
+                block_iter_count = block_sparse_num
+                n_block = partial(block_info.get_n_block_idx, mBlockIndex, batch_idx, head_idx, m_block)
 
             load_K(block=n_block(block_iter_count - 1), producer_state=kv_producer_state, page_idx=None)  # K0
             if const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]:
@@ -1275,7 +1282,10 @@ class FlashAttentionForwardSm100:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls()
 
-            block_iter_count = mBlockNums[batch_idx, head_idx, m_block] if const_expr(mBlockNums is not None) else block_sparse_num
+            if const_expr(mBlockNums is not None):
+                block_iter_count = (mBlockNums[batch_idx, head_idx, m_block] + 1) & ~1
+            else:
+                block_iter_count = block_sparse_num
             process_tile = True
 
             if process_tile and is_leader_cta:
@@ -1495,7 +1505,12 @@ class FlashAttentionForwardSm100:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
 
             # n_block(i): maps logical index i to actual KV block index via q2k_block_index
-            n_block = partial(block_info.get_n_block_idx, mBlockIndex, batch_idx, head_idx, m_block)
+            if const_expr(mBlockNums is not None):
+                raw_block_count = mBlockNums[batch_idx, head_idx, m_block]
+                n_block = partial(block_info.get_n_block_idx, mBlockIndex, batch_idx, head_idx, m_block, max_i=raw_block_count - 1)
+            else:
+                raw_block_count = block_sparse_num
+                n_block = partial(block_info.get_n_block_idx, mBlockIndex, batch_idx, head_idx, m_block)
 
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2,
@@ -1533,21 +1548,25 @@ class FlashAttentionForwardSm100:
                 # block_iter_count is even: each WG processes exactly half the blocks
                 # WG0 (stage=0): logical indices N-1, N-3, ... (stride 2)
                 # WG1 (stage=1): logical indices N-2, N-4, ... (stride 2)
-                block_iter_count = mBlockNums[batch_idx, head_idx, m_block] if const_expr(mBlockNums is not None) else block_sparse_num
+                if const_expr(mBlockNums is not None):
+                    block_iter_count = (raw_block_count + 1) & ~1
+                else:
+                    block_iter_count = block_sparse_num
                 wg_count = block_iter_count // 2
                 # logical_first is the first logical index for this WG
                 logical_first = block_iter_count - 1 - stage
 
-                # 1st block
+                # 1st block — phantom block (logical_first >= raw_block_count) uses block_size=0
                 n_block_first = n_block(logical_first)
+                first_block_size = Int32(0) if const_expr(mBlockNums is not None) and logical_first >= raw_block_count else mBlockSizes[n_block_first]
                 mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase = softmax_step(
                     mma_si_consumer_phase,
                     sm_stats_producer_phase,
                     s0_s1_sequence_phase,
-                    mask_fn=partial(apply_block_size_mask, block_size=mBlockSizes[n_block_first], n_block_size=self.n_block_size),
+                    mask_fn=partial(apply_block_size_mask, block_size=first_block_size, n_block_size=self.n_block_size),
                     is_first=True,
                 )
-                # Remaining blocks with stride 2
+                # Remaining blocks with stride 2 — always valid (logical_n < raw_block_count)
                 for n_tile in cutlass.range(wg_count - 1, unroll=1):
                     logical_n = logical_first - self.s_stage * (n_tile + 1)
                     n_block_cur = n_block(logical_n)
@@ -1749,7 +1768,10 @@ class FlashAttentionForwardSm100:
 
                 tSrScale_t2r = cute.make_fragment(tSrScale_t2r_shape, Float32)
                 # q_stage=1 correction loop
-                block_iter_count = mBlockNums[batch_idx, head_idx, m_block] if const_expr(mBlockNums is not None) else block_sparse_num
+                if const_expr(mBlockNums is not None):
+                    block_iter_count = (mBlockNums[batch_idx, head_idx, m_block] + 1) & ~1
+                else:
+                    block_iter_count = block_sparse_num
                 corr_pair_count = (block_iter_count - 2) // 2
                 # Paired rescale loop (same structure as q_stage=2)
                 for i in cutlass.range(corr_pair_count, unroll=1):

@@ -1,9 +1,10 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 from dataclasses import dataclass
+from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32
+from cutlass import Int32, const_expr
 
 
 @dataclass(frozen=True)
@@ -20,5 +21,7 @@ class BlockInfo:
         head_idx: Int32,
         m_block: Int32,
         i: Int32,
+        max_i: Optional[Int32] = None,
     ) -> Int32:
-        return block_index[batch_idx, head_idx, m_block, i]
+        idx = cutlass.min(i, max_i) if const_expr(max_i is not None) else i
+        return block_index[batch_idx, head_idx, m_block, idx]

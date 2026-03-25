@@ -80,21 +80,19 @@ def make_random_block_sparse_args(batch_size, seqlen_q, seqlen_k, nheads, tile_m
 def make_random_variable_block_sparse_args(batch_size, seqlen_q, seqlen_k, nheads, tile_m=128, tile_n=128, device="cuda"):
     """Create random block-sparse args with per-(batch, head, q_block) variable block counts.
 
-    Each Q block gets a random even block_sparse_num in [min_bsn, max_even].
-    q2k_block_index is padded to max_kv_blocks (max_even) with zeros (unused entries).
+    Each Q block gets a random block_sparse_num in [1, num_kv_blocks].
+    q2k_block_index is padded to num_kv_blocks with zeros (unused entries).
     Returns q2k_block_index, q2k_block_nums, block_sizes.
     """
     num_q_blocks = (seqlen_q + tile_m - 1) // tile_m
     num_kv_blocks = (seqlen_k + tile_n - 1) // tile_n
-    assert num_kv_blocks >= 2, f"num_kv_blocks={num_kv_blocks} must be >= 2"
+    assert num_kv_blocks >= 1, f"num_kv_blocks={num_kv_blocks} must be >= 1"
 
-    max_even = num_kv_blocks if num_kv_blocks % 2 == 0 else num_kv_blocks - 1
-    min_bsn = min(4, max_even)
-    possible_counts = list(range(min_bsn, max_even + 1, 2))
+    possible_counts = list(range(1, num_kv_blocks + 1))
 
     # Per-(b, h, m) random block count
     q2k_block_nums = torch.empty(batch_size, nheads, num_q_blocks, dtype=torch.int32, device=device)
-    q2k_block_index = torch.zeros(batch_size, nheads, num_q_blocks, max_even,
+    q2k_block_index = torch.zeros(batch_size, nheads, num_q_blocks, num_kv_blocks,
                                    dtype=torch.int32, device=device)
     for b in range(batch_size):
         for h in range(nheads):
