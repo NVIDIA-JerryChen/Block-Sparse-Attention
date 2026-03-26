@@ -65,6 +65,7 @@ def bsa_attn_fwd(
     block_sparse_num: int,
     block_sizes: torch.Tensor,
     q2k_block_nums: Optional[torch.Tensor] = None,
+    allow_empty_block_nums: bool = True,
     softmax_scale: Optional[float] = None,
     pack_gqa: Optional[bool] = None,
     return_lse: bool = False,
@@ -83,8 +84,11 @@ def bsa_attn_fwd(
             Ignored when q2k_block_nums is provided.
         block_sizes: Actual token count per KV block (num_kv_blocks,), int32. Used for masking padding positions.
         q2k_block_nums: Per-(batch, head, q_block) number of KV blocks to attend to,
-            (batch, num_heads, num_q_blocks) int32, each value even and >= 2.
+            (batch, num_heads, num_q_blocks) int32, each value >= 0.
             When None, uses fixed block_sparse_num for all Q blocks.
+        allow_empty_block_nums: When True (default), q2k_block_nums may contain 0 (empty tiles
+            produce O=0, LSE=-inf). When False, all values must be >= 1, enabling compile-time
+            elimination of empty-tile branches for better performance (~2-3%).
         softmax_scale: Softmax scale (default: 1/sqrt(head_dim))
         pack_gqa: Whether to pack GQA heads
         return_lse: Whether to return log-sum-exp
@@ -187,6 +191,7 @@ def bsa_attn_fwd(
         use_clc_scheduler,
         fa_logging.get_fa_log_level(),
         has_variable_block_nums,
+        allow_empty_block_nums and has_variable_block_nums,
     )
 
     if compile_key not in bsa_attn_fwd.compile_cache:
@@ -208,6 +213,7 @@ def bsa_attn_fwd(
             is_persistent=True,
             use_2cta_instrs=use_2cta_instrs,
             use_clc_scheduler=use_clc_scheduler,
+            allow_empty_block_nums=allow_empty_block_nums and has_variable_block_nums,
         )
 
         bsa_attn_fwd.compile_cache[compile_key] = cute.compile(

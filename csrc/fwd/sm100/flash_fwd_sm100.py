@@ -61,6 +61,7 @@ class FlashAttentionForwardSm100:
         is_persistent: bool = True,
         use_2cta_instrs: bool = False,
         use_clc_scheduler: bool = False,
+        allow_empty_block_nums: bool = False,
     ):
         self.use_tma_KV = True
         # self.dtype = dtype
@@ -111,6 +112,7 @@ class FlashAttentionForwardSm100:
                 f"CLC cluster M != cta_group_size: {self.cluster_shape_mn}, {self.cta_group_size}"
             )
         self.scheduling_mode = SchedulingMode.CLC if self.use_clc_scheduler else SchedulingMode.STATIC
+        self.allow_empty_block_nums = allow_empty_block_nums
         self.is_causal = False
         self.is_local = False
         self.is_varlen_q = False
@@ -1150,42 +1152,45 @@ class FlashAttentionForwardSm100:
             # max_i clamps phantom block indices to the last valid entry.
             if const_expr(mBlockNums is not None):
                 raw_block_count = mBlockNums[batch_idx, head_idx, m_block]
+                process_tile = raw_block_count > Int32(0) if const_expr(self.allow_empty_block_nums) else True
                 block_iter_count = (raw_block_count + 1) & ~1
-                n_block = partial(block_info.get_n_block_idx, mBlockIndex, batch_idx, head_idx, m_block, max_i=raw_block_count - 1)
+                n_block = partial(block_info.get_n_block_idx, mBlockIndex, batch_idx, head_idx, m_block, max_i=cutlass.max(raw_block_count - 1, Int32(0)))
             else:
+                process_tile = True
                 block_iter_count = block_sparse_num
                 n_block = partial(block_info.get_n_block_idx, mBlockIndex, batch_idx, head_idx, m_block)
 
-            load_K(block=n_block(block_iter_count - 1), producer_state=kv_producer_state, page_idx=None)  # K0
-            if const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]:
-                pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
-                tma_bar_ptr = pipeline_q.sync_object_full.get_barrier(0)
-                load_Q_fn(src_idx=0, dst_idx=0, tma_bar_ptr=tma_bar_ptr)
-            kv_producer_state.advance()
-
-            # q_stage=1 intra-warp overlap
-            # Load order: K[N-1], Q, K[N-2], {V[N-1-i], K[N-3-i]}x(N-2), V[1], V[0]
-            block_loop_count = block_iter_count - 2
-            q_producer_phase ^= 1
-
-            # Prologue: K[N-2]
-            load_K(block=n_block(block_iter_count - 2), producer_state=kv_producer_state, page_idx=None)
-            kv_producer_state.advance()
-
-            # Flat main loop: N-2 iterations, each loads V then K
-            for i in cutlass.range(block_loop_count, unroll=1):
-                # V[N-1-i]: V for the block whose S was computed earlier
-                load_V(block=n_block(block_iter_count - 1 - i), producer_state=kv_producer_state, page_idx=None)
-                kv_producer_state.advance()
-                # K[N-3-i]: K for the next QK GEMM
-                load_K(block=n_block(block_iter_count - 3 - i), producer_state=kv_producer_state, page_idx=None)
+            if process_tile:
+                load_K(block=n_block(block_iter_count - 1), producer_state=kv_producer_state, page_idx=None)  # K0
+                if const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]:
+                    pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
+                    tma_bar_ptr = pipeline_q.sync_object_full.get_barrier(0)
+                    load_Q_fn(src_idx=0, dst_idx=0, tma_bar_ptr=tma_bar_ptr)
                 kv_producer_state.advance()
 
-            # Epilogue: last 2 V loads
-            load_V(block=n_block(1), producer_state=kv_producer_state, page_idx=None)
-            kv_producer_state.advance()
-            load_V(block=n_block(0), producer_state=kv_producer_state, page_idx=None)
-            kv_producer_state.advance()
+                # q_stage=1 intra-warp overlap
+                # Load order: K[N-1], Q, K[N-2], {V[N-1-i], K[N-3-i]}x(N-2), V[1], V[0]
+                block_loop_count = block_iter_count - 2
+                q_producer_phase ^= 1
+
+                # Prologue: K[N-2]
+                load_K(block=n_block(block_iter_count - 2), producer_state=kv_producer_state, page_idx=None)
+                kv_producer_state.advance()
+
+                # Flat main loop: N-2 iterations, each loads V then K
+                for i in cutlass.range(block_loop_count, unroll=1):
+                    # V[N-1-i]: V for the block whose S was computed earlier
+                    load_V(block=n_block(block_iter_count - 1 - i), producer_state=kv_producer_state, page_idx=None)
+                    kv_producer_state.advance()
+                    # K[N-3-i]: K for the next QK GEMM
+                    load_K(block=n_block(block_iter_count - 3 - i), producer_state=kv_producer_state, page_idx=None)
+                    kv_producer_state.advance()
+
+                # Epilogue: last 2 V loads
+                load_V(block=n_block(1), producer_state=kv_producer_state, page_idx=None)
+                kv_producer_state.advance()
+                load_V(block=n_block(0), producer_state=kv_producer_state, page_idx=None)
+                kv_producer_state.advance()
 
             tile_scheduler.prefetch_next_work()
             work_tile = tile_scheduler.consumer_advance()
@@ -1283,10 +1288,12 @@ class FlashAttentionForwardSm100:
             seqlen = SeqlenInfoCls()
 
             if const_expr(mBlockNums is not None):
-                block_iter_count = (mBlockNums[batch_idx, head_idx, m_block] + 1) & ~1
+                raw_block_count = mBlockNums[batch_idx, head_idx, m_block]
+                process_tile = raw_block_count > Int32(0) if const_expr(self.allow_empty_block_nums) else True
+                block_iter_count = (raw_block_count + 1) & ~1
             else:
+                process_tile = True
                 block_iter_count = block_sparse_num
-            process_tile = True
 
             if process_tile and is_leader_cta:
                 # ================================================================
@@ -1507,9 +1514,11 @@ class FlashAttentionForwardSm100:
             # n_block(i): maps logical index i to actual KV block index via q2k_block_index
             if const_expr(mBlockNums is not None):
                 raw_block_count = mBlockNums[batch_idx, head_idx, m_block]
-                n_block = partial(block_info.get_n_block_idx, mBlockIndex, batch_idx, head_idx, m_block, max_i=raw_block_count - 1)
+                has_work = raw_block_count > Int32(0) if const_expr(self.allow_empty_block_nums) else True
+                n_block = partial(block_info.get_n_block_idx, mBlockIndex, batch_idx, head_idx, m_block, max_i=cutlass.max(raw_block_count - 1, Int32(0)))
             else:
                 raw_block_count = block_sparse_num
+                has_work = True
                 n_block = partial(block_info.get_n_block_idx, mBlockIndex, batch_idx, head_idx, m_block)
 
             softmax = SoftmaxSm100.create(
@@ -1518,8 +1527,6 @@ class FlashAttentionForwardSm100:
                 softmax_scale=softmax_scale,
             )
             softmax.reset()
-
-            has_work = True
 
             softmax_step = partial(
                 self.softmax_step,
@@ -1540,9 +1547,9 @@ class FlashAttentionForwardSm100:
                 stage=stage,
             )
 
-            if has_work:
-                pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
-                sm_stats_producer_phase ^= 1
+            # Always acquire pipeline_sm_stats to stay in sync with correction
+            pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
+            sm_stats_producer_phase ^= 1
 
             if has_work:
                 # block_iter_count is even: each WG processes exactly half the blocks
@@ -1580,6 +1587,9 @@ class FlashAttentionForwardSm100:
                     sScale[
                         tidx + stage * self.m_block_size + self.s_stage * self.m_block_size
                     ] = softmax.row_max[0]
+                sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
+            else:
+                # Empty tile: arrive barrier once (synthetic "no work" signal for correction)
                 sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
             # Advance to next tile
@@ -1756,7 +1766,10 @@ class FlashAttentionForwardSm100:
             # For q_stage=1, always need row_max for combine; use -inf as default
             stats = [(Float32(0.0), -Float32.inf if const_expr(mLSE is not None or self.q_stage == 1) else None, True)] * self.s_stage
 
-            has_work = True
+            if const_expr(mBlockNums is not None):
+                has_work = mBlockNums[batch_idx, head_idx, m_block] > Int32(0) if const_expr(self.allow_empty_block_nums) else True
+            else:
+                has_work = True
 
             if has_work:
                 # Ignore first signal from softmax as no correction is required
@@ -1852,6 +1865,37 @@ class FlashAttentionForwardSm100:
 
                 o_corr_consumer_phase ^= 1
                 sm_stats_consumer_phase ^= 1
+                corr_epi_producer_phase ^= 1
+            else:
+                # Empty tile (block_count == 0): sync pipelines and write O=0.
+                # Match softmax's 1 barrier arrive per stage.
+                for stage_idx in cutlass.range_constexpr(self.s_stage):
+                    sm_stats_barrier.arrive_and_wait_w_index(index=stage_idx * 4 + warp_idx)
+                    pipeline_sm_stats.consumer_release_w_index(stage_idx)
+                sm_stats_consumer_phase ^= 1
+                # Write O=0 via correction_epilogue_combine with scale=0.
+                # Note: reads tmem which may have values from a previous tile;
+                # 0.0 * finite = 0.0. For the very first tile, tmem is hardware-zero-initialized.
+                if const_expr(not self.use_correction_warps_for_epi):
+                    pipeline_o_epi.producer_acquire_w_index_phase(0, corr_epi_producer_phase)
+                self.correction_epilogue_combine(
+                    thr_mma_pv,
+                    tOtO[None, None, None, 0],
+                    tOtO[None, None, None, 1],
+                    tidx,
+                    m_block,
+                    seqlen.seqlen_q,
+                    Float32(0.0),
+                    Float32(0.0),
+                    sO[None, None, 0],
+                    mO_cur,
+                    gO[None, None, 0],
+                    gmem_tiled_copy_O,
+                )
+                # Do NOT release pipeline_s_p_o (MMA didn't commit)
+                if const_expr(not self.use_correction_warps_for_epi):
+                    pipeline_o_epi.producer_commit_w_index(0)
+                # o_corr_consumer_phase NOT toggled (pipeline_o_acc not touched)
                 corr_epi_producer_phase ^= 1
 
             if const_expr(mLSE is not None):
@@ -2068,18 +2112,24 @@ class FlashAttentionForwardSm100:
             frg_shape = tOcO_t2r[None, 0, 0, i].shape
             tOrO0_frg = cute.make_fragment(frg_shape, self.pv_acc_dtype)
             tOrO1_frg = cute.make_fragment(frg_shape, self.pv_acc_dtype)
-            cute.copy(tiled_tmem_load, tOtO0_t2r_i, tOrO0_frg)
-            cute.copy(tiled_tmem_load, tOtO1_t2r_i, tOrO1_frg)
-            # Combined: O = O0 * scale0 + O1 * scale1
-            for j in cutlass.range(0, cute.size(tOrO0_frg), 2, unroll_full=True):
-                o0_a, o0_b = cute.arch.mul_packed_f32x2(
-                    (tOrO0_frg[j], tOrO0_frg[j + 1]), (scale0, scale0)
-                )
-                o1_a, o1_b = cute.arch.mul_packed_f32x2(
-                    (tOrO1_frg[j], tOrO1_frg[j + 1]), (scale1, scale1)
-                )
-                tOrO0_frg[j] = o0_a + o1_a
-                tOrO0_frg[j + 1] = o0_b + o1_b
+            # When both scales are 0 (empty tile), skip tmem reads to avoid 0*NaN=NaN.
+            is_zero_output = scale0 == Float32(0.0) and scale1 == Float32(0.0)
+            if not is_zero_output:
+                cute.copy(tiled_tmem_load, tOtO0_t2r_i, tOrO0_frg)
+                cute.copy(tiled_tmem_load, tOtO1_t2r_i, tOrO1_frg)
+                # Combined: O = O0 * scale0 + O1 * scale1
+                for j in cutlass.range(0, cute.size(tOrO0_frg), 2, unroll_full=True):
+                    o0_a, o0_b = cute.arch.mul_packed_f32x2(
+                        (tOrO0_frg[j], tOrO0_frg[j + 1]), (scale0, scale0)
+                    )
+                    o1_a, o1_b = cute.arch.mul_packed_f32x2(
+                        (tOrO1_frg[j], tOrO1_frg[j + 1]), (scale1, scale1)
+                    )
+                    tOrO0_frg[j], tOrO0_frg[j + 1] = cute.arch.add_packed_f32x2(
+                        (o0_a, o0_b), (o1_a, o1_b)
+                    )
+            else:
+                tOrO0_frg.fill(Float32(0.0))
             copy_utils.cvt_copy(tiled_smem_store, tOrO0_frg, tOsO_r2s_i)
         cute.arch.fence_view_async_shared()
 

@@ -80,7 +80,7 @@ def make_random_block_sparse_args(batch_size, seqlen_q, seqlen_k, nheads, tile_m
 def make_random_variable_block_sparse_args(batch_size, seqlen_q, seqlen_k, nheads, tile_m=128, tile_n=128, device="cuda"):
     """Create random block-sparse args with per-(batch, head, q_block) variable block counts.
 
-    Each Q block gets a random block_sparse_num in [1, num_kv_blocks].
+    Each Q block gets a random block_sparse_num in [0, num_kv_blocks].
     q2k_block_index is padded to num_kv_blocks with zeros (unused entries).
     Returns q2k_block_index, q2k_block_nums, block_sizes.
     """
@@ -88,7 +88,7 @@ def make_random_variable_block_sparse_args(batch_size, seqlen_q, seqlen_k, nhead
     num_kv_blocks = (seqlen_k + tile_n - 1) // tile_n
     assert num_kv_blocks >= 1, f"num_kv_blocks={num_kv_blocks} must be >= 1"
 
-    possible_counts = list(range(1, num_kv_blocks + 1))
+    possible_counts = list(range(0, num_kv_blocks + 1))
 
     # Per-(b, h, m) random block count
     q2k_block_nums = torch.empty(batch_size, nheads, num_q_blocks, dtype=torch.int32, device=device)
@@ -244,11 +244,17 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
         upcast=False, reorder_ops=True,
     )
 
+    # Q rows with all-masked KV (e.g., block_count=0) produce NaN in reference;
+    # kernel outputs 0 for these rows. Replace NaN with 0 for comparison.
+    out_ref = torch.nan_to_num(out_ref, nan=0.0)
+    out_pt = torch.nan_to_num(out_pt, nan=0.0)
+
     fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
     rtol = 2
 
     out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes,
                              q2k_block_nums=q2k_block_nums)
+    out = torch.nan_to_num(out, nan=0.0)
 
     kernel_diff = (out - out_ref).abs().max().item()
     pt_diff = (out_pt - out_ref).abs().max().item()
@@ -318,10 +324,18 @@ def run_quick_tests():
     print("-" * 70)
     print("Variable block_sparse_num tests")
     var_configs = [
+        # Small configs — few tiles, tests odd/even/zero N mix
         (1, 64, 512, 4, 4, 128),
         (1, 256, 512, 4, 4, 128),
         (1, 128, 640, 4, 4, 128),
-        (1, 64, 256, 8, 1, 128),
+        (1, 64, 256, 8, 1, 128),     # MQA
+        # Large configs — persistent scheduling multi-round (tiles > 148 SMs)
+        (4, 1024, 1024, 6, 6, 128),  # 192 tiles, MHA
+        (4, 1024, 1024, 6, 3, 128),  # 192 tiles, GQA
+        (2, 2048, 2048, 4, 4, 64),   # 128 tiles, d=64
+        # Different head dims
+        (1, 256, 512, 4, 4, 64),
+        (1, 256, 512, 4, 4, 96),
     ]
     for bs, sq, sk, hq, hk, d in var_configs:
         _test_single(bs, sq, sk, hq, hk, d, use_variable_block_nums=True)
@@ -364,6 +378,47 @@ def run_benchmark_suite():
         for s, e in evts:
             s.record()
             bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes)
+            e.record()
+        torch.cuda.synchronize()
+
+        times = sorted([s.elapsed_time(e) for s, e in evts])
+        med = times[len(times) // 2]
+        f = flops(bs, nheads, seqlen, seqlen, hdim, hdim)
+        tflops = f / (med * 1e-3) / 1e12
+        print(f"{label:<40} {med:>8.3f} {tflops:>8.1f}")
+
+    # Variable block nums path (uniform count = same as dense, measures overhead of mBlockNums path)
+    print()
+    print(f"{'Config (q2k_block_nums path)':<40} {'ms':>8} {'TFLOPS':>8}")
+    print("-" * 60)
+
+    for bs, nheads, seqlen, hdim in configs:
+        label = f"bs={bs} h={nheads} sq={seqlen} d={hdim}"
+        dtype = torch.bfloat16
+        tile_n = 128
+        num_q_blocks = seqlen // 128
+        num_kv_blocks = seqlen // tile_n
+        q = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
+        k = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
+        v = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
+        q2k_block_index, block_sparse_num, block_sizes = make_dense_block_sparse_args(
+            bs, seqlen, seqlen, nheads, device="cuda",
+        )
+        q2k_block_nums = torch.full((bs, nheads, num_q_blocks), num_kv_blocks,
+                                     dtype=torch.int32, device="cuda")
+
+        for _ in range(10):
+            bsa_attn_fwd(q, k, v, q2k_block_index, 0, block_sizes, q2k_block_nums=q2k_block_nums)
+        torch.cuda.synchronize()
+
+        niters = 100
+        evts = [
+            (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+            for _ in range(niters)
+        ]
+        for s, e in evts:
+            s.record()
+            bsa_attn_fwd(q, k, v, q2k_block_index, 0, block_sizes, q2k_block_nums=q2k_block_nums)
             e.record()
         torch.cuda.synchronize()
 
