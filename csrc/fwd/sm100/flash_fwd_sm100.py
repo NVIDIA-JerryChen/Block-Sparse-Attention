@@ -181,14 +181,14 @@ class FlashAttentionForwardSm100:
             self.num_regs_other = 48
         else:
             if not self.enable_ex2_emu:
-                self.num_regs_softmax = 192
+                self.num_regs_softmax = 184
             else:
-                self.num_regs_softmax = 192
+                self.num_regs_softmax = 184
             if not self.enable_ex2_emu:
-                self.num_regs_correction = 80
+                self.num_regs_correction = 88
             else:
-                self.num_regs_correction = 80
-            self.num_regs_other = 48
+                self.num_regs_correction = 88
+            self.num_regs_other = 56
 
         self.buffer_align_bytes = 1024
 
@@ -296,9 +296,9 @@ class FlashAttentionForwardSm100:
         # This can be tuned
         # This is currently very ad-hoc, we should tune it systematically
         self.ex2_emu_freq = 0
-        self.ex2_emu_start_frg = 1
+        self.ex2_emu_start_frg = 0
         if const_expr(self.enable_ex2_emu):
-            self.ex2_emu_freq = 16
+            self.ex2_emu_freq = 10
             if const_expr(self.head_dim_padded == 128 and self.use_2cta_instrs):
                 self.ex2_emu_freq = 12
             if const_expr(
