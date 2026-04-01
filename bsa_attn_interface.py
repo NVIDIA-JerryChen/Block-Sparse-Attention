@@ -16,10 +16,10 @@ from cutlass import Int32, Float32
 from utils.cache_utils import get_jit_cache
 from utils.testing import is_fake_mode
 
-from csrc.fwd.sm100 import utils
+from csrc.fwd.sm100_blk128 import utils
 from utils import fa_logging
-from csrc.fwd.sm100.cute_dsl_utils import to_cute_tensor
-from csrc.fwd.sm100.flash_fwd_sm100 import FlashAttentionForwardSm100
+from csrc.fwd.sm100_blk128.cute_dsl_utils import to_cute_tensor
+from csrc.fwd.sm100_blk128.flash_fwd_sm100 import FlashAttentionForwardSm100
 
 _bsa_clc_enabled: bool = os.environ.get("BSA_CLC", "1") == "1"
 

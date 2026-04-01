@@ -6,32 +6,46 @@ Usage:
     python test_flash_fwd.py profile      # single fwd for ncu
 """
 
+import os
 import sys
 import math
 
 import pytest
 import torch
 
+# BSA_BLK env var: "64", "128", or "64,128" (default). Controls which blk sizes to test.
+_BSA_BLK = os.environ.get("BSA_BLK", "64,128")
+_BLK_SIZES = [int(x) for x in _BSA_BLK.split(",")]
+
 from utils.testing import attention_ref
 from utils.bench_utils import flops
 from utils.benchmark import benchmark_forward
 from bsa_attn_interface import bsa_attn_fwd
 
+# Optional: blk64 C++ AOT kernel
+try:
+    import sys as _sys
+    _sys.path.insert(0, "build")
+    import bsa_fwd_blk64_ext
+    HAS_BLK64 = True
+except ImportError:
+    HAS_BLK64 = False
+
 
 # ============== Block-sparse helpers ==============
 
-def make_dense_block_sparse_args(batch_size, seqlen_q, seqlen_k, nheads, tile_m=128, tile_n=128, device="cuda"):
+def make_dense_block_sparse_args(batch_size, seqlen_q, seqlen_k, nheads, blk_m=128, blk_n=128, device="cuda"):
     """Create block-sparse args equivalent to dense (full) attention.  For benchmark/profile.
 
-    All block_sizes = tile_n (full blocks).  Requires seqlen_k % (2*tile_n) == 0.
+    All block_sizes = blk_n (full blocks).  Requires seqlen_k % (2*blk_n) == 0.
     Returns q2k_block_index, block_sparse_num, block_sizes.
     """
-    num_q_blocks = (seqlen_q + tile_m - 1) // tile_m
-    num_kv_blocks = (seqlen_k + tile_n - 1) // tile_n
+    num_q_blocks = (seqlen_q + blk_m - 1) // blk_m
+    num_kv_blocks = (seqlen_k + blk_n - 1) // blk_n
 
     assert num_kv_blocks >= 2 and num_kv_blocks % 2 == 0, (
         f"num_kv_blocks={num_kv_blocks} must be even and >= 2 for dense-equivalent test. "
-        f"Adjust seqlen_k to be a multiple of {2 * tile_n}."
+        f"Adjust seqlen_k to be a multiple of {2 * blk_n}."
     )
     block_sparse_num = num_kv_blocks
 
@@ -40,25 +54,28 @@ def make_dense_block_sparse_args(batch_size, seqlen_q, seqlen_k, nheads, tile_m=
         batch_size, nheads, num_q_blocks, num_kv_blocks
     ).contiguous()
 
-    block_sizes = torch.full((num_kv_blocks,), tile_n, dtype=torch.int32, device=device)
+    block_sizes = torch.full((num_kv_blocks,), blk_n, dtype=torch.int32, device=device)
     return q2k_block_index, block_sparse_num, block_sizes
 
 
-def make_random_block_sparse_args(batch_size, seqlen_q, seqlen_k, nheads, tile_m=128, tile_n=128, device="cuda"):
+def make_random_block_sparse_args(batch_size, seqlen_q, seqlen_k, nheads, blk_m=128, blk_n=128, device="cuda"):
     """Create random block-sparse args for correctness testing.
 
     Random block_sparse_num (even, >= 2), random per-(batch,head,q_block) KV block
-    selection, and random block_sizes in [1, tile_n].
+    selection, and random block_sizes in [1, blk_n].
     Returns q2k_block_index, block_sparse_num, block_sizes.
     """
-    num_q_blocks = (seqlen_q + tile_m - 1) // tile_m
-    num_kv_blocks = (seqlen_k + tile_n - 1) // tile_n
+    num_q_blocks = (seqlen_q + blk_m - 1) // blk_m
+    num_kv_blocks = (seqlen_k + blk_n - 1) // blk_n
     assert num_kv_blocks >= 2, f"num_kv_blocks={num_kv_blocks} must be >= 2"
 
     max_even = num_kv_blocks if num_kv_blocks % 2 == 0 else num_kv_blocks - 1
     # Minimum bsn=4 to avoid pre-existing kernel issue with bsn=2 + large batch + small hdim
     min_bsn = min(4, max_even)
-    possible_counts = list(range(min_bsn, max_even + 1, 2))
+    # blk64: phantom padding allows any count >= 1. Step by 2 for variety.
+    # blk128: step by 2 as before.
+    step = 2
+    possible_counts = list(range(min_bsn, max_even + 1, step))
     block_sparse_num = possible_counts[torch.randint(len(possible_counts), (1,)).item()]
 
     q2k_block_index = torch.empty(batch_size, nheads, num_q_blocks, block_sparse_num,
@@ -69,26 +86,30 @@ def make_random_block_sparse_args(batch_size, seqlen_q, seqlen_k, nheads, tile_m
                 perm = torch.randperm(num_kv_blocks, device=device)[:block_sparse_num]
                 q2k_block_index[b, h, m] = perm.to(torch.int32)
 
-    block_sizes = torch.randint(1, tile_n + 1, (num_kv_blocks,), dtype=torch.int32, device=device)
-    last_block_actual = seqlen_k - (num_kv_blocks - 1) * tile_n
-    if last_block_actual < tile_n:
+    block_sizes = torch.randint(1, blk_n + 1, (num_kv_blocks,), dtype=torch.int32, device=device)
+    last_block_actual = seqlen_k - (num_kv_blocks - 1) * blk_n
+    if last_block_actual < blk_n:
         block_sizes[-1] = min(block_sizes[-1].item(), last_block_actual)
 
     return q2k_block_index, block_sparse_num, block_sizes
 
 
-def make_random_variable_block_sparse_args(batch_size, seqlen_q, seqlen_k, nheads, tile_m=128, tile_n=128, device="cuda"):
+def make_random_variable_block_sparse_args(batch_size, seqlen_q, seqlen_k, nheads, blk_m=128, blk_n=128, device="cuda"):
     """Create random block-sparse args with per-(batch, head, q_block) variable block counts.
 
     Each Q block gets a random block_sparse_num in [0, num_kv_blocks].
     q2k_block_index is padded to num_kv_blocks with zeros (unused entries).
     Returns q2k_block_index, q2k_block_nums, block_sizes.
     """
-    num_q_blocks = (seqlen_q + tile_m - 1) // tile_m
-    num_kv_blocks = (seqlen_k + tile_n - 1) // tile_n
+    num_q_blocks = (seqlen_q + blk_m - 1) // blk_m
+    num_kv_blocks = (seqlen_k + blk_n - 1) // blk_n
     assert num_kv_blocks >= 1, f"num_kv_blocks={num_kv_blocks} must be >= 1"
 
-    possible_counts = list(range(0, num_kv_blocks + 1))
+    # blk64: any count >= 1 (phantom padding handles arbitrary counts), no zero yet
+    if blk_n == 64:
+        possible_counts = list(range(1, num_kv_blocks + 1))
+    else:
+        possible_counts = list(range(0, num_kv_blocks + 1))
 
     # Per-(b, h, m) random block count
     q2k_block_nums = torch.empty(batch_size, nheads, num_q_blocks, dtype=torch.int32, device=device)
@@ -102,16 +123,16 @@ def make_random_variable_block_sparse_args(batch_size, seqlen_q, seqlen_k, nhead
                 perm = torch.randperm(num_kv_blocks, device=device)[:bsn]
                 q2k_block_index[b, h, m, :bsn] = perm.to(torch.int32)
 
-    block_sizes = torch.randint(1, tile_n + 1, (num_kv_blocks,), dtype=torch.int32, device=device)
-    last_block_actual = seqlen_k - (num_kv_blocks - 1) * tile_n
-    if last_block_actual < tile_n:
+    block_sizes = torch.randint(1, blk_n + 1, (num_kv_blocks,), dtype=torch.int32, device=device)
+    last_block_actual = seqlen_k - (num_kv_blocks - 1) * blk_n
+    if last_block_actual < blk_n:
         block_sizes[-1] = min(block_sizes[-1].item(), last_block_actual)
 
     return q2k_block_index, q2k_block_nums, block_sizes
 
 
 def block_sparse_to_attn_bias(q2k_block_index, block_sparse_num, block_sizes,
-                               seqlen_q, seqlen_k, tile_m=128, tile_n=128,
+                               seqlen_q, seqlen_k, blk_m=128, blk_n=128,
                                q2k_block_nums=None):
     """Convert block-sparse args to additive attention bias for reference.
 
@@ -125,8 +146,8 @@ def block_sparse_to_attn_bias(q2k_block_index, block_sparse_num, block_sizes,
     num_kv_blocks = block_sizes.shape[0]
     device = q2k_block_index.device
 
-    col_idx = torch.arange(tile_n, device=device)
-    block_valid = col_idx.unsqueeze(0) < block_sizes.unsqueeze(1)  # (num_kv_blocks, tile_n)
+    col_idx = torch.arange(blk_n, device=device)
+    block_valid = col_idx.unsqueeze(0) < block_sizes.unsqueeze(1)  # (num_kv_blocks, blk_n)
 
     if q2k_block_nums is None:
         # Fixed block_sparse_num: all entries up to block_sparse_num are valid
@@ -144,7 +165,7 @@ def block_sparse_to_attn_bias(q2k_block_index, block_sparse_num, block_sizes,
                     indices = q2k_block_index[b, h, m, :bsn].long()
                     block_attended[b, h, m].scatter_(0, indices, True)
 
-    # (batch, nheads, num_q_blocks, num_kv_blocks, tile_n) -> clip to seqlen_k
+    # (batch, nheads, num_q_blocks, num_kv_blocks, blk_n) -> clip to seqlen_k
     token_valid = (block_attended.unsqueeze(-1) & block_valid).reshape(
         batch_size, nheads, num_q_blocks, -1
     )[..., :seqlen_k]
@@ -152,8 +173,8 @@ def block_sparse_to_attn_bias(q2k_block_index, block_sparse_num, block_sizes,
     attn_bias = torch.full((batch_size, nheads, seqlen_q, seqlen_k), float("-inf"),
                            device=device, dtype=torch.float32)
     for m in range(num_q_blocks):
-        q_start = m * tile_m
-        q_end = min((m + 1) * tile_m, seqlen_q)
+        q_start = m * blk_m
+        q_end = min((m + 1) * blk_m, seqlen_q)
         attn_bias[:, :, q_start:q_end] = torch.where(
             token_valid[:, :, m : m + 1], 0.0, float("-inf"),
         )
@@ -193,17 +214,25 @@ def pack_gqa_attn_bias(attn_bias_kv, nheads, qhead_per_kvhead, seqlen_q):
 # ============== Correctness helpers ==============
 
 def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloat16,
-                  use_variable_block_nums=False):
+                  use_variable_block_nums=False, blk_m=128, blk_n=128):
     """Run a single correctness test with random block-sparse pattern.
 
-    Tolerance (from FA4 test_flash_attn.py):
-        fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max()   # bf16 noise floor
-        rtol = 2
-        assert |out - out_ref| <= rtol * |out_pt - out_ref| + fwd_atol
+    blk_m/blk_n: block sizes. blk_n=64 routes to blk64 C++ AOT kernel.
     """
     device = "cuda"
     torch.manual_seed(0)
     torch.cuda.empty_cache()
+
+    is_blk64 = (blk_m == 64 and blk_n == 64)
+
+    # blk64 constraints: skip unsupported configurations
+    if is_blk64:
+        if not HAS_BLK64:
+            pytest.skip("bsa_fwd_blk64_ext not built")
+        if nheads_kv != nheads:
+            pytest.skip("blk64 does not support GQA/MQA")
+        if d != 128:
+            pytest.skip("blk64 requires d=128")
 
     q_ref = torch.randn(bs, seqlen_q, nheads, d, device=device, dtype=dtype).requires_grad_()
     k_ref = torch.randn(bs, seqlen_k, nheads_kv, d, device=device, dtype=dtype).requires_grad_()
@@ -212,8 +241,6 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
     k = k_ref.detach().requires_grad_()
     v = v_ref.detach().requires_grad_()
 
-    # With pack_gqa, the kernel indexes q2k by nheads_kv (not nheads_q) and
-    # seqlen_q is packed: seqlen_q_eff = seqlen_q * qhead_per_kvhead.
     qhead_per_kvhead = nheads // nheads_kv
     pack_gqa = qhead_per_kvhead > 1 and (128 % qhead_per_kvhead == 0)
     nheads_q2k = nheads_kv if pack_gqa else nheads
@@ -222,19 +249,17 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
     q2k_block_nums = None
     if use_variable_block_nums:
         q2k_block_index, q2k_block_nums, block_sizes = make_random_variable_block_sparse_args(
-            bs, seqlen_q_q2k, seqlen_k, nheads_q2k, device=device,
+            bs, seqlen_q_q2k, seqlen_k, nheads_q2k, blk_m=blk_m, blk_n=blk_n, device=device,
         )
-        block_sparse_num = 0  # unused when q2k_block_nums is provided
+        block_sparse_num = 0
     else:
         q2k_block_index, block_sparse_num, block_sizes = make_random_block_sparse_args(
-            bs, seqlen_q_q2k, seqlen_k, nheads_q2k, device=device,
+            bs, seqlen_q_q2k, seqlen_k, nheads_q2k, blk_m=blk_m, blk_n=blk_n, device=device,
         )
 
-    # Build attn_bias at (bs, nheads_q, seqlen_q, seqlen_k) for the reference.
-    # Expand nheads_kv → nheads_q: all Q heads in the same KV group share the same pattern.
     attn_bias_kv = block_sparse_to_attn_bias(
         q2k_block_index, block_sparse_num, block_sizes, seqlen_q_q2k, seqlen_k,
-        q2k_block_nums=q2k_block_nums,
+        blk_m=blk_m, blk_n=blk_n, q2k_block_nums=q2k_block_nums,
     )
     attn_bias = pack_gqa_attn_bias(attn_bias_kv, nheads, qhead_per_kvhead, seqlen_q) if pack_gqa else attn_bias_kv
 
@@ -244,16 +269,21 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
         upcast=False, reorder_ops=True,
     )
 
-    # Q rows with all-masked KV (e.g., block_count=0) produce NaN in reference;
-    # kernel outputs 0 for these rows. Replace NaN with 0 for comparison.
     out_ref = torch.nan_to_num(out_ref, nan=0.0)
     out_pt = torch.nan_to_num(out_pt, nan=0.0)
 
     fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
     rtol = 2
 
-    out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes,
-                             q2k_block_nums=q2k_block_nums)
+    if is_blk64:
+        softmax_scale = 1.0 / math.sqrt(d)
+        bn_arg = q2k_block_nums if use_variable_block_nums else torch.Tensor()
+        out = bsa_fwd_blk64_ext.bsa_fused_fwd_blk64(
+            q, k, v, q2k_block_index, block_sparse_num, block_sizes, softmax_scale, bn_arg)
+        lse = None
+    else:
+        out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes,
+                                 q2k_block_nums=q2k_block_nums)
     out = torch.nan_to_num(out, nan=0.0)
 
     kernel_diff = (out - out_ref).abs().max().item()
@@ -261,11 +291,12 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
     tol = rtol * pt_diff + fwd_atol
     passed = kernel_diff <= tol
 
+    blk_str = f" blk={blk_n}" if blk_n != 128 else ""
     mode_str = "var_bsn" if use_variable_block_nums else f"sparse_num={block_sparse_num}"
     tag = "PASS" if passed else "FAIL"
     print(
         f"  {tag} bs={bs} sq={seqlen_q} sk={seqlen_k} h={nheads}/{nheads_kv} d={d} "
-        f"{mode_str}: "
+        f"{mode_str}{blk_str}: "
         f"kernel={kernel_diff:.6f} pt={pt_diff:.6f} tol={tol:.6f}"
     )
     assert passed, f"kernel_diff={kernel_diff} > tol={tol}"
@@ -277,70 +308,112 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
 @pytest.mark.parametrize("mha_type", ["mha", "gqa", "mqa"])
 @pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("use_variable_block_nums", [False, True])
+@pytest.mark.parametrize("blk_n", _BLK_SIZES)
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
-        # num_kv_blocks >= 2 required (seqlen_k >= 129 for tile_n=128)
-        (64, 256),
-        (64, 384),
         (64, 512),
         (64, 1024),
-        (128, 256),
-        (128, 640),
+        (128, 512),
         (128, 1024),
-        (256, 256),
         (256, 512),
+        (256, 1024),
         (1024, 1024),
         (2048, 2048),
         (4096, 4096),
     ],
 )
-def test_flash_fwd_sm100(seqlen_q, seqlen_k, d, mha_type, dtype, use_variable_block_nums):
+def test_flash_fwd_sm100(seqlen_q, seqlen_k, d, mha_type, dtype, use_variable_block_nums, blk_n):
     batch_size = 4 if seqlen_k <= 2048 else 2
     nheads = 6
     nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
+    blk_m = 64 if blk_n == 64 else 128
     _test_single(batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype,
-                  use_variable_block_nums=use_variable_block_nums)
+                  use_variable_block_nums=use_variable_block_nums,
+                  blk_m=blk_m, blk_n=blk_n)
 
 
 # ============== Quick test (make tt) ==============
 
 def run_quick_tests():
-    print("Quick correctness tests")
-    print("=" * 70)
-    configs = [
-        # (bs, sq, sk, hq, hk, d) — num_kv_blocks >= 2 required
-        (1, 64, 256, 4, 4, 128),
-        (1, 64, 384, 4, 4, 128),
-        (1, 64, 512, 4, 4, 128),
-        (1, 64, 256, 8, 1, 128),
-        (1, 256, 256, 4, 4, 128),
-        (1, 128, 640, 4, 4, 128),
-        (1, 1024, 1024, 4, 4, 128),
-        (1, 2048, 2048, 4, 4, 128),
-    ]
-    for bs, sq, sk, hq, hk, d in configs:
-        _test_single(bs, sq, sk, hq, hk, d)
-    print("-" * 70)
-    print("Variable block_sparse_num tests")
-    var_configs = [
-        # Small configs — few tiles, tests odd/even/zero N mix
-        (1, 64, 512, 4, 4, 128),
-        (1, 256, 512, 4, 4, 128),
-        (1, 128, 640, 4, 4, 128),
-        (1, 64, 256, 8, 1, 128),     # MQA
-        # Large configs — persistent scheduling multi-round (tiles > 148 SMs)
-        (4, 1024, 1024, 6, 6, 128),  # 192 tiles, MHA
-        (4, 1024, 1024, 6, 3, 128),  # 192 tiles, GQA
-        (2, 2048, 2048, 4, 4, 64),   # 128 tiles, d=64
-        # Different head dims
-        (1, 256, 512, 4, 4, 64),
-        (1, 256, 512, 4, 4, 96),
-    ]
-    for bs, sq, sk, hq, hk, d in var_configs:
-        _test_single(bs, sq, sk, hq, hk, d, use_variable_block_nums=True)
+    if 128 in _BLK_SIZES:
+        print("Quick correctness tests (blk128)")
+        print("=" * 70)
+        configs_128 = [
+            (1, 64, 256, 4, 4, 128),
+            (1, 64, 384, 4, 4, 128),
+            (1, 64, 512, 4, 4, 128),
+            (1, 64, 256, 8, 1, 128),
+            (1, 256, 256, 4, 4, 128),
+            (1, 128, 640, 4, 4, 128),
+            (1, 1024, 1024, 4, 4, 128),
+            (1, 2048, 2048, 4, 4, 128),
+        ]
+        for bs, sq, sk, hq, hk, d in configs_128:
+            _test_single(bs, sq, sk, hq, hk, d)
+
+    if HAS_BLK64 and 64 in _BLK_SIZES:
+        print("-" * 70)
+        print("Quick correctness tests (blk64)")
+        configs_64 = [
+            (1, 64, 512, 4, 4, 128),
+            (1, 64, 1024, 4, 4, 128),
+            (1, 128, 512, 4, 4, 128),
+            (1, 256, 1024, 4, 4, 128),
+            (1, 1024, 1024, 4, 4, 128),
+            (1, 2048, 2048, 4, 4, 128),
+        ]
+        for bs, sq, sk, hq, hk, d in configs_64:
+            _test_single(bs, sq, sk, hq, hk, d, blk_m=64, blk_n=64)
+
+    if 128 in _BLK_SIZES:
+        print("-" * 70)
+        print("Variable block_sparse_num tests (blk128)")
+        var_configs_128 = [
+            (1, 64, 512, 4, 4, 128),
+            (1, 256, 512, 4, 4, 128),
+            (1, 128, 640, 4, 4, 128),
+            (1, 64, 256, 8, 1, 128),     # MQA
+            (4, 1024, 1024, 6, 6, 128),  # 192 tiles, MHA
+            (4, 1024, 1024, 6, 3, 128),  # 192 tiles, GQA
+            (2, 2048, 2048, 4, 4, 64),   # 128 tiles, d=64
+            (1, 256, 512, 4, 4, 64),
+            (1, 256, 512, 4, 4, 96),
+        ]
+        for bs, sq, sk, hq, hk, d in var_configs_128:
+            _test_single(bs, sq, sk, hq, hk, d, use_variable_block_nums=True)
+
+    if HAS_BLK64 and 64 in _BLK_SIZES:
+        print("-" * 70)
+        print("Variable block_sparse_num tests (blk64)")
+        var_configs_64 = [
+            (1, 64, 512, 4, 4, 128),
+            (1, 128, 1024, 4, 4, 128),
+            (1, 256, 1024, 4, 4, 128),
+            (4, 1024, 1024, 4, 4, 128),
+        ]
+        for bs, sq, sk, hq, hk, d in var_configs_64:
+            _test_single(bs, sq, sk, hq, hk, d, use_variable_block_nums=True,
+                          blk_m=64, blk_n=64)
+
     print("=" * 70)
     print("All quick tests passed.")
+
+
+# ============== Kernel dispatch helper ==============
+
+def _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n,
+                 q2k_block_nums=None, softmax_scale=None):
+    """Dispatch to blk64 or blk128 kernel based on blk_n."""
+    if blk_n == 64:
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+        bn_arg = q2k_block_nums if q2k_block_nums is not None else torch.Tensor()
+        return bsa_fwd_blk64_ext.bsa_fused_fwd_blk64(
+            q, k, v, q2k_block_index, block_sparse_num, block_sizes, softmax_scale, bn_arg)
+    else:
+        return bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes,
+                             q2k_block_nums=q2k_block_nums)[0]
 
 
 # ============== Benchmark (make bb) ==============
@@ -352,81 +425,45 @@ def run_benchmark_suite():
         (1, 40, 16384, 128),
     ]
 
-    print(f"{'Config':<40} {'ms':>8} {'TFLOPS':>8}")
-    print("-" * 60)
+    for blk_n in _BLK_SIZES:
+        blk_m = 64 if blk_n == 64 else 128
+        if blk_n == 64 and not HAS_BLK64:
+            print(f"[blk{blk_n}] skipped (not built)")
+            continue
 
-    for bs, nheads, seqlen, hdim in configs:
-        label = f"bs={bs} h={nheads} sq={seqlen} d={hdim}"
-        dtype = torch.bfloat16
-        q = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
-        k = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
-        v = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
-        q2k_block_index, block_sparse_num, block_sizes = make_dense_block_sparse_args(
-            bs, seqlen, seqlen, nheads, device="cuda",
-        )
+        print(f"\n{'Config (blk=' + str(blk_n) + ')':<40} {'ms':>8} {'TFLOPS':>8}")
+        print("-" * 60)
 
-        # Warmup
-        for _ in range(10):
-            bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes)
-        torch.cuda.synchronize()
+        for bs, nheads, seqlen, hdim in configs:
+            label = f"bs={bs} h={nheads} sq={seqlen} d={hdim}"
+            dtype = torch.bfloat16
+            q = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
+            k = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
+            v = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
+            q2k_block_index, block_sparse_num, block_sizes = make_dense_block_sparse_args(
+                bs, seqlen, seqlen, nheads, blk_m=blk_m, blk_n=blk_n, device="cuda",
+            )
 
-        niters = 100
-        evts = [
-            (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
-            for _ in range(niters)
-        ]
-        for s, e in evts:
-            s.record()
-            bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes)
-            e.record()
-        torch.cuda.synchronize()
+            for _ in range(10):
+                _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n)
+            torch.cuda.synchronize()
 
-        times = sorted([s.elapsed_time(e) for s, e in evts])
-        med = times[len(times) // 2]
-        f = flops(bs, nheads, seqlen, seqlen, hdim, hdim)
-        tflops = f / (med * 1e-3) / 1e12
-        print(f"{label:<40} {med:>8.3f} {tflops:>8.1f}")
+            niters = 100
+            evts = [
+                (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+                for _ in range(niters)
+            ]
+            for s, e in evts:
+                s.record()
+                _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n)
+                e.record()
+            torch.cuda.synchronize()
 
-    # Variable block nums path (uniform count = same as dense, measures overhead of mBlockNums path)
-    print()
-    print(f"{'Config (q2k_block_nums path)':<40} {'ms':>8} {'TFLOPS':>8}")
-    print("-" * 60)
-
-    for bs, nheads, seqlen, hdim in configs:
-        label = f"bs={bs} h={nheads} sq={seqlen} d={hdim}"
-        dtype = torch.bfloat16
-        tile_n = 128
-        num_q_blocks = seqlen // 128
-        num_kv_blocks = seqlen // tile_n
-        q = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
-        k = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
-        v = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
-        q2k_block_index, block_sparse_num, block_sizes = make_dense_block_sparse_args(
-            bs, seqlen, seqlen, nheads, device="cuda",
-        )
-        q2k_block_nums = torch.full((bs, nheads, num_q_blocks), num_kv_blocks,
-                                     dtype=torch.int32, device="cuda")
-
-        for _ in range(10):
-            bsa_attn_fwd(q, k, v, q2k_block_index, 0, block_sizes, q2k_block_nums=q2k_block_nums)
-        torch.cuda.synchronize()
-
-        niters = 100
-        evts = [
-            (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
-            for _ in range(niters)
-        ]
-        for s, e in evts:
-            s.record()
-            bsa_attn_fwd(q, k, v, q2k_block_index, 0, block_sizes, q2k_block_nums=q2k_block_nums)
-            e.record()
-        torch.cuda.synchronize()
-
-        times = sorted([s.elapsed_time(e) for s, e in evts])
-        med = times[len(times) // 2]
-        f = flops(bs, nheads, seqlen, seqlen, hdim, hdim)
-        tflops = f / (med * 1e-3) / 1e12
-        print(f"{label:<40} {med:>8.3f} {tflops:>8.1f}")
+            times = sorted([s.elapsed_time(e) for s, e in evts])
+            med = times[len(times) // 2]
+            f = flops(bs, nheads, seqlen, seqlen, hdim, hdim)
+            tflops = f / (med * 1e-3) / 1e12
+            print(f"{label:<40} {med:>8.3f} {tflops:>8.1f}")
 
 
 # ============== Profile (make profile) ==============
@@ -435,18 +472,24 @@ def run_profile():
     bs, nheads, seqlen, hdim = 1, 40, 8192, 128
     dtype = torch.bfloat16
 
-    q = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
-    k = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
-    v = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
-    q2k_block_index, block_sparse_num, block_sizes = make_dense_block_sparse_args(
-        bs, seqlen, seqlen, nheads, device="cuda",
-    )
+    for blk_n in _BLK_SIZES:
+        blk_m = 64 if blk_n == 64 else 128
+        if blk_n == 64 and not HAS_BLK64:
+            print(f"[blk{blk_n}] skipped (not built)")
+            continue
 
-    # Profile run
-    bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes)
-    torch.cuda.synchronize()
+        q = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
+        k = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
+        v = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
+        q2k_block_index, block_sparse_num, block_sizes = make_dense_block_sparse_args(
+            bs, seqlen, seqlen, nheads, blk_m=blk_m, blk_n=blk_n, device="cuda",
+        )
 
-    print(f"Profile done: bs={bs} h={nheads} sq={seqlen} d={hdim}")
+        # Warmup + profile run
+        _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n)
+        torch.cuda.synchronize()
+
+        print(f"Profile done: bs={bs} h={nheads} sq={seqlen} d={hdim} blk={blk_n}")
 
 
 # ============== Main ==============

@@ -37,3 +37,5 @@ profile/*
 
 dev_docs/*
 docs/*
+benchmark_compare.py
+csrc/fwd/sm100_blk128/SASS.txt
