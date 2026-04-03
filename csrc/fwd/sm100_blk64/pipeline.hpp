@@ -31,14 +31,14 @@ static constexpr uint32_t kMBarTicks = 1;
 
 __device__ __forceinline__ void mbarrier_arrive(cute::uint64_t& bar) {
     uint32_t addr = cute::cast_smem_ptr_to_uint(&bar);
-    asm volatile("mbarrier.arrive.shared.b64 _, [%0];\n" : : "r"(addr));
+    asm volatile("mbarrier.arrive.shared.b64 _, [%0];\n" : : "r"(addr) : "memory");
 }
 
 // mbarrier arrive with .release for SMEM store visibility (pairs with .acquire on wait).
 // Single-CTA kernel: .cta scope suffices (was .cluster → MEMBAR.ALL.GPU, now cheaper).
 __device__ __forceinline__ void mbarrier_arrive_release(cute::uint64_t& bar) {
     uint32_t addr = cute::cast_smem_ptr_to_uint(&bar);
-    asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];\n" : : "r"(addr));
+    asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];\n" : : "r"(addr) : "memory");
 }
 
 __device__ __forceinline__ void fence_barrier_init() {
@@ -80,7 +80,7 @@ __device__ __forceinline__ void wait_barrier_acquire(cute::uint64_t& bar, int ph
 
 // Address-based overloads (for pre-computed UR-promoted addresses).
 __device__ __forceinline__ void mbarrier_arrive_addr(uint32_t addr) {
-        asm volatile("mbarrier.arrive.shared.b64 _, [%0];\n" : : "r"(addr));
+        asm volatile("mbarrier.arrive.shared.b64 _, [%0];\n" : : "r"(addr) : "memory");
 }
 
 __device__ __forceinline__ void wait_barrier_addr(uint32_t addr, int phase) {
@@ -420,93 +420,17 @@ __device__ __forceinline__ void issue_clc_query(uint32_t result_addr,
 }
 
 // ============================================================================
-// PipelineCLC: CLC scheduler pipeline
+// PipelineCLC: CLC scheduler pipeline — CUTLASS PipelineCLCFetchAsync<1>
 //
 //   Producer: Sched warp (warp 15 / kSchedWarp) — issues CLC queries.
-//   Consumer: All other warps (480 threads)      — read decoded tile info.
+//   Consumer: Worker warps (kWorkerThreads = 480) — read decoded tile info.
 //
-//   full  — transaction barrier (16-byte tx): signals CLC response arrived.
-//   empty — regular barrier (consumer_arv_count threads): signals tile done.
+//   CUTLASS manages full/empty barriers internally.
+//   CLCResponse buffer is stored separately in kernel SharedStorage.
 // ============================================================================
 
-struct PipelineCLC {
-    struct SharedStorage {
-        alignas(16) uint64_t full;      // transaction barrier (producer arrive_expect_tx)
-        alignas(16) uint64_t empty;     // regular barrier    (consumer arrive)
-        alignas(16) CLCResponse response; // 128-bit CLC response buffer
-    };
-
-    uint32_t full_addr_;
-    uint32_t empty_addr_;
-    uint32_t resp_addr_;
-
-    __device__ PipelineCLC(SharedStorage& s)
-        : full_addr_(smem_ptr_to_uint(&s.full))
-        , empty_addr_(smem_ptr_to_uint(&s.empty))
-        , resp_addr_(smem_ptr_to_uint(&s.response)) {}
-
-    // init: must be called by exactly one thread before any other operation.
-    // prod_count  — arrive count for full  (typically 1, the sched warp lane 0)
-    // cons_count  — arrive count for empty (typically kWorkerThreads = 480)
-    __device__ void init(int prod_count, int cons_count) {
-        asm volatile("mbarrier.init.shared.b64 [%0], %1;\n"
-                 : : "r"(full_addr_),  "r"(prod_count));
-        asm volatile("mbarrier.init.shared.b64 [%0], %1;\n"
-                 : : "r"(empty_addr_), "r"(cons_count));
-    }
-
-    // producer_acquire: sched warp waits for workers to finish the previous tile.
-    // phase — current empty barrier phase (caller must toggle after call).
-    __device__ void producer_acquire(uint32_t phase) {
-        uint32_t _t = kMBarTicks;
-        asm volatile(
-      "{\n"
-      "  .reg .pred P;\n"
-      "  PCLC_ACQ_%=:\n"
-      "  mbarrier.try_wait.parity.shared::cta.b64 P, [%0], %1, %2;\n"
-      "  @P bra.uni PCLC_ACQ_DONE_%=;\n"
-      "  bra.uni PCLC_ACQ_%=;\n"
-      "  PCLC_ACQ_DONE_%=:\n"
-      "}\n"
-      : : "r"(empty_addr_), "r"(phase), "r"(_t) : "memory");
-    }
-
-    // producer_get_barrier: returns the full barrier smem address so caller can
-    // pass it directly to issue_clc_query (which does arrive_expect_tx internally
-    // via hardware). Caller uses producer_expect_tx to signal expect_tx first.
-    __device__ uint32_t producer_get_barrier() { return full_addr_; }
-
-    // producer_expect_tx: sched warp calls arrive_expect_tx(16) on full before
-    // issuing the CLC query (which delivers the 16-byte response).
-    __device__ void producer_expect_tx() {
-        asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;\n"
-                 : : "r"(full_addr_), "r"(16));
-    }
-
-    // get_response_addr: returns smem address of CLCResponse for decode / issue.
-    __device__ uint32_t get_response_addr() { return resp_addr_; }
-
-    // consumer_wait: worker warps wait for the CLC response to arrive.
-    // phase — current full barrier phase (caller must toggle after call).
-    __device__ void consumer_wait(uint32_t phase) {
-        uint32_t _t = kMBarTicks;
-        asm volatile(
-      "{\n"
-      "  .reg .pred P;\n"
-      "  CCLC_WAIT_%=:\n"
-      "  mbarrier.try_wait.parity.shared::cta.b64 P, [%0], %1, %2;\n"
-      "  @P bra.uni CCLC_WAIT_DONE_%=;\n"
-      "  bra.uni CCLC_WAIT_%=;\n"
-      "  CCLC_WAIT_DONE_%=:\n"
-      "}\n"
-      : : "r"(full_addr_), "r"(phase), "r"(_t) : "memory");
-    }
-
-    // consumer_release: worker signals tile done (arrive on empty).
-    __device__ void consumer_release() {
-        asm volatile("mbarrier.arrive.shared.b64 _, [%0];\n"
-                 : : "r"(empty_addr_));
-    }
-};
+static constexpr int kCLCStages = 1;
+using PipelineCLC = cutlass::PipelineCLCFetchAsync<kCLCStages>;
+using PipelineCLCState = cutlass::PipelineState<kCLCStages>;
 
 } // namespace flash

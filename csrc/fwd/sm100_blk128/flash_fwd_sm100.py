@@ -62,6 +62,7 @@ class FlashAttentionForwardSm100:
         use_2cta_instrs: bool = False,
         use_clc_scheduler: bool = False,
         allow_empty_block_nums: bool = False,
+        has_block_sizes: bool = True,
     ):
         self.use_tma_KV = True
         # self.dtype = dtype
@@ -113,6 +114,7 @@ class FlashAttentionForwardSm100:
             )
         self.scheduling_mode = SchedulingMode.CLC if self.use_clc_scheduler else SchedulingMode.STATIC
         self.allow_empty_block_nums = allow_empty_block_nums
+        self.has_block_sizes = has_block_sizes
         self.is_causal = False
         self.is_local = False
         self.is_varlen_q = False
@@ -1565,21 +1567,34 @@ class FlashAttentionForwardSm100:
 
                 # 1st block — phantom block (logical_first >= raw_block_count) uses block_size=0
                 n_block_first = n_block(logical_first)
-                first_block_size = Int32(0) if const_expr(mBlockNums is not None) and logical_first >= raw_block_count else mBlockSizes[n_block_first]
+                if const_expr(self.has_block_sizes):
+                    first_block_size = Int32(0) if const_expr(mBlockNums is not None) and logical_first >= raw_block_count else mBlockSizes[n_block_first]
+                    first_mask_fn = partial(apply_block_size_mask, block_size=first_block_size, n_block_size=self.n_block_size)
+                elif const_expr(mBlockNums is not None):
+                    # No block_sizes but var block nums: phantom block still needs block_size=0 mask;
+                    # real blocks get n_block_size which is a no-op in apply_block_size_mask
+                    first_block_size = Int32(0) if logical_first >= raw_block_count else Int32(self.n_block_size)
+                    first_mask_fn = partial(apply_block_size_mask, block_size=first_block_size, n_block_size=self.n_block_size)
+                else:
+                    first_mask_fn = None
                 mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase = softmax_step(
                     mma_si_consumer_phase,
                     sm_stats_producer_phase,
                     s0_s1_sequence_phase,
-                    mask_fn=partial(apply_block_size_mask, block_size=first_block_size, n_block_size=self.n_block_size),
+                    mask_fn=first_mask_fn,
                     is_first=True,
                 )
                 # Remaining blocks with stride 2 — always valid (logical_n < raw_block_count)
                 for n_tile in cutlass.range(wg_count - 1, unroll=1):
                     logical_n = logical_first - self.s_stage * (n_tile + 1)
                     n_block_cur = n_block(logical_n)
+                    if const_expr(self.has_block_sizes):
+                        remaining_mask_fn = partial(apply_block_size_mask, block_size=mBlockSizes[n_block_cur], n_block_size=self.n_block_size)
+                    else:
+                        remaining_mask_fn = None
                     mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase = softmax_step(
                         mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase,
-                        mask_fn=partial(apply_block_size_mask, block_size=mBlockSizes[n_block_cur], n_block_size=self.n_block_size),
+                        mask_fn=remaining_mask_fn,
                     )
 
                 sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]

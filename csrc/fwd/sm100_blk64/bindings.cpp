@@ -1,6 +1,7 @@
+#include <vector>
 #include <torch/extension.h>
 
-torch::Tensor bsa_fused_fwd_blk64(
+std::vector<torch::Tensor> bsa_fused_fwd_blk64(
         torch::Tensor q, torch::Tensor k, torch::Tensor v,
         torch::Tensor q2k_block_index, int block_sparse_num,
         torch::Tensor block_sizes, float softmax_scale,

@@ -22,10 +22,8 @@ from utils.bench_utils import flops
 from utils.benchmark import benchmark_forward
 from bsa_attn_interface import bsa_attn_fwd
 
-# Optional: blk64 C++ AOT kernel
+# Optional: blk64 C++ AOT kernel (install via `make setup BLK=64`)
 try:
-    import sys as _sys
-    _sys.path.insert(0, "build")
     import bsa_fwd_blk64_ext
     HAS_BLK64 = True
 except ImportError:
@@ -269,6 +267,13 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
         upcast=False, reorder_ops=True,
     )
 
+    # Reference LSE: logsumexp of attention scores (float32)
+    softmax_scale_ref = 1.0 / math.sqrt(d)
+    k_ref_expanded = k_ref.float().repeat_interleave(qhead_per_kvhead, dim=2) if qhead_per_kvhead > 1 else k_ref.float()
+    scores_ref = torch.einsum("bthd,bshd->bhts", q_ref.float() * softmax_scale_ref, k_ref_expanded)
+    scores_ref = scores_ref + attn_bias
+    lse_ref = torch.logsumexp(scores_ref, dim=-1)  # (bs, nheads, seqlen_q)
+
     out_ref = torch.nan_to_num(out_ref, nan=0.0)
     out_pt = torch.nan_to_num(out_pt, nan=0.0)
 
@@ -278,12 +283,11 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
     if is_blk64:
         softmax_scale = 1.0 / math.sqrt(d)
         bn_arg = q2k_block_nums if use_variable_block_nums else torch.Tensor()
-        out = bsa_fwd_blk64_ext.bsa_fused_fwd_blk64(
+        out, lse = bsa_fwd_blk64_ext.bsa_fused_fwd_blk64(
             q, k, v, q2k_block_index, block_sparse_num, block_sizes, softmax_scale, bn_arg)
-        lse = None
     else:
         out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes,
-                                 q2k_block_nums=q2k_block_nums)
+                                 q2k_block_nums=q2k_block_nums, return_lse=True)
     out = torch.nan_to_num(out, nan=0.0)
 
     kernel_diff = (out - out_ref).abs().max().item()
@@ -291,15 +295,25 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
     tol = rtol * pt_diff + fwd_atol
     passed = kernel_diff <= tol
 
+    # LSE validation
+    lse_diff = (lse - lse_ref).abs()
+    # Mask out -inf positions (empty rows) for comparison
+    finite_mask = lse_ref.isfinite()
+    lse_max_diff = lse_diff[finite_mask].max().item() if finite_mask.any() else 0.0
+    lse_tol = 1e-3
+    lse_passed = lse_max_diff <= lse_tol
+    passed = passed and lse_passed
+
     blk_str = f" blk={blk_n}" if blk_n != 128 else ""
     mode_str = "var_bsn" if use_variable_block_nums else f"sparse_num={block_sparse_num}"
     tag = "PASS" if passed else "FAIL"
     print(
         f"  {tag} bs={bs} sq={seqlen_q} sk={seqlen_k} h={nheads}/{nheads_kv} d={d} "
         f"{mode_str}{blk_str}: "
-        f"kernel={kernel_diff:.6f} pt={pt_diff:.6f} tol={tol:.6f}"
+        f"kernel={kernel_diff:.6f} pt={pt_diff:.6f} tol={tol:.6f} "
+        f"lse_diff={lse_max_diff:.6f}"
     )
-    assert passed, f"kernel_diff={kernel_diff} > tol={tol}"
+    assert passed, f"kernel_diff={kernel_diff} > tol={tol}, lse_diff={lse_max_diff} > lse_tol={lse_tol}"
 
 
 # ============== Pytest ==============
@@ -409,8 +423,10 @@ def _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n,
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
         bn_arg = q2k_block_nums if q2k_block_nums is not None else torch.Tensor()
-        return bsa_fwd_blk64_ext.bsa_fused_fwd_blk64(
-            q, k, v, q2k_block_index, block_sparse_num, block_sizes, softmax_scale, bn_arg)
+        bs_arg = block_sizes if block_sizes is not None else torch.Tensor()
+        out, lse = bsa_fwd_blk64_ext.bsa_fused_fwd_blk64(
+            q, k, v, q2k_block_index, block_sparse_num, bs_arg, softmax_scale, bn_arg)
+        return out
     else:
         return bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes,
                              q2k_block_nums=q2k_block_nums)[0]
@@ -418,12 +434,39 @@ def _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n,
 
 # ============== Benchmark (make bb) ==============
 
-def run_benchmark_suite():
-    configs = [
-        (1, 40, 4096, 128),
-        (1, 40, 8192, 128),
-        (1, 40, 16384, 128),
+def _benchmark_one(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n,
+                   q2k_block_nums=None, niters=10):
+    """Warmup + benchmark a single kernel config. Returns median time in ms."""
+    for _ in range(2):
+        _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n,
+                     q2k_block_nums=q2k_block_nums)
+    torch.cuda.synchronize()
+
+    evts = [
+        (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        for _ in range(niters)
     ]
+    for s, e in evts:
+        s.record()
+        _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n,
+                     q2k_block_nums=q2k_block_nums)
+        e.record()
+    torch.cuda.synchronize()
+    times = sorted([s.elapsed_time(e) for s, e in evts])
+    return times[len(times) // 2]
+
+
+def run_benchmark_suite():
+    # (bs, nheads, seqlen, hdim)
+    configs = [
+        # (1, 40, 4096, 128),
+        # (1, 40, 8192, 128),
+        # (1, 40, 16384, 128),
+        (1, 1,  102400, 128),
+    ]
+
+    # topK values to benchmark (0 = dense)
+    topk_values = [0, 32, 64, 128, 256]
 
     for blk_n in _BLK_SIZES:
         blk_m = 64 if blk_n == 64 else 128
@@ -431,46 +474,98 @@ def run_benchmark_suite():
             print(f"[blk{blk_n}] skipped (not built)")
             continue
 
-        print(f"\n{'Config (blk=' + str(blk_n) + ')':<40} {'ms':>8} {'TFLOPS':>8}")
-        print("-" * 60)
+        print(f"\n{'Config (blk=' + str(blk_n) + ')':<48} {'ms':>8} {'TFLOPS':>8}")
+        print("-" * 68)
 
         for bs, nheads, seqlen, hdim in configs:
-            label = f"bs={bs} h={nheads} sq={seqlen} d={hdim}"
             dtype = torch.bfloat16
             q = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
             k = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
             v = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
-            q2k_block_index, block_sparse_num, block_sizes = make_dense_block_sparse_args(
-                bs, seqlen, seqlen, nheads, blk_m=blk_m, blk_n=blk_n, device="cuda",
-            )
 
-            for _ in range(10):
-                _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n)
-            torch.cuda.synchronize()
+            num_kv_blocks = (seqlen + blk_n - 1) // blk_n
 
-            niters = 100
-            evts = [
-                (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
-                for _ in range(niters)
-            ]
-            for s, e in evts:
-                s.record()
-                _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n)
-                e.record()
-            torch.cuda.synchronize()
+            for topk in topk_values:
+                if topk == 0:
+                    # Dense attention
+                    q2k_block_index, bsn, bsizes = make_dense_block_sparse_args(
+                        bs, seqlen, seqlen, nheads, blk_m=blk_m, blk_n=blk_n, device="cuda",
+                    )
+                    q2k_block_nums = None
+                    label = f"bs={bs} h={nheads} sq={seqlen} d={hdim} dense"
+                    effective_sk = seqlen
+                else:
+                    if topk > num_kv_blocks:
+                        continue
+                    # Round topk to even for block_sparse_num compatibility
+                    topk_even = topk if topk % 2 == 0 else topk + 1
+                    q2k_block_index, bsn, bsizes, q2k_block_nums = make_topk_block_sparse_args(
+                        bs, seqlen, seqlen, nheads, topk_even, blk_m=blk_m, blk_n=blk_n, device="cuda",
+                    )
+                    label = f"bs={bs} h={nheads} sq={seqlen} d={hdim} topk={topk_even}"
+                    effective_sk = topk_even * blk_n
 
-            times = sorted([s.elapsed_time(e) for s, e in evts])
-            med = times[len(times) // 2]
-            f = flops(bs, nheads, seqlen, seqlen, hdim, hdim)
-            tflops = f / (med * 1e-3) / 1e12
-            print(f"{label:<40} {med:>8.3f} {tflops:>8.1f}")
+                print(f"  {label:<46} ...", end="", flush=True)
+                med = _benchmark_one(q, k, v, q2k_block_index, bsn, bsizes, blk_n,
+                                     q2k_block_nums=q2k_block_nums)
+                f = flops(bs, nheads, seqlen, effective_sk, hdim, hdim)
+                tflops = f / (med * 1e-3) / 1e12
+                print(f"\r  {label:<46} {med:>8.3f} {tflops:>8.1f}")
 
 
 # ============== Profile (make profile) ==============
 
+def make_topk_block_sparse_args(batch_size, seqlen_q, seqlen_k, nheads, topk, blk_m=128, blk_n=128, device="cuda",
+                                 use_var_block_num=False, use_block_sizes=False):
+    """Create block-sparse args with fixed topK (each Q block attends to topK random KV blocks).
+
+    Args:
+        use_var_block_num: If True, return q2k_block_nums tensor (all entries = topk)
+                           instead of using fixed block_sparse_num.
+        use_block_sizes: If True, set block_sizes to blk_n (actual sizes, enables masking path).
+                         If False, pass None (skip block_sizes masking for faster kernel path).
+
+    Returns q2k_block_index, block_sparse_num, block_sizes, q2k_block_nums.
+    """
+    num_q_blocks = (seqlen_q + blk_m - 1) // blk_m
+    num_kv_blocks = (seqlen_k + blk_n - 1) // blk_n
+    assert topk <= num_kv_blocks, f"topk={topk} > num_kv_blocks={num_kv_blocks}"
+    assert topk % 2 == 0, f"topk={topk} must be even"
+
+    block_sparse_num = topk
+    q2k_block_index = torch.empty(batch_size, nheads, num_q_blocks, block_sparse_num,
+                                   dtype=torch.int32, device=device)
+    for b in range(batch_size):
+        for h in range(nheads):
+            for m in range(num_q_blocks):
+                perm = torch.randperm(num_kv_blocks, device=device)[:block_sparse_num]
+                q2k_block_index[b, h, m] = perm.to(torch.int32)
+
+    if use_block_sizes:
+        block_sizes = torch.full((num_kv_blocks,), blk_n, dtype=torch.int32, device=device)
+        last_block_actual = seqlen_k - (num_kv_blocks - 1) * blk_n
+        if last_block_actual < blk_n:
+            block_sizes[-1] = last_block_actual
+    else:
+        block_sizes = None
+
+    q2k_block_nums = None
+    if use_var_block_num:
+        q2k_block_nums = torch.full((batch_size, nheads, num_q_blocks), topk,
+                                     dtype=torch.int32, device=device)
+
+    return q2k_block_index, block_sparse_num, block_sizes, q2k_block_nums
+
+
 def run_profile():
     bs, nheads, seqlen, hdim = 1, 40, 8192, 128
+    # bs, nheads, seqlen, hdim = 1, 1, 1024000, 128
+    topk = 64 # each Q block attends to topK KV blocks
     dtype = torch.bfloat16
+
+    # Toggle features via env vars: BSA_VAR_BN=1  BSA_BLKSZ=1
+    use_var_block_num = os.environ.get("BSA_VAR_BN", "0") == "1"
+    use_block_sizes = os.environ.get("BSA_BLKSZ", "0") == "1"
 
     for blk_n in _BLK_SIZES:
         blk_m = 64 if blk_n == 64 else 128
@@ -481,15 +576,23 @@ def run_profile():
         q = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
         k = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
         v = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
-        q2k_block_index, block_sparse_num, block_sizes = make_dense_block_sparse_args(
-            bs, seqlen, seqlen, nheads, blk_m=blk_m, blk_n=blk_n, device="cuda",
+        q2k_block_index, block_sparse_num, block_sizes, q2k_block_nums = make_topk_block_sparse_args(
+            bs, seqlen, seqlen, nheads, topk, blk_m=blk_m, blk_n=blk_n, device="cuda",
+            use_var_block_num=use_var_block_num, use_block_sizes=use_block_sizes,
         )
 
         # Warmup + profile run
-        _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n)
+        _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n,
+                     q2k_block_nums=q2k_block_nums)
         torch.cuda.synchronize()
 
-        print(f"Profile done: bs={bs} h={nheads} sq={seqlen} d={hdim} blk={blk_n}")
+        flags = []
+        if use_var_block_num:
+            flags.append("var_bn")
+        if use_block_sizes:
+            flags.append("blksz")
+        flag_str = f" [{','.join(flags)}]" if flags else ""
+        print(f"Profile done: bs={bs} h={nheads} sq={seqlen} d={hdim} topk={topk} blk={blk_n}{flag_str}")
 
 
 # ============== Main ==============

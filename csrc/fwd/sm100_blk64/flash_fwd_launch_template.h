@@ -6,7 +6,9 @@
 #pragma once
 #define CUDA_CTA_RECONFIG_ACTIVATED 1
 
+#include <limits>
 #include <sstream>
+#include <vector>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
@@ -20,7 +22,7 @@ namespace flash {
 
 // Templated launch: HasVarBlockNums/HasBlockSizes select kernel variant at compile time.
 template<bool HasVarBlockNums, bool HasBlockSizes>
-torch::Tensor bsa_fused_fwd_blk64_launch(
+std::vector<torch::Tensor> bsa_fused_fwd_blk64_launch(
         torch::Tensor q, torch::Tensor k, torch::Tensor v,
         torch::Tensor q2k_block_index, int block_sparse_num,
         torch::Tensor block_sizes, float softmax_scale,
@@ -100,6 +102,9 @@ torch::Tensor bsa_fused_fwd_blk64_launch(
                             .contiguous();
 
     auto out_flat = torch::zeros({batch * heads * num_row_tiles, kRows, kOutputCols}, q.options());
+    auto lse_flat = torch::full({batch * heads * num_row_tiles * kRows},
+                                -std::numeric_limits<float>::infinity(),
+                                torch::dtype(torch::kFloat32).device(q.device()));
 
     // block_indices: flatten to (B*H, Q, max_KV)
     auto bi_flat = q2k_block_index.reshape({batch * heads, num_row_tiles, -1}).contiguous();
@@ -129,7 +134,8 @@ torch::Tensor bsa_fused_fwd_blk64_launch(
             raw_block_sparse_num,
         },
         // epilogue
-        { reinterpret_cast<bf16*>(out_flat.data_ptr<at::BFloat16>()) },
+        { reinterpret_cast<bf16*>(out_flat.data_ptr<at::BFloat16>()),
+          lse_flat.data_ptr<float>() },
         // dimensions
         rows_padded, seq_padded, heads, batch, total_k_padded,
     };
@@ -161,7 +167,10 @@ torch::Tensor bsa_fused_fwd_blk64_launch(
                        .narrow(2, 0, seq_q)
                        .permute({0, 2, 1, 3})
                        .contiguous();
-    return out;
+    auto lse = lse_flat.view({batch, heads, rows_padded})
+                       .narrow(2, 0, seq_q)
+                       .contiguous();
+    return {out, lse};
 }
 
 } // namespace flash

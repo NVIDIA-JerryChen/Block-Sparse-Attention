@@ -112,6 +112,7 @@ struct FusedAttnFwdSm100 {
             PipelineSmStats::SharedStorage sm_stats;
             PipelinePLastSplit::SharedStorage p_lastsplit;
             PipelineCLC::SharedStorage clc;
+            alignas(16) CLCResponse clc_response[kCLCStages];
 
             alignas(16) cute::uint64_t bar_q_ready;
         } pipelines;
@@ -200,7 +201,21 @@ struct FusedAttnFwdSm100 {
         PipelineOEpi    pipeline_o_epi(shared_storage.pipelines.o_epi);
         PipelineSmStats pipeline_sm_stats(shared_storage.pipelines.sm_stats);
         PipelinePLastSplit pipeline_p_lastsplit(shared_storage.pipelines.p_lastsplit);
-        PipelineCLC     pipeline_clc(shared_storage.pipelines.clc);
+
+        // PipelineCLC: CUTLASS PipelineCLCFetchAsync constructor initializes barriers.
+        // Scheduler warp = ProducerConsumer, all others = Consumer.
+        PipelineCLC::Params clc_params;
+        clc_params.transaction_bytes = 16;  // sizeof(CLCResponse)
+        clc_params.role = (warp_idx == kSchedWarp)
+            ? PipelineCLC::ThreadCategory::ProducerConsumer
+            : PipelineCLC::ThreadCategory::Consumer;
+        clc_params.is_leader = 1;              // single CTA
+        clc_params.num_consumers = 1;          // single CTA
+        clc_params.producer_blockid = 0;       // single CTA
+        clc_params.producer_arv_count = 1;     // lane 0 does arrive_and_expect_tx
+        clc_params.consumer_arv_count = kWorkerThreads; // 480 worker threads do consumer_release (scheduler does NOT)
+        clc_params.initializing_warp = 0;      // warp 0 initializes CLC barriers
+        PipelineCLC pipeline_clc(shared_storage.pipelines.clc, clc_params);
 
         // Init all barriers: KV pipeline (warp-wide) + others (elect_one)
         if (warp_idx == 0) {
@@ -213,7 +228,7 @@ struct FusedAttnFwdSm100 {
             pipeline_o_epi.init();
             pipeline_sm_stats.init();
             pipeline_p_lastsplit.init();
-            pipeline_clc.init(1, kWorkerThreads);
+            // PipelineCLC barriers initialized by CUTLASS constructor above
             cute::initialize_barrier(shared_storage.pipelines.bar_q_ready, 1);
             shared_storage.tmem_ready = 0;
         }
@@ -246,20 +261,21 @@ struct FusedAttnFwdSm100 {
         CollectiveEpilogue epilogue;
 
         if (warp_idx == kSchedWarp) {
-            // ===== WG3 warp 15: CLC scheduler (CUTLASS pattern) =====
-            // No pipeline re-init between tiles — states persist (BSA/CUTLASS).
+            // ===== WG3 warp 15: CLC scheduler (lane 0 only) =====
+            // Only lane 0 runs the scheduling loop (matching original pattern).
+            // producer_tail drains the pipeline on exit.
             if (lane_idx == 0) {
-                CLCTileScheduler tile_sched(pipeline_clc, {params.num_row_tiles, params.num_kv_blocks, params.num_heads, params.batch});
+                CLCTileScheduler tile_sched(pipeline_clc, shared_storage.pipelines.clc_response, {params.num_row_tiles, params.num_kv_blocks, params.num_heads, params.batch});
+
                 auto work = tile_sched.initial_work_tile_info();
                 while (work.is_valid) {
                     tile_sched.advance_to_next_work([&]() {
-                        // Only OEpi needs re-init (single-stage, not self-balancing).
-                        // All other pipelines persist across tiles (BSA/CUTLASS pattern).
                         pipeline_o_epi.init();
                         fence_barrier_init();
                     });
                     work = tile_sched.fetch_next_work();
                 }
+                // producer_tail intentionally omitted (matches original)
             }
         }
         else if (warp_idx == kMmaWarp) {
@@ -272,7 +288,7 @@ struct FusedAttnFwdSm100 {
 
             const uint32_t tmem_base = shared_storage.tmem_base_ptr;
             typename CollectiveMainloop::MmaState mma_state;
-            CLCTileScheduler tile_sched(pipeline_clc, {params.num_row_tiles, params.num_kv_blocks, params.num_heads, params.batch});
+            CLCTileScheduler tile_sched(pipeline_clc, shared_storage.pipelines.clc_response, {params.num_row_tiles, params.num_kv_blocks, params.num_heads, params.batch});
 
             auto work = tile_sched.initial_work_tile_info();
             while (work.is_valid) {
@@ -291,7 +307,7 @@ struct FusedAttnFwdSm100 {
             __threadfence_block();
 
             typename CollectiveEpilogue::EpiState epi_state;
-            CLCTileScheduler tile_sched(pipeline_clc, {params.num_row_tiles, params.num_kv_blocks, params.num_heads, params.batch});
+            CLCTileScheduler tile_sched(pipeline_clc, shared_storage.pipelines.clc_response, {params.num_row_tiles, params.num_kv_blocks, params.num_heads, params.batch});
 
             auto work = tile_sched.initial_work_tile_info();
             while (work.is_valid) {
@@ -310,7 +326,7 @@ struct FusedAttnFwdSm100 {
 
             // Producer start state: phase=1 (no prefill needed, example 77 pattern)
             typename CollectiveMainloop::LoadState load_state;
-            CLCTileScheduler tile_sched(pipeline_clc, {params.num_row_tiles, params.num_kv_blocks, params.num_heads, params.batch});
+            CLCTileScheduler tile_sched(pipeline_clc, shared_storage.pipelines.clc_response, {params.num_row_tiles, params.num_kv_blocks, params.num_heads, params.batch});
 
             auto work = tile_sched.initial_work_tile_info();
             while (work.is_valid) {
@@ -333,17 +349,20 @@ struct FusedAttnFwdSm100 {
 
             const uint32_t tmem_base = shared_storage.tmem_base_ptr;
             typename CollectiveMainloop::CorrState corr_state;
-            CLCTileScheduler tile_sched(pipeline_clc, {params.num_row_tiles, params.num_kv_blocks, params.num_heads, params.batch});
+            CLCTileScheduler tile_sched(pipeline_clc, shared_storage.pipelines.clc_response, {params.num_row_tiles, params.num_kv_blocks, params.num_heads, params.batch});
 
             auto work = tile_sched.initial_work_tile_info();
             while (work.is_valid) {
                 int tile_nkv = CollectiveMainloop::get_tile_num_kv_blocks(
                         params.mainloop, work.batch, work.head, work.row_tile, global_num_kv_blocks);
+                int lse_tile_offset = (work.batch * params.num_heads + work.head)
+                                      * params.num_row_tiles + work.row_tile;
                 corr_state = mainloop.template correction<SharedStorage, NamedBarriers>(
                         params.mainloop.sm_scale_log2,
                         pipeline_s_p_o, pipeline_sm_stats, pipeline_o_acc, pipeline_o_epi,
                         shared_storage,
-                        tmem_base, tile_nkv, corr_state);
+                        tmem_base, tile_nkv, corr_state,
+                        params.epilogue.ptr_LSE, lse_tile_offset);
                 work = tile_sched.consumer_advance();
             }
         }
@@ -355,7 +374,7 @@ struct FusedAttnFwdSm100 {
 
             const uint32_t tmem_base = shared_storage.tmem_base_ptr;
             typename CollectiveMainloop::SoftmaxState softmax1_state;
-            CLCTileScheduler tile_sched(pipeline_clc, {params.num_row_tiles, params.num_kv_blocks, params.num_heads, params.batch});
+            CLCTileScheduler tile_sched(pipeline_clc, shared_storage.pipelines.clc_response, {params.num_row_tiles, params.num_kv_blocks, params.num_heads, params.batch});
 
             auto work = tile_sched.initial_work_tile_info();
             while (work.is_valid) {
@@ -384,7 +403,7 @@ struct FusedAttnFwdSm100 {
 
             const uint32_t tmem_base = shared_storage.tmem_base_ptr;
             typename CollectiveMainloop::SoftmaxState softmax0_state;
-            CLCTileScheduler tile_sched(pipeline_clc, {params.num_row_tiles, params.num_kv_blocks, params.num_heads, params.batch});
+            CLCTileScheduler tile_sched(pipeline_clc, shared_storage.pipelines.clc_response, {params.num_row_tiles, params.num_kv_blocks, params.num_heads, params.batch});
 
             auto work = tile_sched.initial_work_tile_info();
             while (work.is_valid) {

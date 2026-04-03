@@ -63,7 +63,7 @@ def bsa_attn_fwd(
     v: torch.Tensor,
     q2k_block_index: torch.Tensor,
     block_sparse_num: int,
-    block_sizes: torch.Tensor,
+    block_sizes: Optional[torch.Tensor] = None,
     q2k_block_nums: Optional[torch.Tensor] = None,
     allow_empty_block_nums: bool = True,
     softmax_scale: Optional[float] = None,
@@ -83,6 +83,7 @@ def bsa_attn_fwd(
         block_sparse_num: Number of KV blocks each Q block attends to. Must be even and >= 2.
             Ignored when q2k_block_nums is provided.
         block_sizes: Actual token count per KV block (num_kv_blocks,), int32. Used for masking padding positions.
+            When None, block_size masking is skipped (assumes all blocks are full).
         q2k_block_nums: Per-(batch, head, q_block) number of KV blocks to attend to,
             (batch, num_heads, num_q_blocks) int32, each value >= 0.
             When None, uses fixed block_sparse_num for all Q blocks.
@@ -115,7 +116,9 @@ def bsa_attn_fwd(
 
     # Block-sparse parameter validation
     assert q2k_block_index.dtype == torch.int32, "q2k_block_index must be int32"
-    assert block_sizes.dtype == torch.int32, "block_sizes must be int32"
+    has_block_sizes = block_sizes is not None
+    if has_block_sizes:
+        assert block_sizes.dtype == torch.int32, "block_sizes must be int32"
     if q2k_block_nums is not None:
         q2k_block_nums = maybe_contiguous(q2k_block_nums)
         assert q2k_block_nums.dtype == torch.int32, "q2k_block_nums must be int32"
@@ -192,6 +195,7 @@ def bsa_attn_fwd(
         fa_logging.get_fa_log_level(),
         has_variable_block_nums,
         allow_empty_block_nums and has_variable_block_nums,
+        has_block_sizes,
     )
 
     if compile_key not in bsa_attn_fwd.compile_cache:
@@ -200,7 +204,7 @@ def bsa_attn_fwd(
         ]
         lse_tensor = to_cute_tensor(lse, assumed_align=4) if lse is not None else None
         block_index_tensor = to_cute_tensor(q2k_block_index)
-        block_sizes_tensor = to_cute_tensor(block_sizes)
+        block_sizes_tensor = to_cute_tensor(block_sizes) if has_block_sizes else None
         block_nums_tensor = to_cute_tensor(q2k_block_nums) if has_variable_block_nums else None
 
         fa_fwd = FlashAttentionForwardSm100(
@@ -214,6 +218,7 @@ def bsa_attn_fwd(
             use_2cta_instrs=use_2cta_instrs,
             use_clc_scheduler=use_clc_scheduler,
             allow_empty_block_nums=allow_empty_block_nums and has_variable_block_nums,
+            has_block_sizes=has_block_sizes,
         )
 
         bsa_attn_fwd.compile_cache[compile_key] = cute.compile(
@@ -242,7 +247,7 @@ def bsa_attn_fwd(
                 lse,
                 softmax_scale,
                 q2k_block_index.detach(),
-                block_sizes.detach(),
+                block_sizes.detach() if has_block_sizes else None,
                 block_sparse_num,
                 q2k_block_nums.detach() if has_variable_block_nums else None,
                 current_stream,

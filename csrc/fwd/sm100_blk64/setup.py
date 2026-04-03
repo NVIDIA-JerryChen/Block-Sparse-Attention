@@ -1,19 +1,12 @@
 import os
 import shutil
-import sys
 from pathlib import Path
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-# Place .so in project build/ directory (not in source tree)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-BUILD_DIR = PROJECT_ROOT / "build"
 CUTLASS_ROOT = PROJECT_ROOT / "third_party" / "cutlass"
 SRC_DIR = Path(__file__).resolve().parent
-
-# Output .so to build/ directory, then copy to project root for import
-sys.argv = [a for a in sys.argv if a != "--inplace"]
-sys.argv += [f"--build-lib={BUILD_DIR}"]
 
 # Kernel instantiation sources (separate TUs for register allocation isolation)
 instantiation_sources = [

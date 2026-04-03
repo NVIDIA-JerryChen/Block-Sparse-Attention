@@ -12,7 +12,7 @@
 | pack_gqa | Yes | No |
 | Persistent scheduling | Static + CLC dynamic | CLC dynamic (built-in) |
 | Variable block counts (`q2k_block_nums`) | Yes (>= 0) | Yes (>= 1) |
-| LSE output | Yes | No |
+| LSE output | Yes | Yes |
 
 **Not supported (both backends):** causal, local, mask_mod, score_mod, split-kv, paged_kv, softcap, varlen
 
@@ -45,8 +45,8 @@ BSA/
 │       ├── softmax.h                     # Softmax
 │       ├── pipeline.hpp                  # Pipeline management
 │       ├── tile_scheduler.hpp            # Tile scheduler
-│       ├── bindings.cpp                  # PyTorch C++ bindings
-│       └── setup.py                      # Build script (torch CUDAExtension)
+│       ├── bindings.cpp                  # PyTorch C++ bindings (returns [out, lse])
+│       └── setup.py                      # Build script (bdist_wheel + CUDAExtension)
 │
 ├── utils/
 │   ├── cache_utils.py            # JIT compilation cache
@@ -79,7 +79,7 @@ git submodule update --init --recursive
 
 pip install -r requirements.txt
 
-# Build blk64 C++ extension (optional, required for blk64 tests)
+# Build blk64 C++ extension (builds wheel + pip installs it)
 make setup
 ```
 

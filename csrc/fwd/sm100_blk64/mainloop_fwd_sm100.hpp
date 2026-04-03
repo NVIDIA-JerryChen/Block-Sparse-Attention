@@ -929,7 +929,8 @@ struct CollectiveMainloopFwd {
             PipelineOEpi& pipeline_o_epi,
             SharedStorage& shared_storage,
             uint32_t tmem_base, int num_kv_blocks,
-            CorrState corr_state)
+            CorrState corr_state,
+            float* ptr_LSE = nullptr, int lse_tile_offset = 0)
     {
         using namespace cute;
         using cutlass::arch::NamedBarrier;
@@ -1023,6 +1024,21 @@ struct CollectiveMainloopFwd {
             float sum_total = my_sum * my_rescale + partner_sum * partner_rescale;
             float inv_sum_total = (sum_total > 0.0f) ? __frcp_rn(sum_total) : 0.0f;  // BSA: rcp_approx
             my_weight = my_rescale * inv_sum_total;
+
+            // ---- Write LSE to global memory (one warp per warp-pair) ----
+            if (ptr_LSE != nullptr && corr_warp < 2) {
+                int out_row = (corr_warp & 1) * 32 + lane_idx;
+                if (out_row < kRows) {
+                    float lse;
+                    if (sum_total > 0.0f) {
+                        lse = (max_total_safe * sm_scale_log2 + log2f(sum_total))
+                              * 0.6931471805599453f;  // LN2
+                    } else {
+                        lse = -CUDART_INF_F;
+                    }
+                    ptr_LSE[lse_tile_offset * kRows + out_row] = lse;
+                }
+            }
         }
 
         // ---- (g) 2-pass combine: correction_combine ----

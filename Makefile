@@ -20,6 +20,14 @@ FA_TEST := flash_attn/cute/test_flash_fwd_sm100.py
 # BLK: 64, 128, or "64,128" (default: both)
 # BLK ?= 64,128
 BLK ?= 64
+# BLK ?= 128
+
+# Profile feature toggles (0 or 1)
+VAR_BN ?= 0
+BLKSZ ?= 0
+
+# Env prefix for profile/bm targets
+PROF_ENV := BSA_BLK=$(BLK) BSA_VAR_BN=$(VAR_BN) BSA_BLKSZ=$(BLKSZ)
 
 .PHONY: setup tt vt bb profile bm bm-cli clean compare help
 
@@ -29,8 +37,10 @@ setup:
 		git submodule update --init --recursive third_party/cutlass; \
 	fi
 	@if echo "$(BLK)" | grep -q "64"; then \
-		echo "=== Building blk64 C++ extension ===" && \
-		$(PYTHON) csrc/fwd/sm100_blk64/setup.py build_ext; \
+		echo "=== Building blk64 wheel ===" && \
+		$(PYTHON) csrc/fwd/sm100_blk64/setup.py bdist_wheel --dist-dir dist/ && \
+		echo "=== Installing blk64 wheel ===" && \
+		pip install --force-reinstall --no-deps dist/bsa_fwd_blk64_ext-*.whl; \
 	fi
 
 tt:
@@ -43,10 +53,10 @@ bb:
 	BSA_BLK=$(BLK) $(PYTHON) -u $(TEST_FILE) benchmark
 
 profile:
-	BSA_BLK=$(BLK) $(PYTHON) -u $(TEST_FILE) profile
+	$(PROF_ENV) $(PYTHON) -u $(TEST_FILE) profile
 
 bm:
-	BSA_BLK=$(BLK) ncu --set full --nvtx --nvtx-include "bsa_attn_fwd_kernel/" \
+	$(PROF_ENV) ncu --set full --nvtx --nvtx-include "bsa_attn_fwd_kernel/" \
 		-f -o profile/bsa_fwd.%p \
 		$(PYTHON) -u $(TEST_FILE) profile
 
@@ -54,7 +64,7 @@ NCU_METRICS := launch__registers_per_thread,sm__cycles_elapsed.avg,sm__cycles_el
 
 bm-cli:
 	@echo "=== ncu register/local-spill/smem analysis (BSA) ==="
-	ncu --nvtx --nvtx-include "bsa_attn_fwd_kernel/" \
+	$(PROF_ENV) ncu --nvtx --nvtx-include "bsa_attn_fwd_kernel/" \
 		--metrics $(NCU_METRICS) \
 		--target-processes all \
 		$(PYTHON) -u $(TEST_FILE) profile; true
@@ -83,7 +93,7 @@ compare:
 
 clean:
 	rm -rf /tmp/$$(USER)/flash_attention_cute_dsl_cache/
-	rm -rf build/ csrc/fwd/sm100_blk64/build/
+	rm -rf build/ dist/ csrc/fwd/sm100_blk64/build/ *.egg-info
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
 help:
@@ -98,3 +108,6 @@ help:
 	@echo "  make bm-cli                      ncu register/spill/smem analysis"
 	@echo "  make compare                     Compare BSA vs FA4"
 	@echo "  make clean                       Clear compile caches + blk64 build"
+	@echo ""
+	@echo "  Profile toggles: VAR_BN=0|1  BLKSZ=0|1"
+	@echo "    e.g. make bm-cli BLK=64 VAR_BN=1 BLKSZ=1"

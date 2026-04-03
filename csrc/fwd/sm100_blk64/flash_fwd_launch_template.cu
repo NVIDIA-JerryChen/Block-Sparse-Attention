@@ -4,6 +4,7 @@
 // Dispatch + Python binding for BSA fused attention forward kernel (blk=64)
 // Kernel instantiations are in instantiations/*.cu (separate TUs).
 
+#include <vector>
 #include <torch/extension.h>
 #include "static_switch.h"
 
@@ -11,14 +12,14 @@ namespace flash {
 
 // Declarations of explicit instantiations (defined in instantiations/*.cu)
 template<bool HasVarBlockNums, bool HasBlockSizes>
-torch::Tensor bsa_fused_fwd_blk64_launch(
+std::vector<torch::Tensor> bsa_fused_fwd_blk64_launch(
         torch::Tensor q, torch::Tensor k, torch::Tensor v,
         torch::Tensor q2k_block_index, int block_sparse_num,
         torch::Tensor block_sizes, float softmax_scale,
         torch::Tensor q2k_block_nums);
 
 // Entry point: BOOL_SWITCH dispatches to the correct template instantiation
-inline torch::Tensor bsa_fused_fwd_blk64_impl(
+inline std::vector<torch::Tensor> bsa_fused_fwd_blk64_impl(
         torch::Tensor q, torch::Tensor k, torch::Tensor v,
         torch::Tensor q2k_block_index, int block_sparse_num,
         torch::Tensor block_sizes, float softmax_scale,
@@ -42,7 +43,7 @@ inline torch::Tensor bsa_fused_fwd_blk64_impl(
 } // namespace flash
 
 // Python binding
-torch::Tensor bsa_fused_fwd_blk64(
+std::vector<torch::Tensor> bsa_fused_fwd_blk64(
         torch::Tensor q, torch::Tensor k, torch::Tensor v,
         torch::Tensor q2k_block_index, int block_sparse_num,
         torch::Tensor block_sizes, float softmax_scale,

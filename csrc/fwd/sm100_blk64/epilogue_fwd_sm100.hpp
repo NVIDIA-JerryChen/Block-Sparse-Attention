@@ -57,6 +57,7 @@ struct CollectiveEpilogueFwd {
     // ---- Arguments (host-side) ----
     struct Arguments {
         ElementA* ptr_O;
+        float* ptr_LSE = nullptr;  // (batch * heads * num_row_tiles * kRows,) or nullptr
     };
 
     // ---- Params (device-side) ----
@@ -65,6 +66,7 @@ struct CollectiveEpilogueFwd {
         ShapeTensor shape_O;
         int num_heads = 1;
         int num_row_tiles = 1;
+        float* ptr_LSE = nullptr;
     };
 
     // ---- Convert Arguments -> Params ----
@@ -79,7 +81,7 @@ struct CollectiveEpilogueFwd {
                 make_tensor(make_gmem_ptr(args.ptr_O), make_layout(shape_o, stride_o)),
                 SmemLayoutO{});
 
-        return {tma_o, shape_o, heads, num_row_tiles};
+        return {tma_o, shape_o, heads, num_row_tiles, args.ptr_LSE};
     }
 
     // ===========================================================================
