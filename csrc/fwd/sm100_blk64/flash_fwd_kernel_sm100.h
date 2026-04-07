@@ -294,12 +294,11 @@ struct FusedAttnFwdSm100 {
             // (epilogue uses phase cycling).
             CLCTileScheduler tile_sched(pipeline_clc, shared_storage.pipelines.clc_response, {params.num_row_tiles, params.num_kv_blocks, params.num_heads, params.batch});
 
+            // Single-tile mode: process initial tile, then signal workers to exit.
+            // Do NOT issue CLC try_cancel — it would steal a queued CTA's work.
             auto work = tile_sched.initial_work_tile_info();
-            while (work.is_valid) {
-                tile_sched.advance_to_next_work();
-                work = tile_sched.fetch_next_work();
-            }
-            tile_sched.producer_tail();
+            // Signal exit: produce an invalid CLC response so workers' consumer_wait unblocks.
+            tile_sched.produce_invalid_and_exit();
         }
         else if (warp_idx == kMmaWarp) {
             // ===== WG3 warp 12: MMA (TMEM alloc here) =====

@@ -147,9 +147,7 @@ std::vector<torch::Tensor> bsa_fused_fwd_blk64_launch(
 
     auto kernel_params = Kernel::to_underlying_arguments(args);
 
-    dim3 dim_grid_full = Kernel::get_grid_shape(kernel_params);
-    int total_tiles = dim_grid_full.x * dim_grid_full.y * dim_grid_full.z;
-    dim3 dim_grid = dim3(total_tiles, 1, 1);  // 1D flat grid for CLC
+    dim3 dim_grid = Kernel::get_grid_shape(kernel_params);  // 3D: (row_tiles, heads, batch)
     dim3 dim_block = Kernel::get_block_shape();
     int smem_bytes = Kernel::SharedStorageSize;
 
@@ -160,14 +158,8 @@ std::vector<torch::Tensor> bsa_fused_fwd_blk64_launch(
             kernel_ptr, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
     auto stream = c10::cuda::getCurrentCUDAStream(q.device().index()).stream();
 
-    void const* kernel_fn = reinterpret_cast<void const*>(kernel_ptr);
-    void* params_arr[] = {const_cast<void*>(static_cast<void const*>(&kernel_params))};
-    dim3 dim_cluster(1, 1, 1);
-
     nvtxRangePushA("bsa_attn_fwd_kernel");
-    auto launch_status = cutlass::ClusterLauncher::launch(
-        dim_grid, dim_cluster, dim_block, smem_bytes, stream, kernel_fn, params_arr);
-    TORCH_CHECK(launch_status == cutlass::Status::kSuccess, "ClusterLauncher::launch failed");
+    fused_attn_device<Kernel><<<dim_grid, dim_block, smem_bytes, stream>>>(kernel_params);
     nvtxRangePop();
     C10_CUDA_CHECK(cudaGetLastError());
 #else

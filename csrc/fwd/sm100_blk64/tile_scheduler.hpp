@@ -57,7 +57,9 @@ struct CLCTileScheduler {
 
     CUTLASS_DEVICE
     WorkTileInfo initial_work_tile_info() {
-        return decode(static_cast<int>(blockIdx.x), params.num_row_tiles, params.num_heads);
+        // 3D grid: blockIdx = (row_tile, head, batch) — read directly
+        return {static_cast<int>(blockIdx.x), static_cast<int>(blockIdx.y),
+                static_cast<int>(blockIdx.z), true};
     }
 
     // ---- Sched warp producer: acquire(empty) → [reinit] → issue CLC query ----
@@ -94,17 +96,21 @@ struct CLCTileScheduler {
         auto resp = decode_clc_response(resp_addr);
         pipeline_clc.consumer_release(cons_state);
         ++cons_state;
-        if (!resp.is_valid) {
-            return {0, 0, 0, false};
-        }
-        return decode(resp.row_tile, params.num_row_tiles, params.num_heads);
+        // CLC returns 3D grid coords — use directly, no persistent (single tile per CTA)
+        return {0, 0, 0, false};  // Always return invalid to disable persistent loop
     }
 
-    // ---- Worker consumer: pure CLC pipeline operation (matches blk128) ----
-    // Only does CLC wait/release. tcgen05_commit is caller's responsibility
-    // (only MMA/Load warps that operate TMEM need it).
+    // ---- Worker consumer: single-tile mode, just return invalid ----
     CUTLASS_DEVICE WorkTileInfo consumer_advance() {
-        return fetch_next_work();
+        // No persistent scheduling: each CTA processes exactly 1 tile.
+        // Return invalid to exit the while loop. No CLC pipeline interaction.
+        return {0, 0, 0, false};
+    }
+
+    // ---- Single-tile exit: no persistent, no CLC query ----
+    CUTLASS_DEVICE void produce_invalid_and_exit() {
+        // Don't issue CLC try_cancel (it would steal queued CTAs).
+        // Workers check is_done flag instead of consumer_advance.
     }
 
     // ---- Producer tail: drain pipeline before exit ----
