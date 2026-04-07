@@ -259,6 +259,90 @@ struct CollectiveMainloopFwd {
         cute::prefetch_tma_descriptor(params.tma_load_V.get_tma_descriptor());
     }
 
+    // Resolve sparse block index: indirect via block_indices or direct (dense)
+    // Phantom block clamping: if logical_idx >= raw_block_count,
+    // clamp to last valid index (phantom loads same data, masked in softmax).
+    CUTLASS_DEVICE static int get_sparse_idx(
+            int kv_block_idx, int sub, int raw_block_count,
+            int const* tile_block_indices) {
+        int logical_idx = kv_block_idx * kSparseBlocksPerKV + sub;
+        int clamped = (logical_idx < raw_block_count) ? logical_idx
+                    : max(raw_block_count - 1, 0);
+        return (tile_block_indices != nullptr)
+            ? tile_block_indices[clamped]
+            : clamped;
+    }
+
+    // Load K: 8 TMAs per KV block (4 sparse blocks × 2 dim halves)
+    // Each TMA loads (64, 64) bf16 = 8KB. 8 × 8KB = 64KB per stage.
+    // SMEM offset for sub-block i, dim-half h: K: i*kKSubStride+h*kKHalfStride
+    template<typename ThrTmaK, typename GKFull, typename MainloopStorage>
+    CUTLASS_DEVICE static PipelineKVState load_K(
+            int kv_block_idx, PipelineKVState kv_st,
+            PipelineKV& pipeline_kv, Params const& params,
+            ThrTmaK& thr_tma_k, GKFull& gK_full,
+            MainloopStorage& ml,
+            int head, int batch, int raw_block_count,
+            int const* tile_block_indices) {
+        using namespace cute;
+        // K interleave map: sub-block → SMEM slot. Ensures balanced warp-col distribution.
+        // {0→0, 1→2, 2→1, 3→3}: warp-col 0 gets slots 0,1 (sub 0,2), warp-col 1 gets 2,3 (sub 1,3)
+        static constexpr int kInterleavedSlot[4] = {0, 2, 1, 3};
+        pipeline_kv.producer_acquire(kv_st);
+        auto* tma_bar = pipeline_kv.producer_get_barrier(kv_st);
+        int stage_base = kv_st.index() * kKVElemsPerStage;
+        CUTLASS_PRAGMA_UNROLL
+        for (int sub = 0; sub < kSparseBlocksPerKV; ++sub) {
+            int sparse_idx = get_sparse_idx(kv_block_idx, sub, raw_block_count, tile_block_indices);
+            int slot = kInterleavedSlot[sub];
+            CUTLASS_PRAGMA_UNROLL
+            for (int h = 0; h < kDimHalves; ++h) {
+                int smem_offset = stage_base + slot * kKSubStride + h * kKHalfStride;
+                auto sK_sub = make_tensor(make_smem_ptr(
+                        ml.smem_kv.begin() + smem_offset), SmemLayoutSubTile{});
+                // K 5D indexing: (_, _, head*kDimHalves+h, sparse_idx, batch)
+                cute::copy(params.tma_load_K.with(*tma_bar),
+                        thr_tma_k.partition_S(gK_full(_, _, head * kDimHalves + h, sparse_idx, batch)),
+                        thr_tma_k.partition_D(sK_sub));
+            }
+        }
+        ++kv_st;
+        return kv_st;
+    }
+
+    // Load V: 8 TMAs per KV block (4 sparse blocks × 2 dim halves)
+    template<typename ThrTmaV, typename GVFull, typename MainloopStorage>
+    CUTLASS_DEVICE static PipelineKVState load_V(
+            int kv_block_idx, PipelineKVState kv_st,
+            PipelineKV& pipeline_kv, Params const& params,
+            ThrTmaV& thr_tma_v, GVFull& gV_full,
+            MainloopStorage& ml,
+            int head, int batch, int raw_block_count,
+            int const* tile_block_indices) {
+        using namespace cute;
+        pipeline_kv.producer_acquire(kv_st);
+        auto* tma_bar = pipeline_kv.producer_get_barrier(kv_st);
+        int stage_base = kv_st.index() * kKVElemsPerStage;
+        CUTLASS_PRAGMA_UNROLL
+        for (int sub = 0; sub < kSparseBlocksPerKV; ++sub) {
+            int sparse_idx = get_sparse_idx(kv_block_idx, sub, raw_block_count, tile_block_indices);
+            int slot = sub;  // sequential for V
+            CUTLASS_PRAGMA_UNROLL
+            for (int h = 0; h < kDimHalves; ++h) {
+                // V offsets: kVSubStride/kVHalfStride (adjacent dim_halves per block)
+                int smem_offset = stage_base + slot * kVSubStride + h * kVHalfStride;
+                // V uses K-major sub-tile (same as K; data pre-transposed on host)
+                auto sV_sub = make_tensor(make_smem_ptr(
+                        ml.smem_kv.begin() + smem_offset), SmemLayoutSubTile{});
+                cute::copy(params.tma_load_V.with(*tma_bar),
+                        thr_tma_v.partition_S(gV_full(_, _, head * kDimHalves + h, sparse_idx, batch)),
+                        thr_tma_v.partition_D(sV_sub));
+            }
+        }
+        ++kv_st;
+        return kv_st;
+    }
+
     template<typename SharedStorage>
     CUTLASS_DEVICE LoadState load(
             Params const& params, PipelineKV& pipeline_kv,
@@ -300,88 +384,24 @@ struct CollectiveMainloopFwd {
 
             auto kv_state = state.kv_state;
 
-            // Load K: 8 TMAs per KV block (4 sparse blocks × 2 dim halves)
-            // Each TMA loads (64, 64) bf16 = 8KB. 8 × 8KB = 64KB per stage.
-            // SMEM offset for sub-block i, dim-half h: K: i*kKSubStride+h*kKHalfStride
-            // K interleave map: sub-block → SMEM slot. Ensures balanced warp-col distribution.
-            // {0→0, 1→2, 2→1, 3→3}: warp-col 0 gets slots 0,1 (sub 0,2), warp-col 1 gets 2,3 (sub 1,3)
-            static constexpr int kInterleavedSlot[4] = {0, 2, 1, 3};
-
-            // Resolve sparse block index: indirect via block_indices or direct (dense)
-            // Phantom block clamping: if logical_idx >= raw_block_count,
-            // clamp to last valid index (phantom loads same data, masked in softmax).
-            auto get_sparse_idx = [&] (int kv_block_idx, int sub) -> int {
-                int logical_idx = kv_block_idx * kSparseBlocksPerKV + sub;
-                int clamped = (logical_idx < raw_block_count) ? logical_idx
-                            : max(raw_block_count - 1, 0);
-                return (tile_block_indices != nullptr)
-                    ? tile_block_indices[clamped]
-                    : clamped;
-            };
-
-            // Example 77 pattern: producer_acquire (wait free + arrive_and_expect_tx)
-            // → get_barrier → TMA copies with barrier → advance state.
-            // No manual set_barrier_transaction_bytes, no fence, no nanosleep.
-            // Pass kv_st by value to avoid [&] capturing kv_state by reference → local memory.
-            auto load_K = [&] (int kv_block_idx, PipelineKVState kv_st) -> PipelineKVState {
-                pipeline_kv.producer_acquire(kv_st);
-                auto* tma_bar = pipeline_kv.producer_get_barrier(kv_st);
-                int stage_base = kv_st.index() * kKVElemsPerStage;
-                CUTLASS_PRAGMA_UNROLL
-                for (int sub = 0; sub < kSparseBlocksPerKV; ++sub) {
-                    int sparse_idx = get_sparse_idx(kv_block_idx, sub);
-                    int slot = kInterleavedSlot[sub];
-                    CUTLASS_PRAGMA_UNROLL
-                    for (int h = 0; h < kDimHalves; ++h) {
-                        int smem_offset = stage_base + slot * kKSubStride + h * kKHalfStride;
-                        auto sK_sub = make_tensor(make_smem_ptr(
-                                ml.smem_kv.begin() + smem_offset), SmemLayoutSubTile{});
-                        // K 5D indexing: (_, _, head*kDimHalves+h, sparse_idx, batch)
-                        cute::copy(params.tma_load_K.with(*tma_bar),
-                                thr_tma_k.partition_S(gK_full(_, _, head * kDimHalves + h, sparse_idx, batch)),
-                                thr_tma_k.partition_D(sK_sub));
-                    }
-                }
-                ++kv_st;
-                return kv_st;
-            };
-
-            auto load_V = [&] (int kv_block_idx, PipelineKVState kv_st) -> PipelineKVState {
-                pipeline_kv.producer_acquire(kv_st);
-                auto* tma_bar = pipeline_kv.producer_get_barrier(kv_st);
-                int stage_base = kv_st.index() * kKVElemsPerStage;
-                CUTLASS_PRAGMA_UNROLL
-                for (int sub = 0; sub < kSparseBlocksPerKV; ++sub) {
-                    int sparse_idx = get_sparse_idx(kv_block_idx, sub);
-                    int slot = sub;  // sequential for V
-                    CUTLASS_PRAGMA_UNROLL
-                    for (int h = 0; h < kDimHalves; ++h) {
-                        // V offsets: kVSubStride/kVHalfStride (adjacent dim_halves per block)
-                        int smem_offset = stage_base + slot * kVSubStride + h * kVHalfStride;
-                        // V uses K-major sub-tile (same as K; data pre-transposed on host)
-                        auto sV_sub = make_tensor(make_smem_ptr(
-                                ml.smem_kv.begin() + smem_offset), SmemLayoutSubTile{});
-                        cute::copy(params.tma_load_V.with(*tma_bar),
-                                thr_tma_v.partition_S(gV_full(_, _, head * kDimHalves + h, sparse_idx, batch)),
-                                thr_tma_v.partition_D(sV_sub));
-                    }
-                }
-                ++kv_st;
-                return kv_st;
-            };
-
             // BSA reverse order: K[N-1], K[N-2], {V[N-1-i], K[N-3-i]}x(N-2), V[1], V[0]
-            kv_state = load_K(num_kv_blocks - 1, kv_state);
-            kv_state = load_K(num_kv_blocks - 2, kv_state);
+            kv_state = load_K(num_kv_blocks - 1, kv_state, pipeline_kv, params,
+                    thr_tma_k, gK_full, ml, head, batch, raw_block_count, tile_block_indices);
+            kv_state = load_K(num_kv_blocks - 2, kv_state, pipeline_kv, params,
+                    thr_tma_k, gK_full, ml, head, batch, raw_block_count, tile_block_indices);
 
             CUTE_NO_UNROLL
             for (int i = 0; i < num_kv_blocks - 2; ++i) {
-                kv_state = load_V(num_kv_blocks - 1 - i, kv_state);
-                kv_state = load_K(num_kv_blocks - 3 - i, kv_state);
+                kv_state = load_V(num_kv_blocks - 1 - i, kv_state, pipeline_kv, params,
+                        thr_tma_v, gV_full, ml, head, batch, raw_block_count, tile_block_indices);
+                kv_state = load_K(num_kv_blocks - 3 - i, kv_state, pipeline_kv, params,
+                        thr_tma_k, gK_full, ml, head, batch, raw_block_count, tile_block_indices);
             }
 
-            kv_state = load_V(1, kv_state);
-            kv_state = load_V(0, kv_state);
+            kv_state = load_V(1, kv_state, pipeline_kv, params,
+                    thr_tma_v, gV_full, ml, head, batch, raw_block_count, tile_block_indices);
+            kv_state = load_V(0, kv_state, pipeline_kv, params,
+                    thr_tma_v, gV_full, ml, head, batch, raw_block_count, tile_block_indices);
 
             state.kv_state = kv_state;
         }
@@ -471,82 +491,171 @@ struct CollectiveMainloopFwd {
             q_phase ^= 1;
             flash::tcgen05_commit();
 
-            // QK GEMM: S[stage] = Q @ K, then signal S ready via UMMA arrive
-            // Pass kv_st by value to avoid [&] capturing kv_state → local memory.
-            auto mma_qk = [&] (int stage, PipelineKVState kv_st) -> PipelineKVState {
-                pipeline_kv.consumer_wait(kv_st);
+            // ---- Prologue: S0 = Q@K[N-1], S1 = Q@K[N-2] (N>=2 guaranteed) ----
+            // mma_qk stage=0
+            {
+                constexpr int stage = 0;
+                pipeline_kv.consumer_wait(kv_state);
                 flash::tcgen05_commit();
                 tC_qk.data() = tmem_s[stage];
                 auto sK = make_tensor(make_smem_ptr(
-                        ml.smem_kv.begin() + kv_st.index() * kKVElemsPerStage),
+                        ml.smem_kv.begin() + kv_state.index() * kKVElemsPerStage),
                         SmemLayoutBDual{});
                 flash::utcmma_ss(qk_mma, sQ, sK, tC_qk, true);
-                // UMMA arrive on SPO full barrier (S ready)
                 flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
                         shared_storage.pipelines.spo.full_barrier_[stage]));
-                // consumer_release: umma_arrive on KV empty barrier.
                 flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
-                        shared_storage.pipelines.kv.empty_barrier_[kv_st.index()]));
-                ++kv_st;
-                return kv_st;
-            };
-
-            // PV GEMM: O[stage] += P[stage] @ V
-            // Uses split_P_arrive: first half UTCHMMA, wait p_lastsplit, last half.
-            auto mma_pv = [&] (int stage, bool clear_accum, PipelineKVState kv_st) -> PipelineKVState {
-                pipeline_kv.consumer_wait(kv_st);
+                        shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
+                ++kv_state;
+            }
+            // mma_qk stage=1
+            {
+                constexpr int stage = 1;
+                pipeline_kv.consumer_wait(kv_state);
                 flash::tcgen05_commit();
-                tC_pv.data() = tmem_o[stage];
-                tP.data() = tmem_s[stage];
-                auto sV = make_tensor(make_smem_ptr(
-                        ml.smem_kv.begin() + kv_st.index() * kKVElemsPerStage),
+                tC_qk.data() = tmem_s[stage];
+                auto sK = make_tensor(make_smem_ptr(
+                        ml.smem_kv.begin() + kv_state.index() * kKVElemsPerStage),
                         SmemLayoutBDual{});
-                // Get p_lastsplit barrier addr and phase from PipeState
-                auto& pls_st = (stage == 0) ? pls_state_0 : pls_state_1;
-                uint32_t pls_addr = cute::cast_smem_ptr_to_uint(
-                        &shared_storage.pipelines.p_lastsplit.full_barrier_[stage]);
-                utcmma_ts_split(pv_mma, tP, sV, tC_pv, clear_accum,
-                        pls_addr, pls_st.phase());
-                // Advance pls by 2 (stay on same stage, flip phase)
-                ++pls_st; ++pls_st;
-                // consumer_release: umma_arrive on KV empty barrier.
+                flash::utcmma_ss(qk_mma, sQ, sK, tC_qk, true);
                 flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
-                        shared_storage.pipelines.kv.empty_barrier_[kv_st.index()]));
-                ++kv_st;
-                return kv_st;
-            };
-
-            // ---- Prologue: S0 = Q@K[N-1], S1 = Q@K[N-2] (N>=2 guaranteed) ----
-            kv_state = mma_qk(0, kv_state);
-            kv_state = mma_qk(1, kv_state);
+                        shared_storage.pipelines.spo.full_barrier_[stage]));
+                flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                        shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
+                ++kv_state;
+            }
 
             // ---- Main loop: pairs of {PV[stage] + QK[stage]} alternating stage 0,1 ----
             int pair_count = (num_kv_blocks - 2) / 2;
             CUTE_NO_UNROLL
             for (int i = 0; i < pair_count; ++i) {
+                // ---- stage 0: PV then QK ----
                 pipeline_s_p_o.producer_acquire(spo_state);
-                kv_state = mma_pv(0, !o_acc_s0, kv_state);
-                kv_state = mma_qk(0, kv_state);
+                // mma_pv stage=0
+                {
+                    constexpr int stage = 0;
+                    pipeline_kv.consumer_wait(kv_state);
+                    flash::tcgen05_commit();
+                    tC_pv.data() = tmem_o[stage];
+                    tP.data() = tmem_s[stage];
+                    auto sV = make_tensor(make_smem_ptr(
+                            ml.smem_kv.begin() + kv_state.index() * kKVElemsPerStage),
+                            SmemLayoutBDual{});
+                    uint32_t pls_addr = cute::cast_smem_ptr_to_uint(
+                            &shared_storage.pipelines.p_lastsplit.full_barrier_[stage]);
+                    utcmma_ts_split(pv_mma, tP, sV, tC_pv, !o_acc_s0,
+                            pls_addr, pls_state_0.phase());
+                    ++pls_state_0; ++pls_state_0;
+                    flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                            shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
+                    ++kv_state;
+                }
+                // mma_qk stage=0
+                {
+                    constexpr int stage = 0;
+                    pipeline_kv.consumer_wait(kv_state);
+                    flash::tcgen05_commit();
+                    tC_qk.data() = tmem_s[stage];
+                    auto sK = make_tensor(make_smem_ptr(
+                            ml.smem_kv.begin() + kv_state.index() * kKVElemsPerStage),
+                            SmemLayoutBDual{});
+                    flash::utcmma_ss(qk_mma, sQ, sK, tC_qk, true);
+                    flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                            shared_storage.pipelines.spo.full_barrier_[stage]));
+                    flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                            shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
+                    ++kv_state;
+                }
                 ++spo_state;
                 o_acc_s0 = true;
 
+                // ---- stage 1: PV then QK ----
                 pipeline_s_p_o.producer_acquire(spo_state);
-                kv_state = mma_pv(1, !o_acc_s1, kv_state);
-                kv_state = mma_qk(1, kv_state);
+                // mma_pv stage=1
+                {
+                    constexpr int stage = 1;
+                    pipeline_kv.consumer_wait(kv_state);
+                    flash::tcgen05_commit();
+                    tC_pv.data() = tmem_o[stage];
+                    tP.data() = tmem_s[stage];
+                    auto sV = make_tensor(make_smem_ptr(
+                            ml.smem_kv.begin() + kv_state.index() * kKVElemsPerStage),
+                            SmemLayoutBDual{});
+                    uint32_t pls_addr = cute::cast_smem_ptr_to_uint(
+                            &shared_storage.pipelines.p_lastsplit.full_barrier_[stage]);
+                    utcmma_ts_split(pv_mma, tP, sV, tC_pv, !o_acc_s1,
+                            pls_addr, pls_state_1.phase());
+                    ++pls_state_1; ++pls_state_1;
+                    flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                            shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
+                    ++kv_state;
+                }
+                // mma_qk stage=1
+                {
+                    constexpr int stage = 1;
+                    pipeline_kv.consumer_wait(kv_state);
+                    flash::tcgen05_commit();
+                    tC_qk.data() = tmem_s[stage];
+                    auto sK = make_tensor(make_smem_ptr(
+                            ml.smem_kv.begin() + kv_state.index() * kKVElemsPerStage),
+                            SmemLayoutBDual{});
+                    flash::utcmma_ss(qk_mma, sQ, sK, tC_qk, true);
+                    flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                            shared_storage.pipelines.spo.full_barrier_[stage]));
+                    flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                            shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
+                    ++kv_state;
+                }
                 ++spo_state;
                 o_acc_s1 = true;
             }
 
             // ---- Epilogue: 2 final PV GEMMs, signal O_acc ----
+            // mma_pv stage=0 (epilogue)
             pipeline_s_p_o.producer_acquire(spo_state);
-            kv_state = mma_pv(0, !o_acc_s0, kv_state);
+            {
+                constexpr int stage = 0;
+                pipeline_kv.consumer_wait(kv_state);
+                flash::tcgen05_commit();
+                tC_pv.data() = tmem_o[stage];
+                tP.data() = tmem_s[stage];
+                auto sV = make_tensor(make_smem_ptr(
+                        ml.smem_kv.begin() + kv_state.index() * kKVElemsPerStage),
+                        SmemLayoutBDual{});
+                uint32_t pls_addr = cute::cast_smem_ptr_to_uint(
+                        &shared_storage.pipelines.p_lastsplit.full_barrier_[stage]);
+                utcmma_ts_split(pv_mma, tP, sV, tC_pv, !o_acc_s0,
+                        pls_addr, pls_state_0.phase());
+                ++pls_state_0; ++pls_state_0;
+                flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                        shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
+                ++kv_state;
+            }
             // UMMA arrive on OAcc full barrier (final O0 ready)
             flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
                     shared_storage.pipelines.o_acc.full_barrier_[0]));
             ++spo_state;
 
+            // mma_pv stage=1 (epilogue)
             pipeline_s_p_o.producer_acquire(spo_state);
-            kv_state = mma_pv(1, !o_acc_s1, kv_state);
+            {
+                constexpr int stage = 1;
+                pipeline_kv.consumer_wait(kv_state);
+                flash::tcgen05_commit();
+                tC_pv.data() = tmem_o[stage];
+                tP.data() = tmem_s[stage];
+                auto sV = make_tensor(make_smem_ptr(
+                        ml.smem_kv.begin() + kv_state.index() * kKVElemsPerStage),
+                        SmemLayoutBDual{});
+                uint32_t pls_addr = cute::cast_smem_ptr_to_uint(
+                        &shared_storage.pipelines.p_lastsplit.full_barrier_[stage]);
+                utcmma_ts_split(pv_mma, tP, sV, tC_pv, !o_acc_s1,
+                        pls_addr, pls_state_1.phase());
+                ++pls_state_1; ++pls_state_1;
+                flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                        shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
+                ++kv_state;
+            }
             // UMMA arrive on OAcc full barrier (final O1 ready)
             flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
                     shared_storage.pipelines.o_acc.full_barrier_[1]));
