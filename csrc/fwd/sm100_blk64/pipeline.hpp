@@ -124,11 +124,54 @@ __device__ __forceinline__ void consumer_release_cta(
     asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" : : "r"(addr) : "memory");
 }
 
+// Index-based variant: arrive on empty_barrier_[stage] (no PipeState needed).
+template<typename SharedStorage>
+__device__ __forceinline__ void consumer_release_cta_w_index(
+        SharedStorage& storage, int stage) {
+    uint32_t addr = cute::cast_smem_ptr_to_uint(&storage.empty_barrier_[stage]);
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" : : "r"(addr) : "memory");
+}
+
 template<typename SharedStorage>
 __device__ __forceinline__ void producer_commit_cta(
         SharedStorage& storage, PipeState state) {
     uint32_t addr = cute::cast_smem_ptr_to_uint(&storage.full_barrier_[state.index()]);
     asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" : : "r"(addr) : "memory");
+}
+
+// Index-based variant: arrive on full_barrier_[stage] (no PipeState needed).
+template<typename SharedStorage>
+__device__ __forceinline__ void producer_commit_cta_w_index(
+        SharedStorage& storage, int stage) {
+    uint32_t addr = cute::cast_smem_ptr_to_uint(&storage.full_barrier_[stage]);
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" : : "r"(addr) : "memory");
+}
+
+// Index+phase producer_acquire: wait on empty_barrier_[stage] with given phase, then flip.
+template<typename SharedStorage>
+__device__ __forceinline__ void producer_acquire_w_index_phase(
+        SharedStorage& storage, int stage, int& phase) {
+    wait_barrier_addr(
+        cute::cast_smem_ptr_to_uint(&storage.empty_barrier_[stage]), phase);
+    phase ^= 1;
+}
+
+// Index+phase consumer_wait: wait on full_barrier_[stage] with given phase, then flip.
+template<typename SharedStorage>
+__device__ __forceinline__ void consumer_wait_w_index_phase(
+        SharedStorage& storage, int stage, int& phase) {
+    wait_barrier_addr(
+        cute::cast_smem_ptr_to_uint(&storage.full_barrier_[stage]), phase);
+    phase ^= 1;
+}
+
+// Index+phase consumer_wait with .acquire semantics (SM100 SMEM visibility).
+template<typename SharedStorage>
+__device__ __forceinline__ void consumer_wait_acquire_w_index_phase(
+        SharedStorage& storage, int stage, int& phase) {
+    wait_barrier_acquire_addr(
+        cute::cast_smem_ptr_to_uint(&storage.full_barrier_[stage]), phase);
+    phase ^= 1;
 }
 
 // ============================================================================

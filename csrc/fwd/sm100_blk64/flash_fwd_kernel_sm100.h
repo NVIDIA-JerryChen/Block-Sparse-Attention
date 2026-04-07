@@ -386,7 +386,7 @@ struct FusedAttnFwdSm100 {
                 work = tile_sched.consumer_advance();
             }
             // Producer tail: wait for epilogue to finish the last sO store (blk128 line 1951)
-            pipeline_o_epi.producer_acquire(corr_state.o_epi_state);
+            flash::producer_acquire_w_index_phase(shared_storage.pipelines.o_epi, 0, corr_state.o_epi_phase);
         }
         else if (warp_idx >= 4) {
             // ===== WG1 (warps 4-7): Softmax stage=1 =====
@@ -396,8 +396,8 @@ struct FusedAttnFwdSm100 {
 
             const uint32_t tmem_base = shared_storage.tmem_base_ptr;
             typename CollectiveMainloop::SoftmaxState softmax1_state;
-            softmax1_state.spo_state = PipeState(1, 0, 0);
-            softmax1_state.sm_stats_state = PipeState(1, 1, 0);  // producer start: phase=1 (no prefill)
+            // Stage 1 starts at phase=0 for both (fused_gemm pattern: simple int phases)
+            softmax1_state.sm_stats_phase = 1;  // producer start: phase=1 (no prefill)
             CLCTileScheduler tile_sched(pipeline_clc, shared_storage.pipelines.clc_response, {params.num_row_tiles, params.num_kv_blocks, params.num_heads, params.batch});
 
             auto work = tile_sched.initial_work_tile_info();
@@ -427,7 +427,7 @@ struct FusedAttnFwdSm100 {
 
             const uint32_t tmem_base = shared_storage.tmem_base_ptr;
             typename CollectiveMainloop::SoftmaxState softmax0_state;
-            softmax0_state.sm_stats_state = PipeState(0, 1, 0);  // producer start: phase=1 (no prefill)
+            softmax0_state.sm_stats_phase = 1;  // producer start: phase=1 (no prefill)
             CLCTileScheduler tile_sched(pipeline_clc, shared_storage.pipelines.clc_response, {params.num_row_tiles, params.num_kv_blocks, params.num_heads, params.batch});
 
             auto work = tile_sched.initial_work_tile_info();
