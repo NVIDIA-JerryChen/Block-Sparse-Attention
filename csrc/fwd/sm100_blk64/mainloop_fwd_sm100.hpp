@@ -414,11 +414,10 @@ struct CollectiveMainloopFwd {
 
     struct MmaState {
         PipelineKVState kv_state;  // consumer starts at phase=0 (default)
-        int spo_phase_s0 = 0;     // SPO producer phase for stage 0
-        int spo_phase_s1 = 0;     // SPO producer phase for stage 1
+        PipeState spo_state;       // alternating stages 0→1→0→1 for producer_acquire
+        PipeState pls_state_0;     // p_lastsplit stage 0 phase tracking
+        PipeState pls_state_1 = PipeState(1, 0, 0);  // p_lastsplit stage 1
         int q_phase = 0;
-        int pls_phase0 = 0;       // p_lastsplit phase for stage 0
-        int pls_phase1 = 0;       // p_lastsplit phase for stage 1
     };
 
     // Split PV GEMM: issue first half tiles, wait p_lastsplit, issue remaining half.
@@ -479,17 +478,17 @@ struct CollectiveMainloopFwd {
 
         if (elect_one_sync()) {
             auto kv_state = state.kv_state;
-            auto& spo_phase_s0 = state.spo_phase_s0;
-            auto& spo_phase_s1 = state.spo_phase_s1;
-            auto& pls_phase0 = state.pls_phase0;
-            auto& pls_phase1 = state.pls_phase1;
+            auto spo_state = state.spo_state;
+            auto pls_state_0 = state.pls_state_0;
+            auto pls_state_1 = state.pls_state_1;
             bool o_acc_s0 = false, o_acc_s1 = false;
 
             // Wait for Q TMA
+            int q_phase = state.q_phase;
             flash::wait_barrier_addr(
                     cute::cast_smem_ptr_to_uint(&shared_storage.pipelines.bar_q_ready),
-                    state.q_phase);
-            state.q_phase ^= 1;
+                    q_phase);
+            q_phase ^= 1;
             flash::tcgen05_commit();
 
             // ---- Prologue: S0 = Q@K[N-1], S1 = Q@K[N-2] (N>=2 guaranteed) ----
@@ -531,7 +530,7 @@ struct CollectiveMainloopFwd {
             CUTE_NO_UNROLL
             for (int i = 0; i < pair_count; ++i) {
                 // ---- stage 0: PV then QK ----
-                flash::producer_acquire_w_index_phase(shared_storage.pipelines.spo, 0, spo_phase_s0);
+                pipeline_s_p_o.producer_acquire(spo_state);
                 // mma_pv stage=0
                 {
                     constexpr int stage = 0;
@@ -545,8 +544,8 @@ struct CollectiveMainloopFwd {
                     uint32_t pls_addr = cute::cast_smem_ptr_to_uint(
                             &shared_storage.pipelines.p_lastsplit.full_barrier_[stage]);
                     utcmma_ts_split(pv_mma, tP, sV, tC_pv, !o_acc_s0,
-                            pls_addr, pls_phase0);
-                    pls_phase0 ^= 1;
+                            pls_addr, pls_state_0.phase());
+                    ++pls_state_0; ++pls_state_0;
                     flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
                             shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
                     ++kv_state;
@@ -567,10 +566,11 @@ struct CollectiveMainloopFwd {
                             shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
                     ++kv_state;
                 }
+                ++spo_state;
                 o_acc_s0 = true;
 
                 // ---- stage 1: PV then QK ----
-                flash::producer_acquire_w_index_phase(shared_storage.pipelines.spo, 1, spo_phase_s1);
+                pipeline_s_p_o.producer_acquire(spo_state);
                 // mma_pv stage=1
                 {
                     constexpr int stage = 1;
@@ -584,8 +584,8 @@ struct CollectiveMainloopFwd {
                     uint32_t pls_addr = cute::cast_smem_ptr_to_uint(
                             &shared_storage.pipelines.p_lastsplit.full_barrier_[stage]);
                     utcmma_ts_split(pv_mma, tP, sV, tC_pv, !o_acc_s1,
-                            pls_addr, pls_phase1);
-                    pls_phase1 ^= 1;
+                            pls_addr, pls_state_1.phase());
+                    ++pls_state_1; ++pls_state_1;
                     flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
                             shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
                     ++kv_state;
@@ -606,12 +606,13 @@ struct CollectiveMainloopFwd {
                             shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
                     ++kv_state;
                 }
+                ++spo_state;
                 o_acc_s1 = true;
             }
 
             // ---- Epilogue: 2 final PV GEMMs, signal O_acc ----
             // mma_pv stage=0 (epilogue)
-            flash::producer_acquire_w_index_phase(shared_storage.pipelines.spo, 0, spo_phase_s0);
+            pipeline_s_p_o.producer_acquire(spo_state);
             {
                 constexpr int stage = 0;
                 pipeline_kv.consumer_wait(kv_state);
@@ -624,8 +625,8 @@ struct CollectiveMainloopFwd {
                 uint32_t pls_addr = cute::cast_smem_ptr_to_uint(
                         &shared_storage.pipelines.p_lastsplit.full_barrier_[stage]);
                 utcmma_ts_split(pv_mma, tP, sV, tC_pv, !o_acc_s0,
-                        pls_addr, pls_phase0);
-                pls_phase0 ^= 1;
+                        pls_addr, pls_state_0.phase());
+                ++pls_state_0; ++pls_state_0;
                 flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
                         shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
                 ++kv_state;
@@ -633,9 +634,10 @@ struct CollectiveMainloopFwd {
             // UMMA arrive on OAcc full barrier (final O0 ready)
             flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
                     shared_storage.pipelines.o_acc.full_barrier_[0]));
+            ++spo_state;
 
             // mma_pv stage=1 (epilogue)
-            flash::producer_acquire_w_index_phase(shared_storage.pipelines.spo, 1, spo_phase_s1);
+            pipeline_s_p_o.producer_acquire(spo_state);
             {
                 constexpr int stage = 1;
                 pipeline_kv.consumer_wait(kv_state);
@@ -648,8 +650,8 @@ struct CollectiveMainloopFwd {
                 uint32_t pls_addr = cute::cast_smem_ptr_to_uint(
                         &shared_storage.pipelines.p_lastsplit.full_barrier_[stage]);
                 utcmma_ts_split(pv_mma, tP, sV, tC_pv, !o_acc_s1,
-                        pls_addr, pls_phase1);
-                pls_phase1 ^= 1;
+                        pls_addr, pls_state_1.phase());
+                ++pls_state_1; ++pls_state_1;
                 flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
                         shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
                 ++kv_state;
@@ -657,8 +659,13 @@ struct CollectiveMainloopFwd {
             // UMMA arrive on OAcc full barrier (final O1 ready)
             flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
                     shared_storage.pipelines.o_acc.full_barrier_[1]));
+            ++spo_state;
 
             state.kv_state = kv_state;
+            state.spo_state = spo_state;
+            state.pls_state_0 = pls_state_0;
+            state.pls_state_1 = pls_state_1;
+            state.q_phase = q_phase;
         }
         return state;
     }
@@ -673,8 +680,8 @@ struct CollectiveMainloopFwd {
     // ===========================================================================
 
     struct SoftmaxState {
-        int spo_phase = 0;        // consumer_wait phase on SPO (stage from template param)
-        int sm_stats_phase = 0;   // producer_acquire phase on SmStats (stage from template param)
+        PipeState spo_state;        // consumer_wait on SPO (stage from template param)
+        PipeState sm_stats_state;   // producer_acquire on SmStats (stage from template param)
     };
 
     // R2P bitmask: keep positions < limit within 32-element chunk s.
@@ -726,7 +733,7 @@ struct CollectiveMainloopFwd {
             SharedStorage& shared_storage,
             uint32_t tmem_s_cur, float sm_scale,
             float& row_max, float& row_sum,
-            int& spo_phase, int& sm_stats_phase,
+            PipeState& spo_state, PipeState& sm_stats_state,
             int block_size_lo = kSparseBlockSize,
             int block_size_hi = kSparseBlockSize)
     {
@@ -735,7 +742,7 @@ struct CollectiveMainloopFwd {
         auto& ml = shared_storage.tensors.mainloop;
 
         // 1. Wait for S ready in TMEM
-        flash::consumer_wait_w_index_phase(shared_storage.pipelines.spo, Stage, spo_phase);
+        pipeline_s_p_o.consumer_wait(spo_state);
 
         // 2. T2R load
         auto tSrS_t2r = cute::make_tensor<float>(cute::Shape<cute::Int<kCSpan>>{});
@@ -807,7 +814,9 @@ struct CollectiveMainloopFwd {
                 // split_P_arrive
                 if (frag + 1 == kFrgCount * kSplitNumer / kSplitDenom) {
                     cutlass::arch::fence_view_async_tmem_store();
-                    flash::consumer_release_cta_w_index(shared_storage.pipelines.spo, Stage);
+                    flash::consumer_release_cta(shared_storage.pipelines.spo, spo_state);
+                    // Advance spo_state by 2: stay on same Stage, flip phase
+                    ++spo_state; ++spo_state;
                 }
             }
         }
@@ -816,11 +825,13 @@ struct CollectiveMainloopFwd {
         cutlass::arch::fence_view_async_tmem_store();
         __syncwarp();
         if (elect_one_sync()) {
-            flash::producer_commit_cta_w_index(shared_storage.pipelines.p_lastsplit, Stage);
+            flash::producer_commit_cta(shared_storage.pipelines.p_lastsplit, PipeState(Stage, 0, 0));
         }
 
         // ---- 8. pipeline_sm_stats.producer_acquire ----
-        flash::producer_acquire_w_index_phase(shared_storage.pipelines.sm_stats, Stage, sm_stats_phase);
+        pipeline_sm_stats.producer_acquire(sm_stats_state);
+        // Advance sm_stats_state by 2: stay on same Stage, flip phase
+        ++sm_stats_state; ++sm_stats_state;
 
         // ---- 9. update_row_sum (blk128: softmax.update_row_sum) ----
         update_row_sum<IsFirst>(tSrS_t2r, acc_scale, row_sum);
@@ -852,8 +863,8 @@ struct CollectiveMainloopFwd {
 
         float row_max = -CUDART_INF_F;
         float row_sum = 0.0f;
-        auto& spo_phase = state.spo_phase;
-        auto& sm_stats_phase = state.sm_stats_phase;
+        PipeState spo_state = state.spo_state;
+        PipeState sm_stats_state = state.sm_stats_state;
         int wg_count = num_kv_blocks / 2;
 
         // Block-size lookup: slot → sub mapping (inverse of kInterleavedSlot)
@@ -881,7 +892,9 @@ struct CollectiveMainloopFwd {
         };
 
         // BSA: acquire before loop
-        flash::producer_acquire_w_index_phase(shared_storage.pipelines.sm_stats, Stage, sm_stats_phase);
+        pipeline_sm_stats.producer_acquire(sm_stats_state);
+        // Advance sm_stats_state by 2: stay on same Stage, flip phase
+        ++sm_stats_state; ++sm_stats_state;
 
         // BSA: 1st block peeled (IsFirst=true), remaining blocks in loop (IsFirst=false)
         {
@@ -890,7 +903,7 @@ struct CollectiveMainloopFwd {
             softmax_step<Stage, /*IsFirst=*/true, SharedStorage, NamedBarriers>(
                 sm_idx, sm_stats_bar,
                 pipeline_s_p_o, pipeline_sm_stats, pipeline_p_lastsplit, shared_storage,
-                tmem_s_cur, sm_scale, row_max, row_sum, spo_phase, sm_stats_phase,
+                tmem_s_cur, sm_scale, row_max, row_sum, spo_state, sm_stats_state,
                 bs_lo, bs_hi);
         }
 
@@ -901,7 +914,7 @@ struct CollectiveMainloopFwd {
             softmax_step<Stage, /*IsFirst=*/false, SharedStorage, NamedBarriers>(
                 sm_idx, sm_stats_bar,
                 pipeline_s_p_o, pipeline_sm_stats, pipeline_p_lastsplit, shared_storage,
-                tmem_s_cur, sm_scale, row_max, row_sum, spo_phase, sm_stats_phase,
+                tmem_s_cur, sm_scale, row_max, row_sum, spo_state, sm_stats_state,
                 bs_lo, bs_hi);
         }
 
@@ -910,6 +923,8 @@ struct CollectiveMainloopFwd {
         ml.smem_max[Stage * 128 + sm_idx] = row_max;
         __threadfence_block();
         NamedBarrier::arrive(kSmStatsNotifyThreads, sm_stats_bar);
+        state.spo_state = spo_state;
+        state.sm_stats_state = sm_stats_state;
         return state;
     }
 
@@ -929,9 +944,9 @@ struct CollectiveMainloopFwd {
     static constexpr int kNumChunks = kCSpan / kChunk;
 
     struct CorrState {
-        int o_acc_phase0 = 0;     // OAcc consumer_wait phase for stage 0
-        int o_acc_phase1 = 0;     // OAcc consumer_wait phase for stage 1
-        int o_epi_phase = 1;      // producer start: phase=1 (no prefill, matches blk128)
+        PipeState o_acc_state_0;                   // {0, 0, 0} default — OAcc consumer_wait stage 0
+        PipeState o_acc_state_1 = PipeState(1, 0, 0); // OAcc consumer_wait stage 1
+        PipeState o_epi_state = PipeState(0, 1, 0); // producer start: phase=1 (no prefill, matches blk128)
     };
 
     CUTLASS_DEVICE static void correction_rescale(
@@ -1062,11 +1077,15 @@ struct CollectiveMainloopFwd {
         const int corr_warp = warp_idx - 8;       // 0..3
         const int corr_idx = threadIdx.x - 8 * 32; // 0..127
 
+        // Static PipeState helpers for stage-indexed release (phase not needed for arrive)
+        PipeState const st0(0, 0, 0);
+        PipeState const st1(1, 0, 0);
+
         // ---- (a) Skip first pair: no rescale needed (BSA pattern) ----
-        flash::consumer_release_cta_w_index(shared_storage.pipelines.spo, 0);
-        flash::consumer_release_cta_w_index(shared_storage.pipelines.spo, 1);
+        flash::consumer_release_cta(shared_storage.pipelines.spo, st0);
+        flash::consumer_release_cta(shared_storage.pipelines.spo, st1);
         NamedBarrier::arrive_and_wait(kSmStatsNotifyThreads, NamedBarriers::SmStatsNotify + 0 * kCorrWarps + corr_warp);
-        flash::consumer_release_cta_w_index(shared_storage.pipelines.sm_stats, 0);
+        flash::consumer_release_cta(shared_storage.pipelines.sm_stats, st0);
         NamedBarrier::arrive_and_wait(kSmStatsNotifyThreads, NamedBarriers::SmStatsNotify + 1 * kCorrWarps + corr_warp);
 
         // ---- (b) Paired rescale loop (BSA: seqlen_corr_loop_steps) ----
@@ -1077,31 +1096,31 @@ struct CollectiveMainloopFwd {
             {
                 NamedBarrier::arrive_and_wait(kSmStatsNotifyThreads, NamedBarriers::SmStatsNotify + 0 * kCorrWarps + corr_warp);
                 correction_rescale(tmem_o0, ml.corr_scale[0][corr_idx], corr_idx);
-                flash::consumer_release_cta_w_index(shared_storage.pipelines.spo, 0);
-                flash::consumer_release_cta_w_index(shared_storage.pipelines.sm_stats, 1);
+                flash::consumer_release_cta(shared_storage.pipelines.spo, st0);
+                flash::consumer_release_cta(shared_storage.pipelines.sm_stats, st1);
             }
             // Stage 1: rescale O1
             {
                 NamedBarrier::arrive_and_wait(kSmStatsNotifyThreads, NamedBarriers::SmStatsNotify + 1 * kCorrWarps + corr_warp);
                 correction_rescale(tmem_o1, ml.corr_scale[1][corr_idx], corr_idx);
-                flash::consumer_release_cta_w_index(shared_storage.pipelines.spo, 1);
-                flash::consumer_release_cta_w_index(shared_storage.pipelines.sm_stats, 0);
+                flash::consumer_release_cta(shared_storage.pipelines.spo, st1);
+                flash::consumer_release_cta(shared_storage.pipelines.sm_stats, st0);
             }
         }
 
         // BSA: post-loop release for stage 1
-        flash::consumer_release_cta_w_index(shared_storage.pipelines.sm_stats, 1);
+        flash::consumer_release_cta(shared_storage.pipelines.sm_stats, st1);
 
         // ---- (c) Read final stats (BSA: sm_stats_barrier for both stages) ----
         NamedBarrier::arrive_and_wait(kSmStatsNotifyThreads, NamedBarriers::SmStatsNotify + 0 * kCorrWarps + corr_warp);
         float row_sum0 = ml.smem_sum[0 * 128 + corr_idx];
         float row_max0 = ml.smem_max[0 * 128 + corr_idx];
-        flash::consumer_release_cta_w_index(shared_storage.pipelines.sm_stats, 0);
+        flash::consumer_release_cta(shared_storage.pipelines.sm_stats, st0);
 
         NamedBarrier::arrive_and_wait(kSmStatsNotifyThreads, NamedBarriers::SmStatsNotify + 1 * kCorrWarps + corr_warp);
         float row_sum1 = ml.smem_sum[1 * 128 + corr_idx];
         float row_max1 = ml.smem_max[1 * 128 + corr_idx];
-        flash::consumer_release_cta_w_index(shared_storage.pipelines.sm_stats, 1);
+        flash::consumer_release_cta(shared_storage.pipelines.sm_stats, st1);
 
         // ---- (d) Compute cross-stage combine scales ----
         float rm0 = (row_sum0 > 0.0f) ? row_max0 : -CUDART_INF_F;
@@ -1114,10 +1133,13 @@ struct CollectiveMainloopFwd {
         float my_max = max_safe;
 
         // ---- (e) Wait for final O from MMA ----
-        flash::consumer_wait_w_index_phase(shared_storage.pipelines.o_acc, 0, corr_state.o_acc_phase0);
+        pipeline_o_acc.consumer_wait(corr_state.o_acc_state_0);
         flash::tcgen05_commit();
-        flash::consumer_wait_w_index_phase(shared_storage.pipelines.o_acc, 1, corr_state.o_acc_phase1);
+        pipeline_o_acc.consumer_wait(corr_state.o_acc_state_1);
         flash::tcgen05_commit();
+        // Advance OAcc states by 2 (stay on same stage, flip phase)
+        ++corr_state.o_acc_state_0; ++corr_state.o_acc_state_0;
+        ++corr_state.o_acc_state_1; ++corr_state.o_acc_state_1;
 
         // ---- (f) Warp-pair stats exchange + combine weight ----
         auto sO = make_tensor(make_smem_ptr(el.sO.begin()), SmemLayoutO{});
@@ -1158,7 +1180,7 @@ struct CollectiveMainloopFwd {
         }
 
         // ---- (g) Wait for sO slot free, then combine (blk128: producer_acquire before combine) ----
-        flash::producer_acquire_w_index_phase(shared_storage.pipelines.o_epi, 0, corr_state.o_epi_phase);
+        pipeline_o_epi.producer_acquire(corr_state.o_epi_state);
         float my_scale0 = scale0 * my_weight;
         float my_scale1 = scale1 * my_weight;
         correction_combine<decltype(sO), decltype(el), NamedBarriers>(
@@ -1167,7 +1189,9 @@ struct CollectiveMainloopFwd {
 
         // ---- (h) Fence + signal epilogue warp ----
         cutlass::arch::fence_view_async_shared();
-        flash::producer_commit_cta_w_index(shared_storage.pipelines.o_epi, 0);
+        flash::producer_commit_cta(shared_storage.pipelines.o_epi, corr_state.o_epi_state);
+        // Advance OEpi state by 2: stay on stage 0, flip phase
+        ++corr_state.o_epi_state; ++corr_state.o_epi_state;
         return corr_state;
     }
 };
