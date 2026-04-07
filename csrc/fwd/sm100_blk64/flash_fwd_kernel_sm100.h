@@ -108,8 +108,8 @@ struct FusedAttnFwdSm100 {
             PipelineKV::SharedStorage kv;
             PipelineSPO::SharedStorage spo;
             PipelineOAcc::SharedStorage o_acc;
-            PipelineOEpi::SharedStorage o_epi;
             PipelineSmStats::SharedStorage sm_stats;
+            PipelineOEpi::SharedStorage o_epi;
             PipelinePLastSplit::SharedStorage p_lastsplit;
             PipelineCLC::SharedStorage clc;
             alignas(16) CLCResponse clc_response[kCLCStages];
@@ -133,6 +133,7 @@ struct FusedAttnFwdSm100 {
         int heads;
         int batch = 1;
         int seq_kv = 0;   // actual K/V seq length for TMA descriptor (0 = use seq_padded)
+        int seq_k_actual = 0;  // actual K seq length for K's 5D TMA batch stride
     };
 
     // ---- Params (device-side) ----
@@ -153,7 +154,7 @@ struct FusedAttnFwdSm100 {
 
         int seq_kv = args.seq_kv > 0 ? args.seq_kv : args.seq_padded;
         auto mainloop_params = CollectiveMainloop::to_underlying_arguments(
-                args.mainloop, args.rows_padded, args.seq_padded, args.heads, seq_kv, args.batch);
+                args.mainloop, args.rows_padded, args.seq_padded, args.heads, seq_kv, args.batch, args.seq_k_actual);
         auto epilogue_params = CollectiveEpilogue::to_underlying_arguments(
                 args.epilogue, args.rows_padded, args.heads, args.batch);
 
@@ -196,11 +197,42 @@ struct FusedAttnFwdSm100 {
                                cute::Shape<cute::_1, cute::_1, cute::_1>{},
                                cute::false_type{}, cute::false_type{});
 
-        PipelineSPO     pipeline_s_p_o(shared_storage.pipelines.spo);
-        PipelineOAcc    pipeline_o_acc(shared_storage.pipelines.o_acc);
-        PipelineOEpi    pipeline_o_epi(shared_storage.pipelines.o_epi);
-        PipelineSmStats pipeline_sm_stats(shared_storage.pipelines.sm_stats);
-        PipelinePLastSplit pipeline_p_lastsplit(shared_storage.pipelines.p_lastsplit);
+        // Intra-CTA pipeline params (all use PipelineAsync<2>)
+        // SPO: producer=MMA(1 UMMA arrive), consumer=Softmax+Correction(256 threads)
+        PipelineSPO::Params spo_params;
+        spo_params.producer_arv_count = 1;
+        spo_params.consumer_arv_count = 256;
+        spo_params.role = PipelineSPO::ThreadCategory::ProducerConsumer;
+
+        // OAcc: producer=MMA(1 UMMA arrive), consumer=unused(dummy=1)
+        PipelineOAcc::Params oacc_params;
+        oacc_params.producer_arv_count = 1;
+        oacc_params.consumer_arv_count = 1;
+        oacc_params.role = PipelineOAcc::ThreadCategory::ProducerConsumer;
+
+        // SmStats: producer=Softmax(128 threads), consumer=Correction(128 threads)
+        PipelineSmStats::Params smstats_params;
+        smstats_params.producer_arv_count = 128;
+        smstats_params.consumer_arv_count = 128;
+        smstats_params.role = PipelineSmStats::ThreadCategory::ProducerConsumer;
+
+        // OEpi: producer=Correction(128 threads), consumer=Epilogue(1 thread)
+        PipelineOEpi::Params oepi_params;
+        oepi_params.producer_arv_count = 128;
+        oepi_params.consumer_arv_count = 1;
+        oepi_params.role = PipelineOEpi::ThreadCategory::ProducerConsumer;
+
+        // PLastSplit: producer=Softmax(4 warps elect_one), consumer=unused(dummy=1)
+        PipelinePLastSplit::Params pls_params;
+        pls_params.producer_arv_count = 4;
+        pls_params.consumer_arv_count = 1;
+        pls_params.role = PipelinePLastSplit::ThreadCategory::ProducerConsumer;
+
+        PipelineSPO     pipeline_s_p_o(shared_storage.pipelines.spo, spo_params, cute::false_type{});
+        PipelineOAcc    pipeline_o_acc(shared_storage.pipelines.o_acc, oacc_params, cute::false_type{});
+        PipelineSmStats pipeline_sm_stats(shared_storage.pipelines.sm_stats, smstats_params, cute::false_type{});
+        PipelineOEpi    pipeline_o_epi(shared_storage.pipelines.o_epi, oepi_params, cute::false_type{});
+        PipelinePLastSplit pipeline_p_lastsplit(shared_storage.pipelines.p_lastsplit, pls_params, cute::false_type{});
 
         // PipelineCLC: CUTLASS PipelineCLCFetchAsync constructor initializes barriers.
         // Scheduler warp = ProducerConsumer, all others = Consumer.
@@ -213,33 +245,28 @@ struct FusedAttnFwdSm100 {
         clc_params.num_consumers = 1;          // single CTA
         clc_params.producer_blockid = 0;       // single CTA
         clc_params.producer_arv_count = 1;     // lane 0 does arrive_and_expect_tx
-        clc_params.consumer_arv_count = kWorkerThreads; // 480 worker threads do consumer_release (scheduler does NOT)
+        clc_params.consumer_arv_count = kThreads; // ALL 512 threads do consumer_release (blk128 symmetric pattern)
         clc_params.initializing_warp = 0;      // warp 0 initializes CLC barriers
         PipelineCLC pipeline_clc(shared_storage.pipelines.clc, clc_params);
 
-        // Init all barriers: KV pipeline (warp-wide) + others (elect_one)
+        // Init all barriers (CUTLASS init_barriers checks warp internally)
         if (warp_idx == 0) {
             PipelineKV::init_barriers(shared_storage.pipelines.kv, pipeline_kv_params,
                                      cute::Shape<cute::_1, cute::_1, cute::_1>{});
-        }
-        if (warp_idx == 0 && lane_predicate) {
-            pipeline_s_p_o.init();
-            pipeline_o_acc.init();
-            pipeline_o_epi.init();
-            pipeline_sm_stats.init();
-            pipeline_p_lastsplit.init();
+            pipeline_s_p_o.init_barriers(shared_storage.pipelines.spo, spo_params);
+            pipeline_o_acc.init_barriers(shared_storage.pipelines.o_acc, oacc_params);
+            pipeline_sm_stats.init_barriers(shared_storage.pipelines.sm_stats, smstats_params);
+            pipeline_o_epi.init_barriers(shared_storage.pipelines.o_epi, oepi_params);
+            pipeline_p_lastsplit.init_barriers(shared_storage.pipelines.p_lastsplit, pls_params);
             // PipelineCLC barriers initialized by CUTLASS constructor above
-            cute::initialize_barrier(shared_storage.pipelines.bar_q_ready, 1);
-            shared_storage.tmem_ready = 0;
+            if (lane_predicate) {
+                cute::initialize_barrier(shared_storage.pipelines.bar_q_ready, 1);
+                shared_storage.tmem_ready = 0;
+            }
         }
         fence_barrier_init();
         __syncthreads();
         pipeline_kv.init_masks(cute::Shape<cute::_1, cute::_1, cute::_1>{});
-        pipeline_s_p_o.precompute_addrs();
-        pipeline_o_acc.precompute_addrs();
-        pipeline_o_epi.precompute_addrs();
-        pipeline_sm_stats.precompute_addrs();
-        pipeline_p_lastsplit.precompute_addrs();
 
         // ======== Phase 2: Prefetch TMA descriptors (example 77 / FA hopper pattern) ========
         if (warp_idx == kLoadWarp && elect_one_sync()) {
@@ -261,22 +288,18 @@ struct FusedAttnFwdSm100 {
         CollectiveEpilogue epilogue;
 
         if (warp_idx == kSchedWarp) {
-            // ===== WG3 warp 15: CLC scheduler (lane 0 only) =====
-            // Only lane 0 runs the scheduling loop (matching original pattern).
-            // producer_tail drains the pipeline on exit.
-            if (lane_idx == 0) {
-                CLCTileScheduler tile_sched(pipeline_clc, shared_storage.pipelines.clc_response, {params.num_row_tiles, params.num_kv_blocks, params.num_heads, params.batch});
+            // ===== WG3 warp 15: CLC scheduler (blk128 symmetric pattern) =====
+            // All 32 threads participate. Scheduler does BOTH producer (advance)
+            // and consumer (fetch = wait + release). No reinit callback needed
+            // (epilogue uses phase cycling).
+            CLCTileScheduler tile_sched(pipeline_clc, shared_storage.pipelines.clc_response, {params.num_row_tiles, params.num_kv_blocks, params.num_heads, params.batch});
 
-                auto work = tile_sched.initial_work_tile_info();
-                while (work.is_valid) {
-                    tile_sched.advance_to_next_work([&]() {
-                        pipeline_o_epi.init();
-                        fence_barrier_init();
-                    });
-                    work = tile_sched.fetch_next_work();
-                }
-                // producer_tail intentionally omitted (matches original)
+            auto work = tile_sched.initial_work_tile_info();
+            while (work.is_valid) {
+                tile_sched.advance_to_next_work();
+                work = tile_sched.fetch_next_work();
             }
+            tile_sched.producer_tail();
         }
         else if (warp_idx == kMmaWarp) {
             // ===== WG3 warp 12: MMA (TMEM alloc here) =====
@@ -297,6 +320,7 @@ struct FusedAttnFwdSm100 {
                 mma_state = mainloop.mma(pipeline_kv, pipeline_s_p_o, pipeline_o_acc, pipeline_p_lastsplit,
                                           shared_storage, tmem_base, tile_nkv, mma_state);
                 work = tile_sched.consumer_advance();
+                if (work.is_valid) { flash::tcgen05_commit(); }
             }
 
             tmem_alloc.free(shared_storage.tmem_base_ptr, TmemAllocator::Sm100TmemCapacityColumns);
@@ -311,11 +335,9 @@ struct FusedAttnFwdSm100 {
 
             auto work = tile_sched.initial_work_tile_info();
             while (work.is_valid) {
-                if (elect_one_sync()) { pipeline_o_epi.prefill(); }
-                epilogue.template tma_store<SharedStorage>(
+                epi_state = epilogue.template tma_store<SharedStorage>(
                         params.epilogue, pipeline_o_epi, shared_storage,
                         work.head, work.row_tile, work.batch, params.num_row_tiles, epi_state);
-                epi_state = typename CollectiveEpilogue::EpiState{};
                 work = tile_sched.consumer_advance();
             }
         }
@@ -338,6 +360,7 @@ struct FusedAttnFwdSm100 {
                                             work.head, work.row_tile, work.batch, params.num_row_tiles, tile_nkv,
                                             raw_bc, load_state);
                 work = tile_sched.consumer_advance();
+                if (work.is_valid) { flash::tcgen05_commit(); }
             }
         }
         else if (warp_idx >= 8) {
@@ -345,8 +368,6 @@ struct FusedAttnFwdSm100 {
             cutlass::arch::warpgroup_reg_dealloc<kRegsCorrection>();
             while (!*reinterpret_cast<volatile int*>(&shared_storage.tmem_ready)) {}
             __threadfence_block();
-            pipeline_sm_stats.prefill_consumer();
-
             const uint32_t tmem_base = shared_storage.tmem_base_ptr;
             typename CollectiveMainloop::CorrState corr_state;
             CLCTileScheduler tile_sched(pipeline_clc, shared_storage.pipelines.clc_response, {params.num_row_tiles, params.num_kv_blocks, params.num_heads, params.batch});
@@ -365,6 +386,8 @@ struct FusedAttnFwdSm100 {
                         params.epilogue.ptr_LSE, lse_tile_offset);
                 work = tile_sched.consumer_advance();
             }
+            // Producer tail: wait for epilogue to finish the last sO store (blk128 line 1951)
+            pipeline_o_epi.producer_acquire(corr_state.o_epi_state);
         }
         else if (warp_idx >= 4) {
             // ===== WG1 (warps 4-7): Softmax stage=1 =====
@@ -374,6 +397,8 @@ struct FusedAttnFwdSm100 {
 
             const uint32_t tmem_base = shared_storage.tmem_base_ptr;
             typename CollectiveMainloop::SoftmaxState softmax1_state;
+            softmax1_state.spo_state = PipeState(1, 0, 0);
+            softmax1_state.sm_stats_state = PipeState(1, 1, 0);  // producer start: phase=1 (no prefill)
             CLCTileScheduler tile_sched(pipeline_clc, shared_storage.pipelines.clc_response, {params.num_row_tiles, params.num_kv_blocks, params.num_heads, params.batch});
 
             auto work = tile_sched.initial_work_tile_info();
@@ -403,6 +428,7 @@ struct FusedAttnFwdSm100 {
 
             const uint32_t tmem_base = shared_storage.tmem_base_ptr;
             typename CollectiveMainloop::SoftmaxState softmax0_state;
+            softmax0_state.sm_stats_state = PipeState(0, 1, 0);  // producer start: phase=1 (no prefill)
             CLCTileScheduler tile_sched(pipeline_clc, shared_storage.pipelines.clc_response, {params.num_row_tiles, params.num_kv_blocks, params.num_heads, params.batch});
 
             auto work = tile_sched.initial_work_tile_info();

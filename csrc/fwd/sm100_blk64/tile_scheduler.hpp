@@ -12,22 +12,15 @@
 
 namespace flash {
 
-// Noinline fence between consumer_release and consumer_wait.
-// Both the function call boundary (compiler barrier) and membar.gl (hardware fence)
-// are required to prevent CLC persistent scheduling hang on SM100.
-static __device__ __noinline__ void clc_transition_fence() {
-    asm volatile("membar.gl;\n" ::: "memory");
-}
-
-// CLC persistent tile scheduler with batch support.
-// Grid = (num_row_tiles * num_heads * batch, 1, 1) for CLC 1D flattening.
+// CLC persistent tile scheduler — symmetric wait-then-release pattern (matches blk128).
 //
-// Uses CUTLASS PipelineCLCFetchAsync<1>.
-// Pattern: release-then-wait (workers release old, then wait for new).
-// This gives the scheduler a window to reinit pipeline_o_epi between tiles.
+// ALL threads (kThreads=512) participate in consumer_release, including the scheduler
+// warp. This avoids the asymmetric barrier pattern that causes CLC response delivery
+// stalls on SM100/SM103.
 //
-// consumer_arv_count = kWorkerThreads (480): only worker warps release.
-// Scheduler warp does NOT call consumer_release (only producer_acquire + consumer_wait).
+// consumer_arv_count = kThreads (512): scheduler warp also does consumer_release.
+// Scheduler warp: producer (advance_to_next_work) + consumer (fetch_next_work).
+// Worker warps:   consumer only (consumer_advance → fetch_next_work).
 struct CLCTileScheduler {
 
     struct Params {
@@ -40,16 +33,16 @@ struct CLCTileScheduler {
     PipelineCLC& pipeline_clc;
     CLCResponse* clc_response;
     Params params;
-    PipelineCLCState prod_state;   // {0, 0, 0} — blocks on first acquire until workers release
-    PipelineCLCState cons_state;   // {0, 0, 0}
+    PipelineCLCState prod_state;
+    PipelineCLCState cons_state;
 
     CUTLASS_DEVICE
     CLCTileScheduler(PipelineCLC& clc, CLCResponse* resp, Params const& p)
         : pipeline_clc(clc)
         , clc_response(resp)
         , params(p)
-        , prod_state()
-        , cons_state()
+        , prod_state(cutlass::make_producer_start_state<PipelineCLC>())  // {0, 1, 0}
+        , cons_state()  // {0, 0, 0}
     {}
 
     CUTLASS_DEVICE
@@ -67,34 +60,39 @@ struct CLCTileScheduler {
         return decode(static_cast<int>(blockIdx.x), params.num_row_tiles, params.num_heads);
     }
 
-    // ---- Sched warp: acquire(empty) → [reinit callback] → issue CLC query ----
-    // producer_acquire: waits for kWorkerThreads releases on empty, then does
-    // arrive_and_expect_tx on full (only lane 0, internally by CUTLASS).
-    // Called by single thread (lane 0 of scheduler warp).
+    // ---- Sched warp producer: acquire(empty) → [reinit] → issue CLC query ----
+    // Called by ALL 32 threads of the scheduler warp.
     template <typename ReinitFn>
     CUTLASS_DEVICE void advance_to_next_work(ReinitFn&& reinit_fn) {
         pipeline_clc.producer_acquire(prod_state);
+        // Safe reinit window: all threads have released (done with previous tile).
         reinit_fn();
         uint32_t mbar = pipeline_clc.producer_get_barrier(prod_state);
-        uint32_t resp_addr = smem_ptr_to_uint(&clc_response[prod_state.index()]);
-        issue_clc_query(resp_addr, mbar);
+        if (cute::elect_one_sync()) {
+            uint32_t resp_addr = smem_ptr_to_uint(&clc_response[prod_state.index()]);
+            issue_clc_query(resp_addr, mbar);
+        }
         ++prod_state;
     }
 
     CUTLASS_DEVICE void advance_to_next_work() {
         pipeline_clc.producer_acquire(prod_state);
         uint32_t mbar = pipeline_clc.producer_get_barrier(prod_state);
-        uint32_t resp_addr = smem_ptr_to_uint(&clc_response[prod_state.index()]);
-        issue_clc_query(resp_addr, mbar);
+        if (cute::elect_one_sync()) {
+            uint32_t resp_addr = smem_ptr_to_uint(&clc_response[prod_state.index()]);
+            issue_clc_query(resp_addr, mbar);
+        }
         ++prod_state;
     }
 
-    // ---- Sched warp: wait(full) → decode (NO consumer_release) ----
+    // ---- All warps consumer: wait(full) → decode → release(empty) ----
+    // Matches blk128 pattern: wait + read + release for a single CLC result.
+    // ALL threads (including scheduler) call this.
     CUTLASS_DEVICE WorkTileInfo fetch_next_work() {
         pipeline_clc.consumer_wait(cons_state);
         uint32_t resp_addr = smem_ptr_to_uint(&clc_response[cons_state.index()]);
         auto resp = decode_clc_response(resp_addr);
-        // Scheduler does NOT consumer_release — only workers do (consumer_arv_count = kWorkerThreads).
+        pipeline_clc.consumer_release(cons_state);
         ++cons_state;
         if (!resp.is_valid) {
             return {0, 0, 0, false};
@@ -102,26 +100,11 @@ struct CLCTileScheduler {
         return decode(resp.row_tile, params.num_row_tiles, params.num_heads);
     }
 
-    // ---- Worker consumer: fence → release(old) → wait(new) → decode ----
+    // ---- Worker consumer: pure CLC pipeline operation (matches blk128) ----
+    // Only does CLC wait/release. tcgen05_commit is caller's responsibility
+    // (only MMA/Load warps that operate TMEM need it).
     CUTLASS_DEVICE WorkTileInfo consumer_advance() {
-        flash::tcgen05_fence_before_sync();
-        cutlass::arch::fence_view_async_tmem_store();
-        cutlass::arch::fence_view_async_shared();
-        // Release old CLC result (enables scheduler's next producer_acquire)
-        pipeline_clc.consumer_release(cons_state);
-        clc_transition_fence();
-        // Wait for new CLC result (scheduler has issued query after our release)
-        pipeline_clc.consumer_wait(cons_state);
-        uint32_t resp_addr = smem_ptr_to_uint(&clc_response[cons_state.index()]);
-        auto resp = decode_clc_response(resp_addr);
-        ++cons_state;
-        if (!resp.is_valid) {
-            // Extra release so producer_tail can drain the pending empty barrier.
-            pipeline_clc.consumer_release(cons_state);
-            return {0, 0, 0, false};
-        }
-        flash::tcgen05_commit();
-        return decode(resp.row_tile, params.num_row_tiles, params.num_heads);
+        return fetch_next_work();
     }
 
     // ---- Producer tail: drain pipeline before exit ----

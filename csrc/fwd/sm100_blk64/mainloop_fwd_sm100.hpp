@@ -45,9 +45,11 @@ struct CollectiveMainloopFwd {
     // SMEM offsets for K sub-tile: K layout (256,(64,2)):(64,(1,16384))
     static constexpr int kKSubStride = kSparseBlockSize * kDimHalf;  // 4096 (token group)
     static constexpr int kKHalfStride = kDualCols * kDimHalf;        // 16384 (dim half)
-    // SMEM offsets for V sub-tile: V layout (128,(64,4)):(64,(1,8192))
-    static constexpr int kVSubStride = kOutputCols * kDimHalf;       // 8192 (token group)
-    static constexpr int kVHalfStride = kSparseBlockSize * kDimHalf; // 4096 (dim half)
+    // SMEM offsets for V sub-tile: V uses SmemLayoutB (128_dim, 256_tokens) arrangement
+    // V from BHDS reads (64_dim, 64_tokens) per TMA, tokens contiguous (K-major)
+    // V sub-block i, dim-half h: offset = i*kVSubStride + h*kVHalfStride
+    static constexpr int kVSubStride = kOutputCols * kDimHalf;       // 8192 (token group in SmemLayoutB)
+    static constexpr int kVHalfStride = kSparseBlockSize * kDimHalf; // 4096 (dim half in SmemLayoutB)
 
     // ---- MMA types ----
     // QK GEMM: ss mode (Q and K both in SMEM)
@@ -56,7 +58,7 @@ struct CollectiveMainloopFwd {
             kRows, kDualCols,
             cute::UMMA::Major::K, cute::UMMA::Major::K>{}));
 
-    // PV GEMM: ts mode (P in TMEM, V in SMEM) — dual pattern
+    // PV GEMM: ts mode (P in TMEM, V in SMEM) — dual pattern, V same layout as K
     using PvTiledMma = decltype(cute::make_tiled_mma(cute::SM100_MMA_F16BF16_WS_TS_NOELECT<
             ElementA, ElementB, ElementAccumulator,
             kRows, kDualCols,
@@ -68,6 +70,8 @@ struct CollectiveMainloopFwd {
     using SmemLayoutQ = decltype(flash::make_umma_k_major_layout<kRows, kQkK, 128, ElementA>());
     using SmemLayoutB = decltype(flash::make_umma_k_major_layout<kOutputCols, kDualCols, 128, ElementB>());
     using SmemLayoutBDual = decltype(flash::make_umma_k_major_layout<kDualCols, kDualK, 128, ElementB>());
+
+    // V uses same K-major layout as K (dual GEMM: both reduce over K=dim direction)
 
     // ---- KV pipeline ----
     static constexpr int kKVStages = 3;
@@ -96,9 +100,7 @@ struct CollectiveMainloopFwd {
     static constexpr int kKVBytes = kDualCols * kDualK * sizeof(ElementB);
     static constexpr int kSubTileBytes = kSparseBlockSize * kDimHalf * sizeof(ElementB);  // 8KB per TMA
 
-    // ---- Compact (64,64) SMEM layout for sparse TMA ----
-    // Each sparse block's dim-half: (64 tokens, 64 dim) with Sw<3,4,3>
-    // compact(r, c) + i*4096 + h*16384 == canonical(i*64+r, h*64+c) — verified!
+    // ---- Compact (64,64) K-major SMEM layout for sparse TMA ----
     using SmemLayoutSubTile = decltype(cute::coalesce(cute::tile_to_shape(
             cute::UMMA::Layout_K_SW128_Atom<ElementB>{},
             cute::Shape<cute::Int<kSparseBlockSize>, cute::Int<kDimHalf>>{},
@@ -107,24 +109,19 @@ struct CollectiveMainloopFwd {
     // ---- TMA types ----
     using ShapeTensor = cute::Shape<int, int, int>;
     using StrideQ = cute::Stride<cute::Int<kQkK>, cute::_1, int>;
-    // Sparse K dim-half: global (64 tokens, 64 dim) per entry, stride = (64, 1)
-    using StrideKHalf = cute::Stride<cute::Int<kDimHalf>, cute::_1, int>;
-    // Sparse V dim-half: global (64 dim, 64 tokens) per entry, stride = (64, 1)
-    using StrideVHalf = cute::Stride<cute::Int<kSparseBlockSize>, cute::_1, int>;
+    // K/V 5D: (64, 64, 2*H, blocks, B) — same TMA type, both from BSHD
+    // V data is sub-tile-transposed on host so SMEM has (dim_row, token_col)
+    using ShapeKV5 = cute::Shape<cute::Int<kSparseBlockSize>, cute::Int<kDimHalf>, int, int, int>;
+    using StrideKV5 = cute::Stride<int, cute::_1, cute::Int<kDimHalf>, int, int>;
 
     using TMA_Q = decltype(cute::make_tma_copy(cute::SM90_TMA_LOAD{},
             cute::make_tensor(cute::make_gmem_ptr(static_cast<ElementA const*>(nullptr)),
                                                 cute::make_layout(ShapeTensor{}, StrideQ{})),
             SmemLayoutQ{}));
-    // Sparse K TMA: loads one dim-half (64, 64) per call
-    using TMA_K = decltype(cute::make_tma_copy(cute::SM90_TMA_LOAD{},
+    // K/V: same TMA type (K-major, 5D BSHD)
+    using TMA_KV = decltype(cute::make_tma_copy(cute::SM90_TMA_LOAD{},
             cute::make_tensor(cute::make_gmem_ptr(static_cast<ElementB const*>(nullptr)),
-                                                cute::make_layout(ShapeTensor{}, StrideKHalf{})),
-            SmemLayoutSubTile{}));
-    // Sparse V TMA: loads one dim-half (64, 64) per call
-    using TMA_V = decltype(cute::make_tma_copy(cute::SM90_TMA_LOAD{},
-            cute::make_tensor(cute::make_gmem_ptr(static_cast<ElementB const*>(nullptr)),
-                                                cute::make_layout(ShapeTensor{}, StrideVHalf{})),
+                                                cute::make_layout(ShapeKV5{}, StrideKV5{})),
             SmemLayoutSubTile{}));
 
     // ---- TensorStorage ----
@@ -152,15 +149,14 @@ struct CollectiveMainloopFwd {
     // ---- Params (device-side) ----
     struct Params {
         TMA_Q tma_load_Q;
-        TMA_K tma_load_K;
-        TMA_V tma_load_V;
+        TMA_KV tma_load_K;
+        TMA_KV tma_load_V;
         ShapeTensor shape_Q;
-        ShapeTensor shape_K;
-        ShapeTensor shape_V;
+        ShapeKV5 shape_K;
+        ShapeKV5 shape_V;  // same type as K (V data is sub-tile-transposed on host)
         float sm_scale_log2;
         int const* ptr_block_indices = nullptr;
         int block_indices_stride = 0;
-        int kv_tma_per_head = 0;
         int const* ptr_block_sizes = nullptr;
         int num_heads = 1;
         int num_row_tiles = 1;
@@ -172,7 +168,7 @@ struct CollectiveMainloopFwd {
     // seq_kv: actual K/V sequence length for TMA descriptor (may differ from seq_padded in sparse mode)
     // batch: batch size (folded into TMA 3rd dimension)
     static Params
-    to_underlying_arguments(Arguments const& args, int rows_padded, int seq_padded, int heads, int seq_kv = 0, int batch = 1) {
+    to_underlying_arguments(Arguments const& args, int rows_padded, int seq_padded, int heads, int seq_kv = 0, int batch = 1, int seq_k_actual = 0) {
         using namespace cute;
         int const num_row_tiles = rows_padded / kRows;
         if (seq_kv == 0) seq_kv = seq_padded;
@@ -185,22 +181,32 @@ struct CollectiveMainloopFwd {
                 SmemLayoutQ{});
 
         int const total_sparse_blocks = seq_kv / kSparseBlockSize;
-        auto shape_k  = make_shape(kSparseBlockSize, kDimHalf, batch * heads * total_sparse_blocks * kDimHalves);
-        auto stride_k = make_stride(Int<kDimHalf>{}, _1{}, kSparseBlockSize * kDimHalf);
+        // K 5D TMA: read directly from BSHD via stride-aware descriptor
+        // Global layout: (batch, seq_k, heads, dim) — ptr_K points to BSHD contiguous
+        // stride_S = heads * kQkK (stride between consecutive tokens)
+        int stride_S = heads * kQkK;
+        if (seq_k_actual == 0) seq_k_actual = seq_kv;
+        auto shape_k  = make_shape(Int<kSparseBlockSize>{}, Int<kDimHalf>{},
+                                   kDimHalves * heads, total_sparse_blocks, batch);
+        auto stride_k = make_stride(stride_S, _1{}, Int<kDimHalf>{},
+                                    kSparseBlockSize * stride_S, seq_k_actual * stride_S);
         auto tma_k = make_tma_copy(SM90_TMA_LOAD{},
                 make_tensor(make_gmem_ptr(args.ptr_K), make_layout(shape_k, stride_k)),
                 SmemLayoutSubTile{});
 
-        auto shape_v  = make_shape(kDimHalf, kSparseBlockSize, batch * heads * total_sparse_blocks * kDimHalves);
-        auto stride_v = make_stride(Int<kSparseBlockSize>{}, _1{}, kDimHalf * kSparseBlockSize);
+        // V: same TMA type as K (sub-tile-transposed data on host, same BSHD strides)
+        int const total_k_blocks = (seq_k_actual + kSparseBlockSize - 1) / kSparseBlockSize;
+        auto shape_v  = make_shape(Int<kSparseBlockSize>{}, Int<kDimHalf>{},
+                                   kDimHalves * heads, total_k_blocks, batch);
+        auto stride_v = make_stride(stride_S, _1{}, Int<kDimHalf>{},
+                                    kSparseBlockSize * stride_S, seq_k_actual * stride_S);
         auto tma_v = make_tma_copy(SM90_TMA_LOAD{},
                 make_tensor(make_gmem_ptr(args.ptr_V), make_layout(shape_v, stride_v)),
                 SmemLayoutSubTile{});
 
         float sm_scale_log2 = float(args.softmax_scale * M_LOG2E);
-        int kv_tma_per_head = total_sparse_blocks * kDimHalves;
         return {tma_q, tma_k, tma_v, shape_q, shape_k, shape_v, sm_scale_log2,
-                args.ptr_block_indices, args.block_indices_stride, kv_tma_per_head,
+                args.ptr_block_indices, args.block_indices_stride,
                 args.ptr_block_sizes, heads, num_row_tiles, args.ptr_q2k_block_nums,
                 args.raw_block_sparse_num};
     }
@@ -275,7 +281,6 @@ struct CollectiveMainloopFwd {
 
             // Batch-aware TMA indices: batch folds into outermost dimension
             int q_tile_idx = (batch * params.num_heads + head) * num_row_tiles + row_tile;
-            int kv_tma_base = (batch * params.num_heads + head) * params.kv_tma_per_head;
 
             // Block indices for this (batch, head, row_tile)
             int const* tile_block_indices = nullptr;
@@ -297,7 +302,7 @@ struct CollectiveMainloopFwd {
 
             // Load K: 8 TMAs per KV block (4 sparse blocks × 2 dim halves)
             // Each TMA loads (64, 64) bf16 = 8KB. 8 × 8KB = 64KB per stage.
-            // SMEM offset for sub-block i, dim-half h: K: i*kKSubStride+h*kKHalfStride, V: i*kVSubStride+h*kVHalfStride
+            // SMEM offset for sub-block i, dim-half h: K: i*kKSubStride+h*kKHalfStride
             // K interleave map: sub-block → SMEM slot. Ensures balanced warp-col distribution.
             // {0→0, 1→2, 2→1, 3→3}: warp-col 0 gets slots 0,1 (sub 0,2), warp-col 1 gets 2,3 (sub 1,3)
             static constexpr int kInterleavedSlot[4] = {0, 2, 1, 3};
@@ -331,9 +336,9 @@ struct CollectiveMainloopFwd {
                         int smem_offset = stage_base + slot * kKSubStride + h * kKHalfStride;
                         auto sK_sub = make_tensor(make_smem_ptr(
                                 ml.smem_kv.begin() + smem_offset), SmemLayoutSubTile{});
-                        int tma_idx = kv_tma_base + sparse_idx * kDimHalves + h;
+                        // K 5D indexing: (_, _, head*kDimHalves+h, sparse_idx, batch)
                         cute::copy(params.tma_load_K.with(*tma_bar),
-                                thr_tma_k.partition_S(gK_full(_, _, tma_idx)),
+                                thr_tma_k.partition_S(gK_full(_, _, head * kDimHalves + h, sparse_idx, batch)),
                                 thr_tma_k.partition_D(sK_sub));
                     }
                 }
@@ -348,15 +353,16 @@ struct CollectiveMainloopFwd {
                 CUTLASS_PRAGMA_UNROLL
                 for (int sub = 0; sub < kSparseBlocksPerKV; ++sub) {
                     int sparse_idx = get_sparse_idx(kv_block_idx, sub);
-                    int slot = sub;
+                    int slot = sub;  // sequential for V
                     CUTLASS_PRAGMA_UNROLL
                     for (int h = 0; h < kDimHalves; ++h) {
+                        // V offsets: kVSubStride/kVHalfStride (adjacent dim_halves per block)
                         int smem_offset = stage_base + slot * kVSubStride + h * kVHalfStride;
+                        // V uses K-major sub-tile (same as K; data pre-transposed on host)
                         auto sV_sub = make_tensor(make_smem_ptr(
                                 ml.smem_kv.begin() + smem_offset), SmemLayoutSubTile{});
-                        int tma_idx = kv_tma_base + sparse_idx * kDimHalves + h;
                         cute::copy(params.tma_load_V.with(*tma_bar),
-                                thr_tma_v.partition_S(gV_full(_, _, tma_idx)),
+                                thr_tma_v.partition_S(gV_full(_, _, head * kDimHalves + h, sparse_idx, batch)),
                                 thr_tma_v.partition_D(sV_sub));
                     }
                 }
@@ -388,11 +394,10 @@ struct CollectiveMainloopFwd {
 
     struct MmaState {
         PipelineKVState kv_state;  // consumer starts at phase=0 (default)
-        int phase_s0 = 0;
-        int phase_s1 = 0;
+        PipeState spo_state;       // alternating stages 0→1→0→1 for producer_acquire
+        PipeState pls_state_0;     // p_lastsplit stage 0 phase tracking
+        PipeState pls_state_1 = PipeState(1, 0, 0);  // p_lastsplit stage 1
         int q_phase = 0;
-        int pls_phase0 = 0;  // p_lastsplit phase for stage 0
-        int pls_phase1 = 0;  // p_lastsplit phase for stage 1
     };
 
     // Split PV GEMM: issue first half tiles, wait p_lastsplit, issue remaining half.
@@ -453,13 +458,16 @@ struct CollectiveMainloopFwd {
 
         if (elect_one_sync()) {
             auto kv_state = state.kv_state;
-            int phase_s0 = state.phase_s0;
-            int phase_s1 = state.phase_s1;
+            auto spo_state = state.spo_state;
+            auto pls_state_0 = state.pls_state_0;
+            auto pls_state_1 = state.pls_state_1;
             bool o_acc_s0 = false, o_acc_s1 = false;
 
             // Wait for Q TMA
             int q_phase = state.q_phase;
-            wait_barrier(shared_storage.pipelines.bar_q_ready, q_phase);
+            flash::wait_barrier_addr(
+                    cute::cast_smem_ptr_to_uint(&shared_storage.pipelines.bar_q_ready),
+                    q_phase);
             q_phase ^= 1;
             flash::tcgen05_commit();
 
@@ -473,9 +481,10 @@ struct CollectiveMainloopFwd {
                         ml.smem_kv.begin() + kv_st.index() * kKVElemsPerStage),
                         SmemLayoutBDual{});
                 flash::utcmma_ss(qk_mma, sQ, sK, tC_qk, true);
-                flash::umma_arrive(
-                        pipeline_s_p_o.producer_get_barrier_w_index(stage));
-                // consumer_release: umma_arrive on empty barrier.
+                // UMMA arrive on SPO full barrier (S ready)
+                flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                        shared_storage.pipelines.spo.full_barrier_[stage]));
+                // consumer_release: umma_arrive on KV empty barrier.
                 flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
                         shared_storage.pipelines.kv.empty_barrier_[kv_st.index()]));
                 ++kv_st;
@@ -483,10 +492,7 @@ struct CollectiveMainloopFwd {
             };
 
             // PV GEMM: O[stage] += P[stage] @ V
-            // Uses split_P_arrive: first 3/4 UTCHMMA, wait p_lastsplit, last 1/4.
-            int pls_phase0 = state.pls_phase0;
-            int pls_phase1 = state.pls_phase1;
-
+            // Uses split_P_arrive: first half UTCHMMA, wait p_lastsplit, last half.
             auto mma_pv = [&] (int stage, bool clear_accum, PipelineKVState kv_st) -> PipelineKVState {
                 pipeline_kv.consumer_wait(kv_st);
                 flash::tcgen05_commit();
@@ -495,11 +501,15 @@ struct CollectiveMainloopFwd {
                 auto sV = make_tensor(make_smem_ptr(
                         ml.smem_kv.begin() + kv_st.index() * kKVElemsPerStage),
                         SmemLayoutBDual{});
-                int& pls_phase = (stage == 0) ? pls_phase0 : pls_phase1;
+                // Get p_lastsplit barrier addr and phase from PipeState
+                auto& pls_st = (stage == 0) ? pls_state_0 : pls_state_1;
+                uint32_t pls_addr = cute::cast_smem_ptr_to_uint(
+                        &shared_storage.pipelines.p_lastsplit.full_barrier_[stage]);
                 utcmma_ts_split(pv_mma, tP, sV, tC_pv, clear_accum,
-                        pipeline_p_lastsplit.get_barrier_addr(stage), pls_phase);
-                pls_phase ^= 1;
-                // consumer_release: umma_arrive on empty barrier.
+                        pls_addr, pls_st.phase());
+                // Advance pls by 2 (stay on same stage, flip phase)
+                ++pls_st; ++pls_st;
+                // consumer_release: umma_arrive on KV empty barrier.
                 flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
                         shared_storage.pipelines.kv.empty_barrier_[kv_st.index()]));
                 ++kv_st;
@@ -514,32 +524,39 @@ struct CollectiveMainloopFwd {
             int pair_count = (num_kv_blocks - 2) / 2;
             CUTE_NO_UNROLL
             for (int i = 0; i < pair_count; ++i) {
-                pipeline_s_p_o.producer_acquire_w_index_phase(0, phase_s0);
+                pipeline_s_p_o.producer_acquire(spo_state);
                 kv_state = mma_pv(0, !o_acc_s0, kv_state);
                 kv_state = mma_qk(0, kv_state);
+                ++spo_state;
                 o_acc_s0 = true;
 
-                pipeline_s_p_o.producer_acquire_w_index_phase(1, phase_s1);
+                pipeline_s_p_o.producer_acquire(spo_state);
                 kv_state = mma_pv(1, !o_acc_s1, kv_state);
                 kv_state = mma_qk(1, kv_state);
+                ++spo_state;
                 o_acc_s1 = true;
             }
 
             // ---- Epilogue: 2 final PV GEMMs, signal O_acc ----
-            pipeline_s_p_o.producer_acquire_w_index_phase(0, phase_s0);
+            pipeline_s_p_o.producer_acquire(spo_state);
             kv_state = mma_pv(0, !o_acc_s0, kv_state);
-            flash::umma_arrive(pipeline_o_acc.producer_get_barrier_w_index(0));
+            // UMMA arrive on OAcc full barrier (final O0 ready)
+            flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                    shared_storage.pipelines.o_acc.full_barrier_[0]));
+            ++spo_state;
 
-            pipeline_s_p_o.producer_acquire_w_index_phase(1, phase_s1);
+            pipeline_s_p_o.producer_acquire(spo_state);
             kv_state = mma_pv(1, !o_acc_s1, kv_state);
-            flash::umma_arrive(pipeline_o_acc.producer_get_barrier_w_index(1));
+            // UMMA arrive on OAcc full barrier (final O1 ready)
+            flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                    shared_storage.pipelines.o_acc.full_barrier_[1]));
+            ++spo_state;
 
             state.kv_state = kv_state;
-            state.phase_s0 = phase_s0;
-            state.phase_s1 = phase_s1;
+            state.spo_state = spo_state;
+            state.pls_state_0 = pls_state_0;
+            state.pls_state_1 = pls_state_1;
             state.q_phase = q_phase;
-            state.pls_phase0 = pls_phase0;
-            state.pls_phase1 = pls_phase1;
         }
         return state;
     }
@@ -554,8 +571,8 @@ struct CollectiveMainloopFwd {
     // ===========================================================================
 
     struct SoftmaxState {
-        int s_phase = 0;
-        int sm_stats_phase = 0;
+        PipeState spo_state;        // consumer_wait on SPO (stage from template param)
+        PipeState sm_stats_state;   // producer_acquire on SmStats (stage from template param)
     };
 
     // R2P bitmask: keep positions < limit within 32-element chunk s.
@@ -607,7 +624,7 @@ struct CollectiveMainloopFwd {
             SharedStorage& shared_storage,
             uint32_t tmem_s_cur, float sm_scale,
             float& row_max, float& row_sum,
-            int& s_phase, int& sm_stats_phase,
+            PipeState& spo_state, PipeState& sm_stats_state,
             int block_size_lo = kSparseBlockSize,
             int block_size_hi = kSparseBlockSize)
     {
@@ -616,7 +633,7 @@ struct CollectiveMainloopFwd {
         auto& ml = shared_storage.tensors.mainloop;
 
         // 1. Wait for S ready in TMEM
-        pipeline_s_p_o.consumer_wait_w_index_phase(Stage, s_phase);
+        pipeline_s_p_o.consumer_wait(spo_state);
 
         // 2. T2R load
         auto tSrS_t2r = cute::make_tensor<float>(cute::Shape<cute::Int<kCSpan>>{});
@@ -688,7 +705,9 @@ struct CollectiveMainloopFwd {
                 // split_P_arrive
                 if (frag + 1 == kFrgCount * kSplitNumer / kSplitDenom) {
                     cutlass::arch::fence_view_async_tmem_store();
-                    pipeline_s_p_o.consumer_release_w_index(Stage);
+                    flash::consumer_release_cta(shared_storage.pipelines.spo, spo_state);
+                    // Advance spo_state by 2: stay on same Stage, flip phase
+                    ++spo_state; ++spo_state;
                 }
             }
         }
@@ -697,11 +716,13 @@ struct CollectiveMainloopFwd {
         cutlass::arch::fence_view_async_tmem_store();
         __syncwarp();
         if (elect_one_sync()) {
-            pipeline_p_lastsplit.producer_commit_w_index(Stage);
+            flash::producer_commit_cta(shared_storage.pipelines.p_lastsplit, PipeState(Stage, 0, 0));
         }
 
         // ---- 8. pipeline_sm_stats.producer_acquire ----
-        pipeline_sm_stats.producer_acquire_w_index_phase(Stage, sm_stats_phase);
+        pipeline_sm_stats.producer_acquire(sm_stats_state);
+        // Advance sm_stats_state by 2: stay on same Stage, flip phase
+        ++sm_stats_state; ++sm_stats_state;
 
         // ---- 9. update_row_sum (blk128: softmax.update_row_sum) ----
         update_row_sum<IsFirst>(tSrS_t2r, acc_scale, row_sum);
@@ -733,8 +754,8 @@ struct CollectiveMainloopFwd {
 
         float row_max = -CUDART_INF_F;
         float row_sum = 0.0f;
-        int s_phase = state.s_phase;
-        int sm_stats_phase = state.sm_stats_phase;
+        PipeState spo_state = state.spo_state;
+        PipeState sm_stats_state = state.sm_stats_state;
         int wg_count = num_kv_blocks / 2;
 
         // Block-size lookup: slot → sub mapping (inverse of kInterleavedSlot)
@@ -762,7 +783,9 @@ struct CollectiveMainloopFwd {
         };
 
         // BSA: acquire before loop
-        pipeline_sm_stats.producer_acquire_w_index_phase(Stage, sm_stats_phase);
+        pipeline_sm_stats.producer_acquire(sm_stats_state);
+        // Advance sm_stats_state by 2: stay on same Stage, flip phase
+        ++sm_stats_state; ++sm_stats_state;
 
         // BSA: 1st block peeled (IsFirst=true), remaining blocks in loop (IsFirst=false)
         {
@@ -771,7 +794,7 @@ struct CollectiveMainloopFwd {
             softmax_step<Stage, /*IsFirst=*/true, SharedStorage, NamedBarriers>(
                 sm_idx, sm_stats_bar,
                 pipeline_s_p_o, pipeline_sm_stats, pipeline_p_lastsplit, shared_storage,
-                tmem_s_cur, sm_scale, row_max, row_sum, s_phase, sm_stats_phase,
+                tmem_s_cur, sm_scale, row_max, row_sum, spo_state, sm_stats_state,
                 bs_lo, bs_hi);
         }
 
@@ -782,7 +805,7 @@ struct CollectiveMainloopFwd {
             softmax_step<Stage, /*IsFirst=*/false, SharedStorage, NamedBarriers>(
                 sm_idx, sm_stats_bar,
                 pipeline_s_p_o, pipeline_sm_stats, pipeline_p_lastsplit, shared_storage,
-                tmem_s_cur, sm_scale, row_max, row_sum, s_phase, sm_stats_phase,
+                tmem_s_cur, sm_scale, row_max, row_sum, spo_state, sm_stats_state,
                 bs_lo, bs_hi);
         }
 
@@ -791,8 +814,8 @@ struct CollectiveMainloopFwd {
         ml.smem_max[Stage * 128 + sm_idx] = row_max;
         __threadfence_block();
         NamedBarrier::arrive(kSmStatsNotifyThreads, sm_stats_bar);
-        state.s_phase = s_phase;
-        state.sm_stats_phase = sm_stats_phase;
+        state.spo_state = spo_state;
+        state.sm_stats_state = sm_stats_state;
         return state;
     }
 
@@ -812,8 +835,9 @@ struct CollectiveMainloopFwd {
     static constexpr int kNumChunks = kCSpan / kChunk;
 
     struct CorrState {
-        int o_acc_phase0 = 0;
-        int o_acc_phase1 = 0;
+        PipeState o_acc_state_0;                   // {0, 0, 0} default — OAcc consumer_wait stage 0
+        PipeState o_acc_state_1 = PipeState(1, 0, 0); // OAcc consumer_wait stage 1
+        PipeState o_epi_state = PipeState(0, 1, 0); // producer start: phase=1 (no prefill, matches blk128)
     };
 
     CUTLASS_DEVICE static void correction_rescale(
@@ -944,11 +968,15 @@ struct CollectiveMainloopFwd {
         const int corr_warp = warp_idx - 8;       // 0..3
         const int corr_idx = threadIdx.x - 8 * 32; // 0..127
 
+        // Static PipeState helpers for stage-indexed release (phase not needed for arrive)
+        PipeState const st0(0, 0, 0);
+        PipeState const st1(1, 0, 0);
+
         // ---- (a) Skip first pair: no rescale needed (BSA pattern) ----
-        pipeline_s_p_o.consumer_release_w_index(0);
-        pipeline_s_p_o.consumer_release_w_index(1);
+        flash::consumer_release_cta(shared_storage.pipelines.spo, st0);
+        flash::consumer_release_cta(shared_storage.pipelines.spo, st1);
         NamedBarrier::arrive_and_wait(kSmStatsNotifyThreads, NamedBarriers::SmStatsNotify + 0 * kCorrWarps + corr_warp);
-        pipeline_sm_stats.consumer_release_w_index(0);
+        flash::consumer_release_cta(shared_storage.pipelines.sm_stats, st0);
         NamedBarrier::arrive_and_wait(kSmStatsNotifyThreads, NamedBarriers::SmStatsNotify + 1 * kCorrWarps + corr_warp);
 
         // ---- (b) Paired rescale loop (BSA: seqlen_corr_loop_steps) ----
@@ -959,31 +987,31 @@ struct CollectiveMainloopFwd {
             {
                 NamedBarrier::arrive_and_wait(kSmStatsNotifyThreads, NamedBarriers::SmStatsNotify + 0 * kCorrWarps + corr_warp);
                 correction_rescale(tmem_o0, ml.corr_scale[0][corr_idx], corr_idx);
-                pipeline_s_p_o.consumer_release_w_index(0);
-                pipeline_sm_stats.consumer_release_w_index(1);
+                flash::consumer_release_cta(shared_storage.pipelines.spo, st0);
+                flash::consumer_release_cta(shared_storage.pipelines.sm_stats, st1);
             }
             // Stage 1: rescale O1
             {
                 NamedBarrier::arrive_and_wait(kSmStatsNotifyThreads, NamedBarriers::SmStatsNotify + 1 * kCorrWarps + corr_warp);
                 correction_rescale(tmem_o1, ml.corr_scale[1][corr_idx], corr_idx);
-                pipeline_s_p_o.consumer_release_w_index(1);
-                pipeline_sm_stats.consumer_release_w_index(0);
+                flash::consumer_release_cta(shared_storage.pipelines.spo, st1);
+                flash::consumer_release_cta(shared_storage.pipelines.sm_stats, st0);
             }
         }
 
         // BSA: post-loop release for stage 1
-        pipeline_sm_stats.consumer_release_w_index(1);
+        flash::consumer_release_cta(shared_storage.pipelines.sm_stats, st1);
 
         // ---- (c) Read final stats (BSA: sm_stats_barrier for both stages) ----
         NamedBarrier::arrive_and_wait(kSmStatsNotifyThreads, NamedBarriers::SmStatsNotify + 0 * kCorrWarps + corr_warp);
         float row_sum0 = ml.smem_sum[0 * 128 + corr_idx];
         float row_max0 = ml.smem_max[0 * 128 + corr_idx];
-        pipeline_sm_stats.consumer_release_w_index(0);
+        flash::consumer_release_cta(shared_storage.pipelines.sm_stats, st0);
 
         NamedBarrier::arrive_and_wait(kSmStatsNotifyThreads, NamedBarriers::SmStatsNotify + 1 * kCorrWarps + corr_warp);
         float row_sum1 = ml.smem_sum[1 * 128 + corr_idx];
         float row_max1 = ml.smem_max[1 * 128 + corr_idx];
-        pipeline_sm_stats.consumer_release_w_index(1);
+        flash::consumer_release_cta(shared_storage.pipelines.sm_stats, st1);
 
         // ---- (d) Compute cross-stage combine scales ----
         float rm0 = (row_sum0 > 0.0f) ? row_max0 : -CUDART_INF_F;
@@ -996,12 +1024,13 @@ struct CollectiveMainloopFwd {
         float my_max = max_safe;
 
         // ---- (e) Wait for final O from MMA ----
-        int o_acc_phase0 = corr_state.o_acc_phase0;
-        int o_acc_phase1 = corr_state.o_acc_phase1;
-        pipeline_o_acc.consumer_wait_w_index_phase(0, o_acc_phase0);
+        pipeline_o_acc.consumer_wait(corr_state.o_acc_state_0);
         flash::tcgen05_commit();
-        pipeline_o_acc.consumer_wait_w_index_phase(1, o_acc_phase1);
+        pipeline_o_acc.consumer_wait(corr_state.o_acc_state_1);
         flash::tcgen05_commit();
+        // Advance OAcc states by 2 (stay on same stage, flip phase)
+        ++corr_state.o_acc_state_0; ++corr_state.o_acc_state_0;
+        ++corr_state.o_acc_state_1; ++corr_state.o_acc_state_1;
 
         // ---- (f) Warp-pair stats exchange + combine weight ----
         auto sO = make_tensor(make_smem_ptr(el.sO.begin()), SmemLayoutO{});
@@ -1041,7 +1070,8 @@ struct CollectiveMainloopFwd {
             }
         }
 
-        // ---- (g) 2-pass combine: correction_combine ----
+        // ---- (g) Wait for sO slot free, then combine (blk128: producer_acquire before combine) ----
+        pipeline_o_epi.producer_acquire(corr_state.o_epi_state);
         float my_scale0 = scale0 * my_weight;
         float my_scale1 = scale1 * my_weight;
         correction_combine<decltype(sO), decltype(el), NamedBarriers>(
@@ -1050,9 +1080,9 @@ struct CollectiveMainloopFwd {
 
         // ---- (h) Fence + signal epilogue warp ----
         cutlass::arch::fence_view_async_shared();
-        pipeline_o_epi.producer_commit();
-        corr_state.o_acc_phase0 = o_acc_phase0;
-        corr_state.o_acc_phase1 = o_acc_phase1;
+        flash::producer_commit_cta(shared_storage.pipelines.o_epi, corr_state.o_epi_state);
+        // Advance OEpi state by 2: stay on stage 0, flip phase
+        ++corr_state.o_epi_state; ++corr_state.o_epi_state;
         return corr_state;
     }
 };

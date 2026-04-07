@@ -38,7 +38,6 @@ std::vector<torch::Tensor> bsa_fused_fwd_blk64_launch(
     constexpr int kQkK = Kernel::kQkK;
     constexpr int kOutputCols = Kernel::kOutputCols;
     constexpr int kSparseBlockSize = ML::kSparseBlockSize;
-    constexpr int kDimHalf = ML::kDimHalf;
     constexpr int kSparseBlocksPerKV = ML::kSparseBlocksPerKV;
 
     const int batch = static_cast<int>(q.size(0));
@@ -81,25 +80,31 @@ std::vector<torch::Tensor> bsa_fused_fwd_blk64_launch(
     q_padded.narrow(2, 0, seq_q).copy_(q_bhsd);
     auto q_tiled = q_padded.view({batch * heads * num_row_tiles, kRows, kQkK}).contiguous();
 
-    // ======== Prepare K ========
-    auto k_bhsd = k.permute({0, 2, 1, 3}).contiguous();
+    // ======== Prepare K (5D TMA: read directly from BSHD, no permute/pad/reshape) ========
     int const total_k_padded = ((seq_k + kSparseBlockSize - 1) / kSparseBlockSize) * kSparseBlockSize;
     int const total_sparse_blocks = total_k_padded / kSparseBlockSize;
-    auto k_padded = torch::zeros({batch, heads, total_k_padded, kQkK}, k.options());
-    k_padded.narrow(2, 0, seq_k).copy_(k_bhsd);
-    auto k_blocks = k_padded.view({batch, heads, total_sparse_blocks, kSparseBlockSize, 2, kDimHalf})
-                            .permute({0, 1, 2, 4, 3, 5})
-                            .reshape({batch * heads * total_sparse_blocks * 2, kSparseBlockSize, kDimHalf})
-                            .contiguous();
+    // K is (batch, seq_k, heads, dim) — TMA reads via stride-aware 5D descriptor
+    // Pad seq_k to multiple of kSparseBlockSize if needed
+    torch::Tensor k_contig = k.contiguous();
+    torch::Tensor k_padded_bshd;
+    if (seq_k < total_k_padded) {
+        k_padded_bshd = torch::zeros({batch, total_k_padded, heads, kQkK}, k.options());
+        k_padded_bshd.narrow(1, 0, seq_k).copy_(k_contig);
+    } else {
+        k_padded_bshd = k_contig;
+    }
 
-    // ======== Prepare V ========
-    auto v_bhds = v.permute({0, 2, 3, 1}).contiguous();
-    auto v_padded = torch::zeros({batch, heads, kOutputCols, total_k_padded}, v.options());
-    v_padded.narrow(3, 0, seq_k).copy_(v_bhds);
-    auto v_blocks = v_padded.view({batch, heads, 2, kDimHalf, total_sparse_blocks, kSparseBlockSize})
-                            .permute({0, 1, 4, 2, 3, 5})
-                            .reshape({batch * heads * total_sparse_blocks * 2, kDimHalf, kSparseBlockSize})
-                            .contiguous();
+    // ======== V: sub-tile transpose (swap token↔dim within each 64×64 block) ========
+    // V[B,S,H,D] → view as (B, blocks, 64_token, H, 2_dimhalf, 64_dim)
+    // → permute to (B, blocks, 64_dim, H, 2_dimhalf, 64_token)
+    // → reshape back to (B, S, H, D) contiguous
+    // This is 1 copy kernel — required because PV dual GEMM reduces over dim 1 (K direction)
+    constexpr int kDimHalf = ML::kDimHalf;
+    constexpr int kDimHalves = ML::kDimHalves;
+    auto v_subtile_t = v.view({batch, total_sparse_blocks, kSparseBlockSize, heads, kDimHalves, kDimHalf})
+                        .permute({0, 1, 5, 3, 4, 2})
+                        .reshape({batch, total_k_padded, heads, kQkK})
+                        .contiguous();
 
     auto out_flat = torch::zeros({batch * heads * num_row_tiles, kRows, kOutputCols}, q.options());
     auto lse_flat = torch::full({batch * heads * num_row_tiles * kRows},
@@ -124,8 +129,8 @@ std::vector<torch::Tensor> bsa_fused_fwd_blk64_launch(
         // mainloop
         {
             reinterpret_cast<bf16 const*>(q_tiled.data_ptr<at::BFloat16>()),
-            reinterpret_cast<bf16 const*>(k_blocks.data_ptr<at::BFloat16>()),
-            reinterpret_cast<bf16 const*>(v_blocks.data_ptr<at::BFloat16>()),
+            reinterpret_cast<bf16 const*>(k_padded_bshd.data_ptr<at::BFloat16>()),
+            reinterpret_cast<bf16 const*>(v_subtile_t.data_ptr<at::BFloat16>()),
             softmax_scale,
             bi_flat.data_ptr<int>(),
             block_indices_stride,
@@ -137,16 +142,16 @@ std::vector<torch::Tensor> bsa_fused_fwd_blk64_launch(
         { reinterpret_cast<bf16*>(out_flat.data_ptr<at::BFloat16>()),
           lse_flat.data_ptr<float>() },
         // dimensions
-        rows_padded, seq_padded, heads, batch, total_k_padded,
+        rows_padded, seq_padded, heads, batch, total_k_padded, total_k_padded,
     };
 
     auto kernel_params = Kernel::to_underlying_arguments(args);
 
     dim3 dim_grid_full = Kernel::get_grid_shape(kernel_params);
+    int total_tiles = dim_grid_full.x * dim_grid_full.y * dim_grid_full.z;
+    dim3 dim_grid = dim3(total_tiles, 1, 1);  // 1D flat grid for CLC
     dim3 dim_block = Kernel::get_block_shape();
     int smem_bytes = Kernel::SharedStorageSize;
-    int total_tiles = dim_grid_full.x * dim_grid_full.y * dim_grid_full.z;
-    dim3 dim_grid = dim3(total_tiles, 1, 1);
 
     auto* kernel_ptr = &fused_attn_device<Kernel>;
     C10_CUDA_CHECK(cudaFuncSetAttribute(
@@ -155,8 +160,14 @@ std::vector<torch::Tensor> bsa_fused_fwd_blk64_launch(
             kernel_ptr, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
     auto stream = c10::cuda::getCurrentCUDAStream(q.device().index()).stream();
 
+    void const* kernel_fn = reinterpret_cast<void const*>(kernel_ptr);
+    void* params_arr[] = {const_cast<void*>(static_cast<void const*>(&kernel_params))};
+    dim3 dim_cluster(1, 1, 1);
+
     nvtxRangePushA("bsa_attn_fwd_kernel");
-    fused_attn_device<Kernel><<<dim_grid, dim_block, smem_bytes, stream>>>(kernel_params);
+    auto launch_status = cutlass::ClusterLauncher::launch(
+        dim_grid, dim_cluster, dim_block, smem_bytes, stream, kernel_fn, params_arr);
+    TORCH_CHECK(launch_status == cutlass::Status::kSuccess, "ClusterLauncher::launch failed");
     nvtxRangePop();
     C10_CUDA_CHECK(cudaGetLastError());
 #else

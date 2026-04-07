@@ -29,6 +29,7 @@ nvcc_flags = [
     "-DCUDA_CTA_RECONFIG_ACTIVATED=1",
     "--ptxas-options=-v",
     "-gencode=arch=compute_100a,code=sm_100a",
+    "-gencode=arch=compute_103a,code=sm_103a",
 ] + [f"-D{d}" for d in os.environ.get("BSA_EXTRA_DEFINES", "").split(",") if d]
 
 setup(

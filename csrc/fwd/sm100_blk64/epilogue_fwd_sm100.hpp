@@ -89,7 +89,7 @@ struct CollectiveEpilogueFwd {
     // ===========================================================================
 
     struct EpiState {
-        int phase = 0;
+        PipeState o_epi_state;  // consumer_wait on OEpi (stage 0 only, phase alternates)
     };
 
     CUTLASS_DEVICE static void prefetch_tma_descriptors(Params const& params) {
@@ -107,8 +107,7 @@ struct CollectiveEpilogueFwd {
         auto& el = shared_storage.tensors.epilogue;
 
         if (elect_one_sync()) {
-            int phase = state.phase;
-            pipeline_o_epi.consumer_wait(phase);
+            pipeline_o_epi.consumer_wait(state.o_epi_state);
 
             int o_tile_idx = (batch * params.num_heads + head) * params.num_row_tiles + row_tile;
             auto thr_tma_o = params.tma_store_O.get_slice(Int<0>{});
@@ -119,9 +118,9 @@ struct CollectiveEpilogueFwd {
             tma_store_arrive();
             tma_store_wait<0>();
 
-            pipeline_o_epi.consumer_release();
-            phase ^= 1;
-            state.phase = phase;
+            flash::consumer_release_cta(shared_storage.pipelines.o_epi, state.o_epi_state);
+            // Advance by 2: stay on stage 0, flip phase
+            ++state.o_epi_state; ++state.o_epi_state;
         }
         return state;
     }

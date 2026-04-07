@@ -1,15 +1,19 @@
 /******************************************************************************
   * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
   ******************************************************************************/
-// Pipeline abstractions for fused attention kernel — Step 2 (BSA-aligned)
+// Pipeline abstractions for fused attention kernel
 //
 // Pipeline overview (BSA naming):
 //   PipelineKV       — K/V multi-stage buffer (Load <-> MMA), TMA-based
 //   PipelineSPO      — S/P/O TMEM coordination (MMA -> Softmax+Correction)
 //   PipelineOAcc     — Final O accumulator ready (MMA -> Correction)
-//   PipelineSmStats  — Softmax stats (Softmax -> Correction), PipelineAsync
+//   PipelineSmStats  — Softmax stats back-pressure (Softmax <-> Correction)
 //   PipelineOEpi     — sO SMEM staging (Correction -> Epilogue TMA store)
+//   PipelinePLastSplit — Last-split P ready (Softmax -> MMA)
 //   PipelineCLC      — Cluster Launch Control (CLC) scheduler pipeline
+//
+// All intra-CTA pipelines (SPO, OAcc, SmStats, OEpi, PLastSplit) use
+// CUTLASS PipelineAsync<2>. UMMA hardware arrives are done externally.
 #pragma once
 
 #ifndef CUTLASS_ARCH_CLC_ENABLED
@@ -26,56 +30,12 @@ namespace flash {
 static constexpr uint32_t kMBarTicks = 1;
 
 // ============================================================================
-// Barrier helpers
+// Barrier helpers (retained: used by MMA inline PTX for p_lastsplit wait
+// and Q-ready barrier)
 // ============================================================================
-
-__device__ __forceinline__ void mbarrier_arrive(cute::uint64_t& bar) {
-    uint32_t addr = cute::cast_smem_ptr_to_uint(&bar);
-    asm volatile("mbarrier.arrive.shared.b64 _, [%0];\n" : : "r"(addr) : "memory");
-}
-
-// mbarrier arrive with .release for SMEM store visibility (pairs with .acquire on wait).
-// Single-CTA kernel: .cta scope suffices (was .cluster → MEMBAR.ALL.GPU, now cheaper).
-__device__ __forceinline__ void mbarrier_arrive_release(cute::uint64_t& bar) {
-    uint32_t addr = cute::cast_smem_ptr_to_uint(&bar);
-    asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];\n" : : "r"(addr) : "memory");
-}
 
 __device__ __forceinline__ void fence_barrier_init() {
     asm volatile("fence.mbarrier_init.release.cluster;\n");
-}
-
-// wait_barrier: drop-in replacement for cute::wait_barrier with ticks hint.
-// The 3-operand form passes a nanosecond hint to suppress YIELD insertion by ptxas.
-__device__ __forceinline__ void wait_barrier(cute::uint64_t& bar, int phase) {
-    uint32_t addr = cute::cast_smem_ptr_to_uint(&bar);
-    asm volatile(
-    "{\n"
-    ".reg .pred P1;\n"
-    "WAIT_BAR_%=:\n"
-    "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1, %2;\n"
-    "@P1 bra.uni DONE_BAR_%=;\n"
-    "bra.uni WAIT_BAR_%=;\n"
-    "DONE_BAR_%=:\n"
-    "}\n"
-    : : "r"(addr), "r"(phase), "r"(kMBarTicks) : "memory");
-}
-
-// SM100 wait_barrier with .acquire semantics (the cute::wait_barrier from SM90
-// uses mbarrier.try_wait.parity WITHOUT .acquire, which doesn't guarantee
-// SMEM store visibility on SM100).
-__device__ __forceinline__ void wait_barrier_acquire(cute::uint64_t& bar, int phase) {
-    uint32_t addr = cute::cast_smem_ptr_to_uint(&bar);
-    asm volatile(
-    "{\n"
-    ".reg .pred P1;\n"
-    "WAIT_ACQ_%=:\n"
-    "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1, %2;\n"
-    "@P1 bra.uni DONE_ACQ_%=;\n"
-    "bra.uni WAIT_ACQ_%=;\n"
-    "DONE_ACQ_%=:\n"
-    "}\n"
-    : : "r"(addr), "r"(phase), "r"(kMBarTicks) : "memory");
 }
 
 // Address-based overloads (for pre-computed UR-promoted addresses).
@@ -115,28 +75,6 @@ __device__ __forceinline__ uint32_t barrier_smem_addr(cute::uint64_t& bar) {
 }
 
 // ============================================================================
-// PipelineState: auto-tracks stage index and barrier phase
-// ============================================================================
-
-template<int Stages_>
-struct PipelineState {
-    int index_ = 0;
-    uint32_t phase_ = 0;
-    uint32_t count_ = 0;
-
-    CUTLASS_DEVICE int index() const { return index_; }
-    CUTLASS_DEVICE uint32_t phase() const { return phase_; }
-    CUTLASS_DEVICE uint32_t count() const { return count_; }
-
-    CUTLASS_DEVICE PipelineState& operator++() {
-        if (index_ == Stages_ - 1) { index_ = 0; phase_ ^= 1; }
-        else { ++index_; }
-        ++count_;
-        return *this;
-    }
-};
-
-// ============================================================================
 // PipelineKV: K/V multi-stage buffer (TMA-based, 3-stage)
 //
 //   Producer: Load warp (1 thread) — TMA loads K/V into alternating slots
@@ -152,205 +90,46 @@ using PipelineKV = cutlass::PipelineTmaUmmaAsync<
 using PipelineKVState = cutlass::PipelineState<3>;
 
 // ============================================================================
-// PipelineSPO: S/P/O TMEM coordination (indexed 2-stage)
-// BSA: pipeline_s_p_o (PipelineUmmaAsync)
+// Intra-CTA pipelines: CUTLASS PipelineAsync<2>
 //
-//   Producer: MMA warp (1 warp) — writes S via QK, signals full
-//   Consumer: Softmax+Correction (256 threads) — read S, write P, rescale O, signal empty
+// All 5 intra-CTA pipelines use PipelineAsync<2> as their base type
+// (blk128 PipelineUmmaAsync/PipelineAsyncUmma also wrap PipelineAsync).
+// UMMA hardware arrives are done externally via flash::umma_arrive().
 //
-//   full[s]:  MMA -> Softmax (S ready), arrive_count = 1 (UMMA arrive)
-//   empty[s]: Softmax+Correction -> MMA (P ready + O free), arrive_count = 256
+//   PipelineSPO:       producer=MMA(1 UMMA), consumer=Softmax+Correction(256)
+//   PipelineOAcc:      producer=MMA(1 UMMA), consumer=dummy(1)
+//   PipelineSmStats:   producer=Softmax(128), consumer=Correction(128)
+//   PipelineOEpi:      producer=Correction(128), consumer=Epilogue(1)
+//   PipelinePLastSplit: producer=Softmax(4 warps), consumer=dummy(1)
 // ============================================================================
 
-struct PipelineSPO {
-    static constexpr int kStages = 2;
-    static constexpr int kConsumerThreads = 256;  // 128 softmax + 128 correction
+static constexpr int kPipeStages = 2;
 
-    struct SharedStorage {
-        alignas(16) cute::uint64_t full[kStages];
-        alignas(16) cute::uint64_t empty[kStages];
-    };
+using PipelineSPO        = cutlass::PipelineAsync<kPipeStages>;
+using PipelineOAcc       = cutlass::PipelineAsync<kPipeStages>;
+using PipelineSmStats    = cutlass::PipelineAsync<kPipeStages>;
+using PipelineOEpi       = cutlass::PipelineAsync<kPipeStages>;
+using PipelinePLastSplit = cutlass::PipelineAsync<kPipeStages>;
 
-    SharedStorage& storage_;
-    CUTLASS_DEVICE PipelineSPO(SharedStorage& s) : storage_(s) {}
-    CUTLASS_DEVICE void precompute_addrs() {}
+using PipeState = cutlass::PipelineState<kPipeStages>;
 
-    CUTLASS_DEVICE void init() {
-        for (int i = 0; i < kStages; ++i) {
-            cute::initialize_barrier(storage_.full[i], 1);
-            cute::initialize_barrier(storage_.empty[i], kConsumerThreads);
-        }
-    }
-    // Correction prefills empty (128 threads per stage)
-    CUTLASS_DEVICE void prefill_correction() {
-        for (int i = 0; i < kStages; ++i) mbarrier_arrive(storage_.empty[i]);
-    }
+// CTA-local barrier operations for single-CTA kernels.
+// PipelineAsync::consumer_release uses mbarrier.arrive.shared::cluster (via mapa).
+// For single-CTA kernels this is functionally identical to shared::cta, but we
+// provide explicit CTA-scope wrappers to avoid the mapa instruction overhead.
+template<typename SharedStorage>
+__device__ __forceinline__ void consumer_release_cta(
+        SharedStorage& storage, PipeState state) {
+    uint32_t addr = cute::cast_smem_ptr_to_uint(&storage.empty_barrier_[state.index()]);
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" : : "r"(addr) : "memory");
+}
 
-    // MMA: wait O[stage] free before PV
-    CUTLASS_DEVICE void producer_acquire_w_index_phase(int stage, int& phase) {
-        wait_barrier(storage_.empty[stage], phase); phase ^= 1;
-    }
-    // MMA: get barrier for UMMA hardware arrive (S ready)
-    CUTLASS_DEVICE cute::uint64_t& producer_get_barrier_w_index(int stage) {
-        return storage_.full[stage];
-    }
-
-    // Softmax: wait S[stage] ready
-    CUTLASS_DEVICE void consumer_wait_w_index_phase(int stage, int& phase) {
-        wait_barrier(storage_.full[stage], phase); phase ^= 1;
-    }
-    // Softmax: signal P[stage] ready (128 threads)
-    CUTLASS_DEVICE void consumer_release_w_index(int stage) {
-        mbarrier_arrive(storage_.empty[stage]);
-    }
-};
-
-// ============================================================================
-// PipelineOAcc: Final O accumulator ready (indexed 2-stage)
-// BSA: pipeline_o_acc (PipelineUmmaAsync)
-//
-//   Producer: MMA warp — signals final PV done (UMMA arrive on full)
-//   Consumer: Correction warps — waits before combine
-// ============================================================================
-
-struct PipelineOAcc {
-    static constexpr int kStages = 2;
-    struct SharedStorage {
-        alignas(16) cute::uint64_t full[kStages];
-    };
-
-    SharedStorage& storage_;
-    CUTLASS_DEVICE PipelineOAcc(SharedStorage& s) : storage_(s) {}
-    CUTLASS_DEVICE void precompute_addrs() {}
-
-    CUTLASS_DEVICE void init() {
-        for (int i = 0; i < kStages; ++i)
-            cute::initialize_barrier(storage_.full[i], 1);
-    }
-
-    CUTLASS_DEVICE cute::uint64_t& producer_get_barrier_w_index(int stage) {
-        return storage_.full[stage];
-    }
-    CUTLASS_DEVICE void consumer_wait_w_index_phase(int stage, int& phase) {
-        wait_barrier(storage_.full[stage], phase); phase ^= 1;
-    }
-};
-
-// ============================================================================
-// PipelineSmStats: Softmax stats (PipelineAsync, mbarrier-based)
-// BSA: pipeline_sm_stats
-//
-//   Producer: Softmax warps (128 threads per WG) — publish acc_scale/stats
-//   Consumer: Correction warps (128 threads) — read stats for O rescaling
-//
-//   Both "full" (stats ready) and "empty" (stats consumed) barriers.
-// ============================================================================
-
-struct PipelineSmStats {
-    static constexpr int kStages = 2;
-    static constexpr int kProducerThreads = 128;  // per softmax WG
-    static constexpr int kConsumerThreads = 128;  // correction WG
-
-    struct SharedStorage {
-        alignas(16) cute::uint64_t full[kStages];   // stats ready
-        alignas(16) cute::uint64_t empty[kStages];  // stats consumed
-    };
-
-    SharedStorage& storage_;
-    CUTLASS_DEVICE PipelineSmStats(SharedStorage& s) : storage_(s) {}
-    CUTLASS_DEVICE void precompute_addrs() {}
-
-    CUTLASS_DEVICE void init() {
-        for (int i = 0; i < kStages; ++i) {
-            cute::initialize_barrier(storage_.full[i], kProducerThreads);
-            cute::initialize_barrier(storage_.empty[i], kConsumerThreads);
-        }
-    }
-    // Pre-signal: correction prefills empty (stats initially free)
-    CUTLASS_DEVICE void prefill_consumer() {
-        for (int i = 0; i < kStages; ++i) mbarrier_arrive(storage_.empty[i]);
-    }
-
-    // Softmax: wait for previous stats consumed before overwriting
-    CUTLASS_DEVICE void producer_acquire_w_index_phase(int stage, int& phase) {
-        wait_barrier(storage_.empty[stage], phase); phase ^= 1;
-    }
-    // Softmax: stats published (128 threads arrive with .release for SMEM visibility)
-    CUTLASS_DEVICE void producer_commit_w_index(int stage) {
-        mbarrier_arrive_release(storage_.full[stage]);
-    }
-    // Correction: wait for stats ready (with .acquire for SM100 SMEM visibility)
-    CUTLASS_DEVICE void consumer_wait_w_index_phase(int stage, int& phase) {
-        wait_barrier_acquire(storage_.full[stage], phase); phase ^= 1;
-    }
-    // Correction: stats consumed, free for next produce
-    CUTLASS_DEVICE void consumer_release_w_index(int stage) {
-        mbarrier_arrive(storage_.empty[stage]);
-    }
-};
-
-// ============================================================================
-// PipelineOEpi: sO SMEM staging (Correction -> Epilogue TMA store)
-// ============================================================================
-
-struct PipelineOEpi {
-    struct SharedStorage {
-        alignas(16) cute::uint64_t notify;
-        alignas(16) cute::uint64_t free;
-    };
-
-    SharedStorage& storage_;
-    CUTLASS_DEVICE PipelineOEpi(SharedStorage& s) : storage_(s) {}
-    CUTLASS_DEVICE void precompute_addrs() {}
-
-    CUTLASS_DEVICE void init() {
-        cute::initialize_barrier(storage_.notify, 128);
-        cute::initialize_barrier(storage_.free, 1);
-    }
-    CUTLASS_DEVICE void prefill() { mbarrier_arrive(storage_.free); }
-
-    CUTLASS_DEVICE void producer_commit() { mbarrier_arrive(storage_.notify); }
-    CUTLASS_DEVICE void consumer_wait(int& phase) {
-        wait_barrier(storage_.notify, phase); phase ^= 1;
-    }
-    CUTLASS_DEVICE void consumer_release() { mbarrier_arrive(storage_.free); }
-};
-
-// ============================================================================
-// PipelinePLastSplit: last-split P ready (Softmax -> MMA, BSA split_P_arrive)
-// Softmax writes P in fragments. After 3/4, softmax releases SPO_empty.
-// After all P, softmax signals this barrier so MMA can issue remaining UTCHMMA.
-//   Producer: Softmax (elect_one per warp) — arrive after last P fragment
-//   Consumer: MMA warp (inline in UTCHMMA PTX sequence) — try_wait
-// ============================================================================
-
-struct PipelinePLastSplit {
-    static constexpr int kStages = 2;
-    static constexpr int kSoftmaxWarps = 4;  // warps per softmax WG
-
-    struct SharedStorage {
-        alignas(16) cute::uint64_t full[kStages];
-    };
-
-    SharedStorage& storage_;
-    CUTLASS_DEVICE PipelinePLastSplit(SharedStorage& s) : storage_(s) {}
-    CUTLASS_DEVICE void precompute_addrs() {}
-
-    CUTLASS_DEVICE void init() {
-        for (int i = 0; i < kStages; ++i)
-            cute::initialize_barrier(storage_.full[i], kSoftmaxWarps);
-    }
-
-    // Softmax (elect_one per warp): signal last split of P is ready
-    CUTLASS_DEVICE void producer_commit_w_index(int stage) {
-        mbarrier_arrive(storage_.full[stage]);
-    }
-
-    // MMA: get barrier smem address for inline PTX try_wait
-    CUTLASS_DEVICE uint32_t get_barrier_addr(int stage) {
-        return cute::cast_smem_ptr_to_uint(&storage_.full[stage]);
-    }
-};
+template<typename SharedStorage>
+__device__ __forceinline__ void producer_commit_cta(
+        SharedStorage& storage, PipeState state) {
+    uint32_t addr = cute::cast_smem_ptr_to_uint(&storage.full_barrier_[state.index()]);
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" : : "r"(addr) : "memory");
+}
 
 // ============================================================================
 // CLC (Cluster Launch Control) infrastructure

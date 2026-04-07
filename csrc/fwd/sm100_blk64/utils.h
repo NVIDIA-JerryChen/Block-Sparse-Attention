@@ -291,4 +291,19 @@ auto make_umma_k_major_layout() {
         Shape<_1, _1>{});
 }
 
+template <int M, int N, int K, typename Element>
+auto make_umma_mn_major_layout() {
+    using namespace cute;
+    using base_atom_type = std::conditional_t<
+        K == 0 || K == 16,
+        UMMA::Layout_MN_INTER_Atom<Element>,
+        std::conditional_t<K == 32, UMMA::Layout_MN_SW32_Atom<Element>,
+        std::conditional_t<K == 64, UMMA::Layout_MN_SW64_Atom<Element>,
+        std::conditional_t<K == 128, UMMA::Layout_MN_SW128_Atom<Element>, void>>>>;
+    static_assert(!std::is_same_v<base_atom_type, void>, "Invalid swizzle value");
+    return coalesce(
+        tile_to_shape(base_atom_type{}, Shape<Int<M>, Int<N>>{}, Step<_1, _2>{}),
+        Shape<_1, _1>{});
+}
+
 } // namespace flash
