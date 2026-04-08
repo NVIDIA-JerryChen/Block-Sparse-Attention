@@ -475,8 +475,10 @@ struct CollectiveMainloopFwd {
                         ml.smem_kv.begin() + kv_state.index() * kKVElemsPerStage),
                         SmemLayoutBDual{});
                 flash::utcmma_ss(qk_mma, sQ, sK, tC_qk, true);
-                pipeline_s_p_o.producer_commit(PipeState(stage, 0, 0));
-                pipeline_kv.consumer_release(kv_state);
+                flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                        shared_storage.pipelines.spo.full_barrier_[stage]));
+                flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                        shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
                 ++kv_state;
             }
             // mma_qk stage=1
@@ -489,8 +491,10 @@ struct CollectiveMainloopFwd {
                         ml.smem_kv.begin() + kv_state.index() * kKVElemsPerStage),
                         SmemLayoutBDual{});
                 flash::utcmma_ss(qk_mma, sQ, sK, tC_qk, true);
-                pipeline_s_p_o.producer_commit(PipeState(stage, 0, 0));
-                pipeline_kv.consumer_release(kv_state);
+                flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                        shared_storage.pipelines.spo.full_barrier_[stage]));
+                flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                        shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
                 ++kv_state;
             }
 
@@ -515,7 +519,8 @@ struct CollectiveMainloopFwd {
                     utcmma_ts_split(pv_mma, tP, sV, tC_pv, !o_acc_s0,
                             pls_addr, pls_state_0.phase());
                     ++pls_state_0; ++pls_state_0;
-                    pipeline_kv.consumer_release(kv_state);
+                    flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                        shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
                     ++kv_state;
                 }
                 // mma_qk stage=0
@@ -528,8 +533,10 @@ struct CollectiveMainloopFwd {
                             ml.smem_kv.begin() + kv_state.index() * kKVElemsPerStage),
                             SmemLayoutBDual{});
                     flash::utcmma_ss(qk_mma, sQ, sK, tC_qk, true);
-                    pipeline_s_p_o.producer_commit(PipeState(stage, 0, 0));
-                    pipeline_kv.consumer_release(kv_state);
+                    flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                        shared_storage.pipelines.spo.full_barrier_[stage]));
+                    flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                        shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
                     ++kv_state;
                 }
                 ++spo_state;
@@ -552,7 +559,8 @@ struct CollectiveMainloopFwd {
                     utcmma_ts_split(pv_mma, tP, sV, tC_pv, !o_acc_s1,
                             pls_addr, pls_state_1.phase());
                     ++pls_state_1; ++pls_state_1;
-                    pipeline_kv.consumer_release(kv_state);
+                    flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                        shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
                     ++kv_state;
                 }
                 // mma_qk stage=1
@@ -565,8 +573,10 @@ struct CollectiveMainloopFwd {
                             ml.smem_kv.begin() + kv_state.index() * kKVElemsPerStage),
                             SmemLayoutBDual{});
                     flash::utcmma_ss(qk_mma, sQ, sK, tC_qk, true);
-                    pipeline_s_p_o.producer_commit(PipeState(stage, 0, 0));
-                    pipeline_kv.consumer_release(kv_state);
+                    flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                        shared_storage.pipelines.spo.full_barrier_[stage]));
+                    flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                        shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
                     ++kv_state;
                 }
                 ++spo_state;
@@ -590,11 +600,13 @@ struct CollectiveMainloopFwd {
                 utcmma_ts_split(pv_mma, tP, sV, tC_pv, !o_acc_s0,
                         pls_addr, pls_state_0.phase());
                 ++pls_state_0; ++pls_state_0;
-                pipeline_kv.consumer_release(kv_state);
+                flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                        shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
                 ++kv_state;
             }
             // UMMA arrive on OAcc full barrier (final O0 ready)
-            pipeline_o_acc.producer_commit(PipeState(0, 0, 0));
+            flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                    shared_storage.pipelines.o_acc.full_barrier_[0]));
             ++spo_state;
 
             // mma_pv stage=1 (epilogue)
@@ -613,11 +625,13 @@ struct CollectiveMainloopFwd {
                 utcmma_ts_split(pv_mma, tP, sV, tC_pv, !o_acc_s1,
                         pls_addr, pls_state_1.phase());
                 ++pls_state_1; ++pls_state_1;
-                pipeline_kv.consumer_release(kv_state);
+                flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                        shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
                 ++kv_state;
             }
             // UMMA arrive on OAcc full barrier (final O1 ready)
-            pipeline_o_acc.producer_commit(PipeState(1, 0, 0));
+            flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
+                    shared_storage.pipelines.o_acc.full_barrier_[1]));
             ++spo_state;
 
             state.kv_state = kv_state;

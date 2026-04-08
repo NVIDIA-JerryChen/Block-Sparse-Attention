@@ -92,8 +92,16 @@ std::tuple<torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_impl(
     torch::Tensor q_contig = q.contiguous();
     torch::Tensor k_contig = k.contiguous();
 
-    // V: passed directly in BSHD (dim contiguous, same as K). No host transpose.
-    torch::Tensor v_contig = v.contiguous();
+    // V: sub-tile transpose (swap token↔dim within each 64×64 block).
+    // Required because PV dual GEMM reduces over K direction (= tokens),
+    // and K-major SMEM layout makes dim 1 contiguous.
+    constexpr int kDimHalf = 64;    // kDualK / 2
+    constexpr int kDimHalves = 2;
+    int total_sparse_blocks = seqlen_k_rounded / kSparseBlockSize;
+    torch::Tensor v_contig = v.view({b, total_sparse_blocks, kSparseBlockSize, h_k, kDimHalves, kDimHalf})
+                              .permute({0, 1, 5, 3, 4, 2})
+                              .reshape({b, seqlen_k_rounded, h_k, d})
+                              .contiguous();
 
     // ======== Output (BSHD, torch::empty) ========
     auto out = torch::empty({b, seqlen_q_rounded, h, kOutputCols}, q.options());

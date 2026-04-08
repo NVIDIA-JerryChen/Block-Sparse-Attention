@@ -178,10 +178,8 @@ struct FusedAttnFwdSm100 {
         pls_params.consumer_arv_count = 1;
         pls_params.role = PipelinePLastSplit::ThreadCategory::ProducerConsumer;
 
-        PipelineSPO     pipeline_s_p_o(shared_storage.pipelines.spo, spo_params,
-                                       ClusterShape1x1x1{}, cute::false_type{}, cute::false_type{});
-        PipelineOAcc    pipeline_o_acc(shared_storage.pipelines.o_acc, oacc_params,
-                                       ClusterShape1x1x1{}, cute::false_type{}, cute::false_type{});
+        PipelineSPO     pipeline_s_p_o(shared_storage.pipelines.spo, spo_params, cute::false_type{});
+        PipelineOAcc    pipeline_o_acc(shared_storage.pipelines.o_acc, oacc_params, cute::false_type{});
         PipelineSmStats pipeline_sm_stats(shared_storage.pipelines.sm_stats, smstats_params, cute::false_type{});
         PipelineOEpi    pipeline_o_epi(shared_storage.pipelines.o_epi, oepi_params, cute::false_type{});
         PipelinePLastSplit pipeline_p_lastsplit(shared_storage.pipelines.p_lastsplit, pls_params, cute::false_type{});
@@ -202,8 +200,6 @@ struct FusedAttnFwdSm100 {
         fence_barrier_init();
         __syncthreads();
         pipeline_kv.init_masks(ClusterShape1x1x1{});
-        pipeline_s_p_o.init_masks(ClusterShape1x1x1{});
-        pipeline_o_acc.init_masks(ClusterShape1x1x1{});
 
         // ======== Phase 2: Prefetch TMA descriptors ========
         if (warp_idx == kLoadWarp && elect_one_sync()) {
@@ -246,7 +242,6 @@ struct FusedAttnFwdSm100 {
         else if (warp_idx == kEpiWarp) {
             while (!*reinterpret_cast<volatile int*>(&shared_storage.tmem_ready)) {}
             __threadfence_block();
-
             typename CollectiveEpilogue::EpiState epi_state;
             epi_state = epilogue.tma_store(
                     params, pipeline_o_epi, shared_storage,

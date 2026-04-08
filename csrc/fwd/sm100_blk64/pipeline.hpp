@@ -70,9 +70,10 @@ using PipelineKVState = cutlass::PipelineState<3>;
 static constexpr int kPipeStages = 2;
 using ClusterShape1x1x1 = cute::Shape<cute::_1, cute::_1, cute::_1>;
 
-// UMMA-produced pipelines: producer_commit() calls umma_arrive() internally
-using PipelineSPO  = cutlass::PipelineUmmaAsync<kPipeStages, ClusterShape1x1x1>;
-using PipelineOAcc = cutlass::PipelineUmmaAsync<kPipeStages, ClusterShape1x1x1>;
+// UMMA-produced pipelines: MMA warp uses flash::umma_arrive() for barrier arrive
+// (not PipelineUmmaAsync — its internal elect_one_sync nests with MMA's outer elect)
+using PipelineSPO  = cutlass::PipelineAsync<kPipeStages>;
+using PipelineOAcc = cutlass::PipelineAsync<kPipeStages>;
 
 // Software-only pipelines
 using PipelineSmStats    = cutlass::PipelineAsync<kPipeStages>;
