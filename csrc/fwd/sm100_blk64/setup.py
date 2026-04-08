@@ -8,10 +8,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 CUTLASS_ROOT = PROJECT_ROOT / "third_party" / "cutlass"
 SRC_DIR = Path(__file__).resolve().parent
 
-# Kernel instantiation sources (separate TUs for register allocation isolation)
+# Kernel instantiation (nvcc, separate TU for register allocation isolation)
 instantiation_sources = [
-    str(SRC_DIR / "instantiations" / f"flash_fwd_varblk{v}_bs{b}.cu")
-    for v in [0, 1] for b in [0, 1]
+    str(SRC_DIR / "instantiations" / "bsa_fwd_hdim128_bf16_sm100.cu"),
 ]
 
 nvcc_flags = [
@@ -38,8 +37,7 @@ setup(
         CUDAExtension(
             name="bsa_fwd_blk64_ext",
             sources=[
-                str(SRC_DIR / "bindings.cpp"),
-                str(SRC_DIR / "flash_fwd_launch_template.cu"),
+                str(SRC_DIR / "bsa_api.cpp"),
             ] + instantiation_sources,
             include_dirs=[
                 str(SRC_DIR),

@@ -11,6 +11,7 @@
 #include "cute/algorithm/cooperative_copy.hpp"
 #include "cute/tensor.hpp"
 
+#include "bsa.h"
 #include "pipeline.hpp"
 #include "utils.h"
 #include "softmax.h"
@@ -20,10 +21,7 @@ namespace flash {
 namespace cute = ::cute;
 
 
-template<bool HasVariableBlockNums_ = false, bool HasBlockSizes_ = true>
 struct CollectiveMainloopFwd {
-    static constexpr bool HasVariableBlockNums = HasVariableBlockNums_;
-    static constexpr bool HasBlockSizes = HasBlockSizes_;
     // ---- Element types ----
     using ElementA = cutlass::bfloat16_t;
     using ElementB = cutlass::bfloat16_t;
@@ -107,16 +105,16 @@ struct CollectiveMainloopFwd {
             cute::Step<cute::_1, cute::_2>{}), cute::Shape<cute::_1, cute::_1>{}));
 
     // ---- TMA types ----
-    using ShapeTensor = cute::Shape<int, int, int>;
-    using StrideQ = cute::Stride<cute::Int<kQkK>, cute::_1, int>;
-    // K/V 5D: (64, 64, 2*H, blocks, B) — same TMA type, both from BSHD
-    // V data is sub-tile-transposed on host so SMEM has (dim_row, token_col)
+    // Q 5D from BSHD: (kRows, kQkK, H, num_m_blocks, B)
+    using ShapeQ5 = cute::Shape<cute::Int<kRows>, cute::Int<kQkK>, int, int, int>;
+    using StrideQ5 = cute::Stride<int, cute::_1, int, int, int64_t>;
+    // K/V 5D from BSHD: (64, 64, 2*H_k, blocks, B)
     using ShapeKV5 = cute::Shape<cute::Int<kSparseBlockSize>, cute::Int<kDimHalf>, int, int, int>;
-    using StrideKV5 = cute::Stride<int, cute::_1, cute::Int<kDimHalf>, int, int>;
+    using StrideKV5 = cute::Stride<int, cute::_1, cute::Int<kDimHalf>, int, int64_t>;
 
     using TMA_Q = decltype(cute::make_tma_copy(cute::SM90_TMA_LOAD{},
             cute::make_tensor(cute::make_gmem_ptr(static_cast<ElementA const*>(nullptr)),
-                                                cute::make_layout(ShapeTensor{}, StrideQ{})),
+                                                cute::make_layout(ShapeQ5{}, StrideQ5{})),
             SmemLayoutQ{}));
     // K/V: same TMA type (K-major, 5D BSHD)
     using TMA_KV = decltype(cute::make_tma_copy(cute::SM90_TMA_LOAD{},
@@ -133,82 +131,66 @@ struct CollectiveMainloopFwd {
         alignas(16) float corr_scale[2][128]; // per-stage rescale factor
     };
 
-    // ---- Arguments (host-side) ----
-    struct Arguments {
-        ElementA const* ptr_Q;
-        ElementB const* ptr_K;
-        ElementB const* ptr_V;
-        float softmax_scale;
-        int const* ptr_block_indices = nullptr;  // sparse: [heads, num_q_tiles, num_kv_iters * kSparseBlocksPerKV]
-        int block_indices_stride = 0;            // stride per (head, q_tile) = num_kv_iters * kSparseBlocksPerKV
-        int const* ptr_block_sizes = nullptr;    // sparse: [total_sparse_blocks], actual tokens per block (0-64)
-        int const* ptr_q2k_block_nums = nullptr; // variable: [batch * heads, num_q_blocks], per-tile sparse block count
-        int raw_block_sparse_num = 0;            // original unpadded block_sparse_num (for phantom clamping)
-    };
+    // ---- Static TMA construction methods (called from run_bsa_fwd) ----
+    // These read from bsa_fwd_params to build TMA descriptors and shapes.
 
-    // ---- Params (device-side) ----
-    struct Params {
-        TMA_Q tma_load_Q;
-        TMA_KV tma_load_K;
-        TMA_KV tma_load_V;
-        ShapeTensor shape_Q;
-        ShapeKV5 shape_K;
-        ShapeKV5 shape_V;  // same type as K (V data is sub-tile-transposed on host)
-        float sm_scale_log2;
-        int const* ptr_block_indices = nullptr;
-        int block_indices_stride = 0;
-        int const* ptr_block_sizes = nullptr;
-        int num_heads = 1;
-        int num_row_tiles = 1;
-        int const* ptr_q2k_block_nums = nullptr;
-        int raw_block_sparse_num = 0;  // original unpadded block_sparse_num (for index clamping)
-    };
-
-    // ---- Convert Arguments -> Params ----
-    // seq_kv: actual K/V sequence length for TMA descriptor (may differ from seq_padded in sparse mode)
-    // batch: batch size (folded into TMA 3rd dimension)
-    static Params
-    to_underlying_arguments(Arguments const& args, int rows_padded, int seq_padded, int heads, int seq_kv = 0, int batch = 1, int seq_k_actual = 0) {
+    static TMA_Q make_tma_load_Q(bsa_fwd_params const& p) {
         using namespace cute;
-        int const num_row_tiles = rows_padded / kRows;
-        if (seq_kv == 0) seq_kv = seq_padded;
-
-        // TMA 3rd dim = batch * heads * tiles_per_head (batch folded in)
-        auto shape_q  = make_shape(kRows, kQkK, batch * heads * num_row_tiles);
-        auto stride_q = make_stride(Int<kQkK>{}, _1{}, kRows * kQkK);
-        auto tma_q = make_tma_copy(SM90_TMA_LOAD{},
-                make_tensor(make_gmem_ptr(args.ptr_Q), make_layout(shape_q, stride_q)),
+        // 5D TMA from BSHD: (kRows, kQkK, H, num_m_blocks, B)
+        auto shape_q  = make_shape(Int<kRows>{}, Int<kQkK>{}, p.h, p.num_m_blocks, p.b);
+        auto stride_q = make_stride(int(p.q_row_stride), _1{}, int(p.q_head_stride),
+                                    kRows * int(p.q_row_stride), p.q_batch_stride);
+        return make_tma_copy(SM90_TMA_LOAD{},
+                make_tensor(make_gmem_ptr(static_cast<ElementA const*>(p.q_ptr)),
+                            make_layout(shape_q, stride_q)),
                 SmemLayoutQ{});
+    }
 
-        int const total_sparse_blocks = seq_kv / kSparseBlockSize;
-        // K 5D TMA: read directly from BSHD via stride-aware descriptor
-        // Global layout: (batch, seq_k, heads, dim) — ptr_K points to BSHD contiguous
-        // stride_S = heads * kQkK (stride between consecutive tokens)
-        int stride_S = heads * kQkK;
-        if (seq_k_actual == 0) seq_k_actual = seq_kv;
+    static ShapeQ5 make_shape_Q(bsa_fwd_params const& p) {
+        using namespace cute;
+        return make_shape(Int<kRows>{}, Int<kQkK>{}, p.h, p.num_m_blocks, p.b);
+    }
+
+    static TMA_KV make_tma_load_K(bsa_fwd_params const& p) {
+        using namespace cute;
+        int const total_sparse_blocks = p.seqlen_k_rounded / kSparseBlockSize;
+        int stride_S = int(p.k_row_stride);
         auto shape_k  = make_shape(Int<kSparseBlockSize>{}, Int<kDimHalf>{},
-                                   kDimHalves * heads, total_sparse_blocks, batch);
+                                   kDimHalves * p.h_k, total_sparse_blocks, p.b);
         auto stride_k = make_stride(stride_S, _1{}, Int<kDimHalf>{},
-                                    kSparseBlockSize * stride_S, seq_k_actual * stride_S);
-        auto tma_k = make_tma_copy(SM90_TMA_LOAD{},
-                make_tensor(make_gmem_ptr(args.ptr_K), make_layout(shape_k, stride_k)),
+                                    kSparseBlockSize * stride_S, p.k_batch_stride);
+        return make_tma_copy(SM90_TMA_LOAD{},
+                make_tensor(make_gmem_ptr(static_cast<ElementB const*>(p.k_ptr)),
+                            make_layout(shape_k, stride_k)),
                 SmemLayoutSubTile{});
+    }
 
-        // V: same TMA type as K (sub-tile-transposed data on host, same BSHD strides)
-        int const total_k_blocks = (seq_k_actual + kSparseBlockSize - 1) / kSparseBlockSize;
+    static ShapeKV5 make_shape_K(bsa_fwd_params const& p) {
+        using namespace cute;
+        int const total_sparse_blocks = p.seqlen_k_rounded / kSparseBlockSize;
+        return make_shape(Int<kSparseBlockSize>{}, Int<kDimHalf>{},
+                          kDimHalves * p.h_k, total_sparse_blocks, p.b);
+    }
+
+    static TMA_KV make_tma_load_V(bsa_fwd_params const& p) {
+        using namespace cute;
+        int const total_k_blocks = (p.seqlen_k_rounded + kSparseBlockSize - 1) / kSparseBlockSize;
+        int stride_S = int(p.v_row_stride);
         auto shape_v  = make_shape(Int<kSparseBlockSize>{}, Int<kDimHalf>{},
-                                   kDimHalves * heads, total_k_blocks, batch);
+                                   kDimHalves * p.h_k, total_k_blocks, p.b);
         auto stride_v = make_stride(stride_S, _1{}, Int<kDimHalf>{},
-                                    kSparseBlockSize * stride_S, seq_k_actual * stride_S);
-        auto tma_v = make_tma_copy(SM90_TMA_LOAD{},
-                make_tensor(make_gmem_ptr(args.ptr_V), make_layout(shape_v, stride_v)),
+                                    kSparseBlockSize * stride_S, p.v_batch_stride);
+        return make_tma_copy(SM90_TMA_LOAD{},
+                make_tensor(make_gmem_ptr(static_cast<ElementB const*>(p.v_ptr)),
+                            make_layout(shape_v, stride_v)),
                 SmemLayoutSubTile{});
+    }
 
-        float sm_scale_log2 = float(args.softmax_scale * M_LOG2E);
-        return {tma_q, tma_k, tma_v, shape_q, shape_k, shape_v, sm_scale_log2,
-                args.ptr_block_indices, args.block_indices_stride,
-                args.ptr_block_sizes, heads, num_row_tiles, args.ptr_q2k_block_nums,
-                args.raw_block_sparse_num};
+    static ShapeKV5 make_shape_V(bsa_fwd_params const& p) {
+        using namespace cute;
+        int const total_k_blocks = (p.seqlen_k_rounded + kSparseBlockSize - 1) / kSparseBlockSize;
+        return make_shape(Int<kSparseBlockSize>{}, Int<kDimHalf>{},
+                          kDimHalves * p.h_k, total_k_blocks, p.b);
     }
 
     // Helper: compute per-tile num_kv_blocks (pipeline iterations) and raw block count.
@@ -216,29 +198,21 @@ struct CollectiveMainloopFwd {
     // then divide by kSparseBlocksPerKV to get even kv_iters.
     // raw_count: actual sparse blocks (for index clamping and phantom detection).
     CUTLASS_DEVICE static int get_tile_num_kv_blocks(
-            Params const& params, int batch, int head, int row_tile, int global_num_kv_blocks) {
-        if constexpr (HasVariableBlockNums) {
-            int tile_flat = (batch * params.num_heads + head) * params.num_row_tiles + row_tile;
-            int raw_count = params.ptr_q2k_block_nums[tile_flat];
-            if (raw_count <= 0) return 0;  // empty tile
-            // Round up to multiple of 8 (kSparseBlocksPerKV * 2), then /4 → even kv_iters
-            constexpr int kAlign = kSparseBlocksPerKV * 2;  // 8
-            int padded = (raw_count + kAlign - 1) & ~(kAlign - 1);
-            return padded / kSparseBlocksPerKV;
-        } else {
-            return global_num_kv_blocks;
-        }
+            bsa_fwd_params const& fwd, int batch, int head, int row_tile, int global_num_kv_blocks) {
+        int tile_flat = (batch * fwd.h + head) * fwd.num_m_blocks + row_tile;
+        int raw_count = fwd.q2k_block_nums_ptr[tile_flat];
+        if (raw_count <= 0) return 0;  // empty tile
+        // Round up to multiple of 8 (kSparseBlocksPerKV * 2), then /4 → even kv_iters
+        constexpr int kAlign = kSparseBlocksPerKV * 2;  // 8
+        int padded = (raw_count + kAlign - 1) & ~(kAlign - 1);
+        return padded / kSparseBlocksPerKV;
     }
 
     // Get the raw (unpadded) block count for a tile — used for index clamping and phantom detection.
     CUTLASS_DEVICE static int get_tile_raw_block_count(
-            Params const& params, int batch, int head, int row_tile) {
-        if constexpr (HasVariableBlockNums) {
-            int tile_flat = (batch * params.num_heads + head) * params.num_row_tiles + row_tile;
-            return params.ptr_q2k_block_nums[tile_flat];
-        } else {
-            return params.raw_block_sparse_num;
-        }
+            bsa_fwd_params const& fwd, int batch, int head, int row_tile) {
+        int tile_flat = (batch * fwd.h + head) * fwd.num_m_blocks + row_tile;
+        return fwd.q2k_block_nums_ptr[tile_flat];
     }
 
     // ===========================================================================
@@ -253,7 +227,8 @@ struct CollectiveMainloopFwd {
     };
 
     // Prefetch TMA descriptors (called once from kernel, not per-tile).
-    CUTLASS_DEVICE static void prefetch_tma_descriptors(Params const& params) {
+    template<typename KernelParams>
+    CUTLASS_DEVICE static void prefetch_tma_descriptors(KernelParams const& params) {
         cute::prefetch_tma_descriptor(params.tma_load_Q.get_tma_descriptor());
         cute::prefetch_tma_descriptor(params.tma_load_K.get_tma_descriptor());
         cute::prefetch_tma_descriptor(params.tma_load_V.get_tma_descriptor());
@@ -279,7 +254,7 @@ struct CollectiveMainloopFwd {
     template<typename ThrTmaK, typename GKFull, typename MainloopStorage>
     CUTLASS_DEVICE static PipelineKVState load_K(
             int kv_block_idx, PipelineKVState kv_st,
-            PipelineKV& pipeline_kv, Params const& params,
+            PipelineKV& pipeline_kv, auto const& params,
             ThrTmaK& thr_tma_k, GKFull& gK_full,
             MainloopStorage& ml,
             int head, int batch, int raw_block_count,
@@ -314,7 +289,7 @@ struct CollectiveMainloopFwd {
     template<typename ThrTmaV, typename GVFull, typename MainloopStorage>
     CUTLASS_DEVICE static PipelineKVState load_V(
             int kv_block_idx, PipelineKVState kv_st,
-            PipelineKV& pipeline_kv, Params const& params,
+            PipelineKV& pipeline_kv, auto const& params,
             ThrTmaV& thr_tma_v, GVFull& gV_full,
             MainloopStorage& ml,
             int head, int batch, int raw_block_count,
@@ -343,9 +318,9 @@ struct CollectiveMainloopFwd {
         return kv_st;
     }
 
-    template<typename SharedStorage>
+    template<typename KernelParams, typename SharedStorage>
     CUTLASS_DEVICE LoadState load(
-            Params const& params, PipelineKV& pipeline_kv,
+            KernelParams const& params, PipelineKV& pipeline_kv,
             SharedStorage& shared_storage,
             int head, int row_tile, int batch, int num_row_tiles, int num_kv_blocks,
             int raw_block_count,  // actual sparse block count (for phantom clamping)
@@ -363,19 +338,17 @@ struct CollectiveMainloopFwd {
             Tensor gK_full = params.tma_load_K.get_tma_tensor(params.shape_K);
             Tensor gV_full = params.tma_load_V.get_tma_tensor(params.shape_V);
 
-            // Batch-aware TMA indices: batch folds into outermost dimension
-            int q_tile_idx = (batch * params.num_heads + head) * num_row_tiles + row_tile;
-
             // Block indices for this (batch, head, row_tile)
             int const* tile_block_indices = nullptr;
-            if (params.ptr_block_indices != nullptr) {
-                int tile_idx_flat = (batch * params.num_heads + head) * num_row_tiles + row_tile;
-                tile_block_indices = params.ptr_block_indices + tile_idx_flat * params.block_indices_stride;
+            if (params.fwd.block_indices_ptr != nullptr) {
+                int tile_idx_flat = (batch * params.fwd.h + head) * num_row_tiles + row_tile;
+                tile_block_indices = params.fwd.block_indices_ptr + tile_idx_flat * params.fwd.block_indices_stride;
             }
 
             // Load Q (one-shot TMA into persistent smem_q)
             {
-                Tensor gQ_tile = gQ_full(_, _, q_tile_idx);
+                // 5D indexing: (_, _, head, row_tile, batch)
+                Tensor gQ_tile = gQ_full(_, _, head, row_tile, batch);
                 auto sQ = make_tensor(make_smem_ptr(ml.smem_q.begin()), SmemLayoutQ{});
                 cute::set_barrier_transaction_bytes(shared_storage.pipelines.bar_q_ready, kQBytes);
                 cute::copy(params.tma_load_Q.with(reinterpret_cast<uint64_t&>(shared_storage.pipelines.bar_q_ready)),
@@ -502,10 +475,8 @@ struct CollectiveMainloopFwd {
                         ml.smem_kv.begin() + kv_state.index() * kKVElemsPerStage),
                         SmemLayoutBDual{});
                 flash::utcmma_ss(qk_mma, sQ, sK, tC_qk, true);
-                flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
-                        shared_storage.pipelines.spo.full_barrier_[stage]));
-                flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
-                        shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
+                pipeline_s_p_o.producer_commit(PipeState(stage, 0, 0));
+                pipeline_kv.consumer_release(kv_state);
                 ++kv_state;
             }
             // mma_qk stage=1
@@ -518,10 +489,8 @@ struct CollectiveMainloopFwd {
                         ml.smem_kv.begin() + kv_state.index() * kKVElemsPerStage),
                         SmemLayoutBDual{});
                 flash::utcmma_ss(qk_mma, sQ, sK, tC_qk, true);
-                flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
-                        shared_storage.pipelines.spo.full_barrier_[stage]));
-                flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
-                        shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
+                pipeline_s_p_o.producer_commit(PipeState(stage, 0, 0));
+                pipeline_kv.consumer_release(kv_state);
                 ++kv_state;
             }
 
@@ -546,8 +515,7 @@ struct CollectiveMainloopFwd {
                     utcmma_ts_split(pv_mma, tP, sV, tC_pv, !o_acc_s0,
                             pls_addr, pls_state_0.phase());
                     ++pls_state_0; ++pls_state_0;
-                    flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
-                            shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
+                    pipeline_kv.consumer_release(kv_state);
                     ++kv_state;
                 }
                 // mma_qk stage=0
@@ -560,10 +528,8 @@ struct CollectiveMainloopFwd {
                             ml.smem_kv.begin() + kv_state.index() * kKVElemsPerStage),
                             SmemLayoutBDual{});
                     flash::utcmma_ss(qk_mma, sQ, sK, tC_qk, true);
-                    flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
-                            shared_storage.pipelines.spo.full_barrier_[stage]));
-                    flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
-                            shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
+                    pipeline_s_p_o.producer_commit(PipeState(stage, 0, 0));
+                    pipeline_kv.consumer_release(kv_state);
                     ++kv_state;
                 }
                 ++spo_state;
@@ -586,8 +552,7 @@ struct CollectiveMainloopFwd {
                     utcmma_ts_split(pv_mma, tP, sV, tC_pv, !o_acc_s1,
                             pls_addr, pls_state_1.phase());
                     ++pls_state_1; ++pls_state_1;
-                    flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
-                            shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
+                    pipeline_kv.consumer_release(kv_state);
                     ++kv_state;
                 }
                 // mma_qk stage=1
@@ -600,10 +565,8 @@ struct CollectiveMainloopFwd {
                             ml.smem_kv.begin() + kv_state.index() * kKVElemsPerStage),
                             SmemLayoutBDual{});
                     flash::utcmma_ss(qk_mma, sQ, sK, tC_qk, true);
-                    flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
-                            shared_storage.pipelines.spo.full_barrier_[stage]));
-                    flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
-                            shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
+                    pipeline_s_p_o.producer_commit(PipeState(stage, 0, 0));
+                    pipeline_kv.consumer_release(kv_state);
                     ++kv_state;
                 }
                 ++spo_state;
@@ -627,13 +590,11 @@ struct CollectiveMainloopFwd {
                 utcmma_ts_split(pv_mma, tP, sV, tC_pv, !o_acc_s0,
                         pls_addr, pls_state_0.phase());
                 ++pls_state_0; ++pls_state_0;
-                flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
-                        shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
+                pipeline_kv.consumer_release(kv_state);
                 ++kv_state;
             }
             // UMMA arrive on OAcc full barrier (final O0 ready)
-            flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
-                    shared_storage.pipelines.o_acc.full_barrier_[0]));
+            pipeline_o_acc.producer_commit(PipeState(0, 0, 0));
             ++spo_state;
 
             // mma_pv stage=1 (epilogue)
@@ -652,13 +613,11 @@ struct CollectiveMainloopFwd {
                 utcmma_ts_split(pv_mma, tP, sV, tC_pv, !o_acc_s1,
                         pls_addr, pls_state_1.phase());
                 ++pls_state_1; ++pls_state_1;
-                flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
-                        shared_storage.pipelines.kv.empty_barrier_[kv_state.index()]));
+                pipeline_kv.consumer_release(kv_state);
                 ++kv_state;
             }
             // UMMA arrive on OAcc full barrier (final O1 ready)
-            flash::umma_arrive(reinterpret_cast<cute::uint64_t&>(
-                    shared_storage.pipelines.o_acc.full_barrier_[1]));
+            pipeline_o_acc.producer_commit(PipeState(1, 0, 0));
             ++spo_state;
 
             state.kv_state = kv_state;
@@ -814,7 +773,7 @@ struct CollectiveMainloopFwd {
                 // split_P_arrive
                 if (frag + 1 == kFrgCount * kSplitNumer / kSplitDenom) {
                     cutlass::arch::fence_view_async_tmem_store();
-                    flash::consumer_release_cta(shared_storage.pipelines.spo, spo_state);
+                    pipeline_s_p_o.consumer_release(spo_state);
                     // Advance spo_state by 2: stay on same Stage, flip phase
                     ++spo_state; ++spo_state;
                 }
@@ -825,7 +784,7 @@ struct CollectiveMainloopFwd {
         cutlass::arch::fence_view_async_tmem_store();
         __syncwarp();
         if (elect_one_sync()) {
-            flash::producer_commit_cta(shared_storage.pipelines.p_lastsplit, PipeState(Stage, 0, 0));
+            pipeline_p_lastsplit.producer_commit(PipeState(Stage, 0, 0));
         }
 
         // ---- 8. pipeline_sm_stats.producer_acquire ----
@@ -874,21 +833,16 @@ struct CollectiveMainloopFwd {
         const int warp_col = warp_in_wg / 2;
 
         auto get_block_sizes = [&] (int k, int& bs_lo, int& bs_hi) {
-            if constexpr (HasBlockSizes) {
-                int kv_block = num_kv_blocks - 1 - (2 * k + Stage);
-                int logical_lo = kv_block * kSparseBlocksPerKV + warp_col;
-                int logical_hi = kv_block * kSparseBlocksPerKV + warp_col + 2;
-                // Phantom block detection: index >= raw_block_count → block_size=0 (all masked)
-                int clamped_lo = (logical_lo < raw_block_count) ? logical_lo : max(raw_block_count - 1, 0);
-                int clamped_hi = (logical_hi < raw_block_count) ? logical_hi : max(raw_block_count - 1, 0);
-                int bi_lo = tile_block_indices[clamped_lo];
-                int bi_hi = tile_block_indices[clamped_hi];
-                bs_lo = (logical_lo < raw_block_count) ? ptr_block_sizes[bi_lo] : 0;
-                bs_hi = (logical_hi < raw_block_count) ? ptr_block_sizes[bi_hi] : 0;
-            } else {
-                bs_lo = kSparseBlockSize;
-                bs_hi = kSparseBlockSize;
-            }
+            int kv_block = num_kv_blocks - 1 - (2 * k + Stage);
+            int logical_lo = kv_block * kSparseBlocksPerKV + warp_col;
+            int logical_hi = kv_block * kSparseBlocksPerKV + warp_col + 2;
+            // Phantom block detection: index >= raw_block_count → block_size=0 (all masked)
+            int clamped_lo = (logical_lo < raw_block_count) ? logical_lo : max(raw_block_count - 1, 0);
+            int clamped_hi = (logical_hi < raw_block_count) ? logical_hi : max(raw_block_count - 1, 0);
+            int bi_lo = tile_block_indices[clamped_lo];
+            int bi_hi = tile_block_indices[clamped_hi];
+            bs_lo = (logical_lo < raw_block_count) ? ptr_block_sizes[bi_lo] : 0;
+            bs_hi = (logical_hi < raw_block_count) ? ptr_block_sizes[bi_hi] : 0;
         };
 
         // BSA: acquire before loop
@@ -1082,10 +1036,10 @@ struct CollectiveMainloopFwd {
         PipeState const st1(1, 0, 0);
 
         // ---- (a) Skip first pair: no rescale needed (BSA pattern) ----
-        flash::consumer_release_cta(shared_storage.pipelines.spo, st0);
-        flash::consumer_release_cta(shared_storage.pipelines.spo, st1);
+        pipeline_s_p_o.consumer_release(st0);
+        pipeline_s_p_o.consumer_release(st1);
         NamedBarrier::arrive_and_wait(kSmStatsNotifyThreads, NamedBarriers::SmStatsNotify + 0 * kCorrWarps + corr_warp);
-        flash::consumer_release_cta(shared_storage.pipelines.sm_stats, st0);
+        pipeline_sm_stats.consumer_release(st0);
         NamedBarrier::arrive_and_wait(kSmStatsNotifyThreads, NamedBarriers::SmStatsNotify + 1 * kCorrWarps + corr_warp);
 
         // ---- (b) Paired rescale loop (BSA: seqlen_corr_loop_steps) ----
@@ -1096,31 +1050,31 @@ struct CollectiveMainloopFwd {
             {
                 NamedBarrier::arrive_and_wait(kSmStatsNotifyThreads, NamedBarriers::SmStatsNotify + 0 * kCorrWarps + corr_warp);
                 correction_rescale(tmem_o0, ml.corr_scale[0][corr_idx], corr_idx);
-                flash::consumer_release_cta(shared_storage.pipelines.spo, st0);
-                flash::consumer_release_cta(shared_storage.pipelines.sm_stats, st1);
+                pipeline_s_p_o.consumer_release(st0);
+                pipeline_sm_stats.consumer_release(st1);
             }
             // Stage 1: rescale O1
             {
                 NamedBarrier::arrive_and_wait(kSmStatsNotifyThreads, NamedBarriers::SmStatsNotify + 1 * kCorrWarps + corr_warp);
                 correction_rescale(tmem_o1, ml.corr_scale[1][corr_idx], corr_idx);
-                flash::consumer_release_cta(shared_storage.pipelines.spo, st1);
-                flash::consumer_release_cta(shared_storage.pipelines.sm_stats, st0);
+                pipeline_s_p_o.consumer_release(st1);
+                pipeline_sm_stats.consumer_release(st0);
             }
         }
 
         // BSA: post-loop release for stage 1
-        flash::consumer_release_cta(shared_storage.pipelines.sm_stats, st1);
+        pipeline_sm_stats.consumer_release(st1);
 
         // ---- (c) Read final stats (BSA: sm_stats_barrier for both stages) ----
         NamedBarrier::arrive_and_wait(kSmStatsNotifyThreads, NamedBarriers::SmStatsNotify + 0 * kCorrWarps + corr_warp);
         float row_sum0 = ml.smem_sum[0 * 128 + corr_idx];
         float row_max0 = ml.smem_max[0 * 128 + corr_idx];
-        flash::consumer_release_cta(shared_storage.pipelines.sm_stats, st0);
+        pipeline_sm_stats.consumer_release(st0);
 
         NamedBarrier::arrive_and_wait(kSmStatsNotifyThreads, NamedBarriers::SmStatsNotify + 1 * kCorrWarps + corr_warp);
         float row_sum1 = ml.smem_sum[1 * 128 + corr_idx];
         float row_max1 = ml.smem_max[1 * 128 + corr_idx];
-        flash::consumer_release_cta(shared_storage.pipelines.sm_stats, st1);
+        pipeline_sm_stats.consumer_release(st1);
 
         // ---- (d) Compute cross-stage combine scales ----
         float rm0 = (row_sum0 > 0.0f) ? row_max0 : -CUDART_INF_F;
@@ -1189,7 +1143,7 @@ struct CollectiveMainloopFwd {
 
         // ---- (h) Fence + signal epilogue warp ----
         cutlass::arch::fence_view_async_shared();
-        flash::producer_commit_cta(shared_storage.pipelines.o_epi, corr_state.o_epi_state);
+        pipeline_o_epi.producer_commit(corr_state.o_epi_state);
         // Advance OEpi state by 2: stay on stage 0, flip phase
         ++corr_state.o_epi_state; ++corr_state.o_epi_state;
         return corr_state;

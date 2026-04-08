@@ -283,7 +283,7 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
     if is_blk64:
         softmax_scale = 1.0 / math.sqrt(d)
         bn_arg = q2k_block_nums if use_variable_block_nums else torch.Tensor()
-        out, lse = bsa_fwd_blk64_ext.bsa_fused_fwd_blk64(
+        out, lse = torch.ops.bsa_blk64.fwd(
             q, k, v, q2k_block_index, block_sparse_num, block_sizes, softmax_scale, bn_arg)
     else:
         out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes,
@@ -424,7 +424,7 @@ def _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n,
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
         bn_arg = q2k_block_nums if q2k_block_nums is not None else torch.Tensor()
         bs_arg = block_sizes if block_sizes is not None else torch.Tensor()
-        out, lse = bsa_fwd_blk64_ext.bsa_fused_fwd_blk64(
+        out, lse = torch.ops.bsa_blk64.fwd(
             q, k, v, q2k_block_index, block_sparse_num, bs_arg, softmax_scale, bn_arg)
         return out
     else:

@@ -57,6 +57,66 @@ torch2cute_dtype_map = {
 }
 
 
+def bsa_attn_fwd_blk64(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    block_sizes: torch.Tensor,
+    q2k_block_nums: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    layout: str = "bshd",
+):
+    """BSA forward attention (blk64 backend, bf16 only, D=128).
+
+    Args:
+        q, k, v: (B, S, H, D) if layout="bshd" or (B, H, S, D) if layout="bhsd"
+        q2k_block_index: (B, H, Q_tiles, max_kv) int32
+        block_sizes: (num_kv_blocks,) int32
+        q2k_block_nums: (B, H, Q_tiles) int32
+        softmax_scale: default 1/sqrt(D)
+        layout: "bshd" or "bhsd"
+    """
+    assert q.dtype == torch.bfloat16, "blk64 requires bf16"
+    assert q.is_cuda and k.is_cuda and v.is_cuda
+    assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
+
+    if layout == "bhsd":
+        q = q.permute(0, 2, 1, 3).contiguous()
+        k = k.permute(0, 2, 1, 3).contiguous()
+        v = v.permute(0, 2, 1, 3).contiguous()
+
+    assert q.size(3) == 128, "blk64 requires D=128"
+    seqlen_q = q.size(1)
+    seqlen_k = k.size(1)
+
+    if softmax_scale is None:
+        softmax_scale = q.size(3) ** -0.5
+
+    # Pad seqlen to multiples of 64 if needed (C++ expects aligned inputs)
+    if seqlen_q % 64 != 0:
+        pad_q = 64 - seqlen_q % 64
+        q = torch.nn.functional.pad(q, (0, 0, 0, 0, 0, pad_q))
+    if seqlen_k % 64 != 0:
+        pad_k = 64 - seqlen_k % 64
+        k = torch.nn.functional.pad(k, (0, 0, 0, 0, 0, pad_k))
+        v = torch.nn.functional.pad(v, (0, 0, 0, 0, 0, pad_k))
+
+    import bsa_fwd_blk64_ext  # triggers TORCH_LIBRARY registration
+    out, lse = torch.ops.bsa_blk64.fwd(
+        q, k, v, q2k_block_index, 0, block_sizes, softmax_scale, q2k_block_nums)
+
+    # Trim padding
+    if out.size(1) != seqlen_q:
+        out = out[:, :seqlen_q]
+    if lse.size(2) != seqlen_q:
+        lse = lse[:, :, :seqlen_q]
+
+    if layout == "bhsd":
+        out = out.permute(0, 2, 1, 3)
+    return out, lse
+
+
 def bsa_attn_fwd(
     q: torch.Tensor,
     k: torch.Tensor,

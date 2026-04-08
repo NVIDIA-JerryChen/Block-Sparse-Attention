@@ -1,8 +1,8 @@
 /******************************************************************************
   * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
   ******************************************************************************/
-// CollectiveEpilogueFwd — TMA store for Step 2 (2-acc_O)
-// Correction logic has moved to CollectiveMainloopFwd (mainloop_fwd.hpp).
+// CollectiveEpilogueFwd — TMA store for output O.
+// Correction logic is in CollectiveMainloopFwd (mainloop_fwd_sm100.hpp).
 // This file retains TensorStorage (o_exchange, o_staging, sO) and TMA store.
 #pragma once
 
@@ -10,7 +10,7 @@
 #include "cutlass/detail/sm100_tmem_helper.hpp"
 #include "cute/tensor.hpp"
 
-
+#include "bsa.h"
 #include "pipeline.hpp"
 #include "utils.h"
 
@@ -34,54 +34,40 @@ struct CollectiveEpilogueFwd {
             cute::Step<cute::_1, cute::_2>{}), cute::Shape<cute::_1, cute::_1>{}));
     static constexpr int kOBytes = kRows * kOutputCols * sizeof(ElementA);
 
-    // ---- TMA type aliases ----
-    using ShapeTensor = cute::Shape<int, int, int>;
-    using StrideO = cute::Stride<cute::Int<kOutputCols>, cute::_1, int>;
+    // ---- TMA type aliases (5D BSHD) ----
+    using ShapeO5 = cute::Shape<cute::Int<kRows>, cute::Int<kOutputCols>, int, int, int>;
+    using StrideO5 = cute::Stride<int, cute::_1, int, int, int64_t>;
 
     using TMA_O = decltype(cute::make_tma_copy(cute::SM90_TMA_STORE{},
             cute::make_tensor(cute::make_gmem_ptr(static_cast<ElementA*>(nullptr)),
-                                                cute::make_layout(ShapeTensor{}, StrideO{})),
+                                                cute::make_layout(ShapeO5{}, StrideO5{})),
             SmemLayoutO{}));
 
     // ---- TensorStorage ----
-    // o_exchange/o_staging are used by correction (in mainloop) via SharedStorage union.
-    // sO is the SMEM staging buffer for TMA store.
     static constexpr int kCSpan = 128;
-    static constexpr int kExchangePerWarp = kCSpan * 32;  // 128 cols × 32 lanes = 4096 floats
+    static constexpr int kExchangePerWarp = kCSpan * 32;
     struct TensorStorage {
-        alignas(16) float o_exchange[4][kExchangePerWarp];  // 4 * 16KB = 64KB
-        alignas(16) float o_staging[4][64];                 // 4 * 256B = 1KB (stats only)
-        alignas(128) cute::ArrayEngine<ElementA, cute::cosize_v<SmemLayoutO>> sO;  // 16KB
+        alignas(16) float o_exchange[4][kExchangePerWarp];
+        alignas(16) float o_staging[4][64];
+        alignas(128) cute::ArrayEngine<ElementA, cute::cosize_v<SmemLayoutO>> sO;
     };
 
-    // ---- Arguments (host-side) ----
-    struct Arguments {
-        ElementA* ptr_O;
-        float* ptr_LSE = nullptr;  // (batch * heads * num_row_tiles * kRows,) or nullptr
-    };
-
-    // ---- Params (device-side) ----
-    struct Params {
-        TMA_O tma_store_O;
-        ShapeTensor shape_O;
-        int num_heads = 1;
-        int num_row_tiles = 1;
-        float* ptr_LSE = nullptr;
-    };
-
-    // ---- Convert Arguments -> Params ----
-    static Params
-    to_underlying_arguments(Arguments const& args, int rows_padded, int heads, int batch = 1) {
+    // ---- Static TMA construction (called from run_bsa_fwd) ----
+    static TMA_O make_tma_store_O(bsa_fwd_params const& p) {
         using namespace cute;
-        int const num_row_tiles = rows_padded / kRows;
-
-        auto shape_o  = make_shape(kRows, kOutputCols, batch * heads * num_row_tiles);
-        auto stride_o = make_stride(Int<kOutputCols>{}, _1{}, kRows * kOutputCols);
-        auto tma_o = make_tma_copy(SM90_TMA_STORE{},
-                make_tensor(make_gmem_ptr(args.ptr_O), make_layout(shape_o, stride_o)),
+        // 5D TMA store to BSHD: (kRows, kOutputCols, H, num_m_blocks, B)
+        auto shape_o  = make_shape(Int<kRows>{}, Int<kOutputCols>{}, p.h, p.num_m_blocks, p.b);
+        auto stride_o = make_stride(int(p.o_row_stride), _1{}, int(p.o_head_stride),
+                                    kRows * int(p.o_row_stride), p.o_batch_stride);
+        return make_tma_copy(SM90_TMA_STORE{},
+                make_tensor(make_gmem_ptr(static_cast<ElementA*>(p.o_ptr)),
+                            make_layout(shape_o, stride_o)),
                 SmemLayoutO{});
+    }
 
-        return {tma_o, shape_o, heads, num_row_tiles, args.ptr_LSE};
+    static ShapeO5 make_shape_O(bsa_fwd_params const& p) {
+        using namespace cute;
+        return make_shape(Int<kRows>{}, Int<kOutputCols>{}, p.h, p.num_m_blocks, p.b);
     }
 
     // ===========================================================================
@@ -89,16 +75,17 @@ struct CollectiveEpilogueFwd {
     // ===========================================================================
 
     struct EpiState {
-        int o_epi_phase = 0;  // consumer_wait phase on OEpi (stage 0 only, phase alternates)
+        int o_epi_phase = 0;
     };
 
-    CUTLASS_DEVICE static void prefetch_tma_descriptors(Params const& params) {
+    template<typename KernelParams>
+    CUTLASS_DEVICE static void prefetch_tma_descriptors(KernelParams const& params) {
         cute::prefetch_tma_descriptor(params.tma_store_O.get_tma_descriptor());
     }
 
-    template<typename SharedStorage>
+    template<typename KernelParams, typename SharedStorage>
     CUTLASS_DEVICE EpiState tma_store(
-            Params const& params, PipelineOEpi& pipeline_o_epi,
+            KernelParams const& params, PipelineOEpi& pipeline_o_epi,
             SharedStorage& shared_storage,
             int head, int row_tile, int batch, int num_row_tiles,
             EpiState state)
@@ -107,18 +94,20 @@ struct CollectiveEpilogueFwd {
         auto& el = shared_storage.tensors.epilogue;
 
         if (elect_one_sync()) {
-            flash::consumer_wait_w_index_phase(shared_storage.pipelines.o_epi, 0, state.o_epi_phase);
+            PipeState epi_wait_state(0, state.o_epi_phase, 0);
+            pipeline_o_epi.consumer_wait(epi_wait_state);
+            state.o_epi_phase ^= 1;
 
-            int o_tile_idx = (batch * params.num_heads + head) * params.num_row_tiles + row_tile;
             auto thr_tma_o = params.tma_store_O.get_slice(Int<0>{});
             auto sO = make_tensor(make_smem_ptr(el.sO.begin()), SmemLayoutO{});
             Tensor gO_full = params.tma_store_O.get_tma_tensor(params.shape_O);
-            Tensor gO_tile = gO_full(_, _, o_tile_idx);
+            // 5D indexing: (_, _, head, row_tile, batch)
+            Tensor gO_tile = gO_full(_, _, head, row_tile, batch);
             cute::copy(params.tma_store_O, thr_tma_o.partition_S(sO), thr_tma_o.partition_D(gO_tile));
             tma_store_arrive();
             tma_store_wait<0>();
 
-            flash::consumer_release_cta_w_index(shared_storage.pipelines.o_epi, 0);
+            pipeline_o_epi.consumer_release(PipeState(0, 0, 0));
         }
         return state;
     }
