@@ -737,6 +737,7 @@ struct CollectiveMainloopFwd {
 
         // 4. Notify correction
         NamedBarrier::arrive(kSmStatsNotifyThreads, sm_stats_bar);
+        asm volatile("membar.cta;\n" ::: "memory");
 
         // 5. scale_subtract_rowmax (separate FMA pass, matches blk128)
         {
@@ -759,7 +760,7 @@ struct CollectiveMainloopFwd {
 
             CUTLASS_PRAGMA_UNROLL
             for (int frag = 0; frag < kFrgCount; ++frag) {
-                // exp2 in-place
+                // exp2 in-place (with partial FMA emulation)
                 CUTLASS_PRAGMA_UNROLL
                 for (int i = 0; i < kFrgTile; i += 2) {
                     if (frag < kEmuStartFrg || frag >= kFrgCount - 1 ||
@@ -788,7 +789,6 @@ struct CollectiveMainloopFwd {
                 if (frag + 1 == kFrgCount * kSplitNumer / kSplitDenom) {
                     cutlass::arch::fence_view_async_tmem_store();
                     pipeline_s_p_o.consumer_release(spo_state);
-                    // Advance spo_state by 2: stay on same Stage, flip phase
                     ++spo_state; ++spo_state;
                 }
             }
