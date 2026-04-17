@@ -105,21 +105,29 @@ struct CollectiveMainloopFwd {
             cute::Step<cute::_1, cute::_2>{}), cute::Shape<cute::_1, cute::_1>{}));
 
     // ---- TMA types ----
-    // Q 5D from BSHD: (kRows, kQkK, H, num_m_blocks, B)
+    // Q 5D from BHSD: (kRows, kQkK, H, num_m_blocks, B)
+    // Row/head/batch strides are runtime (from bsa_fwd_params) so the same TMA type
+    // supports any 4D physical layout (BSHD, BHSD, ...) as long as dim 3 is contiguous.
     using ShapeQ5 = cute::Shape<cute::Int<kRows>, cute::Int<kQkK>, int, int, int>;
     using StrideQ5 = cute::Stride<int, cute::_1, int, int, int64_t>;
-    // K/V 5D from BSHD: (64, 64, 2*H_k, blocks, B)
-    using ShapeKV5 = cute::Shape<cute::Int<kSparseBlockSize>, cute::Int<kDimHalf>, int, int, int>;
-    using StrideKV5 = cute::Stride<int, cute::_1, cute::Int<kDimHalf>, int, int64_t>;
+    // K/V 6D from BHSD: (64_tok, 64_dim_half, 2_halves, H_k, blocks, B)
+    // Splitting head and dim_half into separate modes lets the head stride stay
+    // runtime (= k_head_stride), so the kernel works for any contiguous layout
+    // of (B, H, S, D) or (B, S, H, D). The 2_halves mode keeps its static
+    // stride of kDimHalf since the two halves are adjacent inside head_dim=128.
+    using ShapeKV6 = cute::Shape<cute::Int<kSparseBlockSize>, cute::Int<kDimHalf>,
+                                 cute::Int<kDimHalves>, int, int, int>;
+    using StrideKV6 = cute::Stride<int, cute::_1,
+                                   cute::Int<kDimHalf>, int, int, int64_t>;
 
     using TMA_Q = decltype(cute::make_tma_copy(cute::SM90_TMA_LOAD{},
             cute::make_tensor(cute::make_gmem_ptr(static_cast<ElementA const*>(nullptr)),
                                                 cute::make_layout(ShapeQ5{}, StrideQ5{})),
             SmemLayoutQ{}));
-    // K/V: same TMA type (K-major, 5D BSHD)
+    // K/V: same TMA type (K-major sub-tile, 6D indexing)
     using TMA_KV = decltype(cute::make_tma_copy(cute::SM90_TMA_LOAD{},
             cute::make_tensor(cute::make_gmem_ptr(static_cast<ElementB const*>(nullptr)),
-                                                cute::make_layout(ShapeKV5{}, StrideKV5{})),
+                                                cute::make_layout(ShapeKV6{}, StrideKV6{})),
             SmemLayoutSubTile{}));
 
     // ---- TensorStorage ----
@@ -155,9 +163,13 @@ struct CollectiveMainloopFwd {
         using namespace cute;
         int const total_sparse_blocks = p.seqlen_k_rounded / kSparseBlockSize;
         int stride_S = int(p.k_row_stride);
+        int stride_H = int(p.k_head_stride);
+        // 6D: (64_tok, 64_dim_half, 2_halves, H_k, sparse_blocks, B)
         auto shape_k  = make_shape(Int<kSparseBlockSize>{}, Int<kDimHalf>{},
-                                   kDimHalves * p.h_k, total_sparse_blocks, p.b);
-        auto stride_k = make_stride(stride_S, _1{}, Int<kDimHalf>{},
+                                   Int<kDimHalves>{}, p.h_k,
+                                   total_sparse_blocks, p.b);
+        auto stride_k = make_stride(stride_S, _1{},
+                                    Int<kDimHalf>{}, stride_H,
                                     kSparseBlockSize * stride_S, p.k_batch_stride);
         return make_tma_copy(SM90_TMA_LOAD{},
                 make_tensor(make_gmem_ptr(static_cast<ElementB const*>(p.k_ptr)),
@@ -165,20 +177,25 @@ struct CollectiveMainloopFwd {
                 SmemLayoutSubTile{});
     }
 
-    static ShapeKV5 make_shape_K(bsa_fwd_params const& p) {
+    static ShapeKV6 make_shape_K(bsa_fwd_params const& p) {
         using namespace cute;
         int const total_sparse_blocks = p.seqlen_k_rounded / kSparseBlockSize;
         return make_shape(Int<kSparseBlockSize>{}, Int<kDimHalf>{},
-                          kDimHalves * p.h_k, total_sparse_blocks, p.b);
+                          Int<kDimHalves>{}, p.h_k,
+                          total_sparse_blocks, p.b);
     }
 
     static TMA_KV make_tma_load_V(bsa_fwd_params const& p) {
         using namespace cute;
         int const total_k_blocks = (p.seqlen_k_rounded + kSparseBlockSize - 1) / kSparseBlockSize;
         int stride_S = int(p.v_row_stride);
+        int stride_H = int(p.v_head_stride);
+        // 6D: (64_tok, 64_dim_half, 2_halves, H_k, sparse_blocks, B)
         auto shape_v  = make_shape(Int<kSparseBlockSize>{}, Int<kDimHalf>{},
-                                   kDimHalves * p.h_k, total_k_blocks, p.b);
-        auto stride_v = make_stride(stride_S, _1{}, Int<kDimHalf>{},
+                                   Int<kDimHalves>{}, p.h_k,
+                                   total_k_blocks, p.b);
+        auto stride_v = make_stride(stride_S, _1{},
+                                    Int<kDimHalf>{}, stride_H,
                                     kSparseBlockSize * stride_S, p.v_batch_stride);
         return make_tma_copy(SM90_TMA_LOAD{},
                 make_tensor(make_gmem_ptr(static_cast<ElementB const*>(p.v_ptr)),
@@ -186,11 +203,12 @@ struct CollectiveMainloopFwd {
                 SmemLayoutSubTile{});
     }
 
-    static ShapeKV5 make_shape_V(bsa_fwd_params const& p) {
+    static ShapeKV6 make_shape_V(bsa_fwd_params const& p) {
         using namespace cute;
         int const total_k_blocks = (p.seqlen_k_rounded + kSparseBlockSize - 1) / kSparseBlockSize;
         return make_shape(Int<kSparseBlockSize>{}, Int<kDimHalf>{},
-                          kDimHalves * p.h_k, total_k_blocks, p.b);
+                          Int<kDimHalves>{}, p.h_k,
+                          total_k_blocks, p.b);
     }
 
     // Helper: compute per-tile num_kv_blocks (pipeline iterations) and raw block count.
@@ -288,9 +306,9 @@ struct CollectiveMainloopFwd {
                 int smem_offset = stage_base + slot * kKSubStride + h * kKHalfStride;
                 auto sK_sub = make_tensor(make_smem_ptr(
                         ml.smem_kv.begin() + smem_offset), SmemLayoutSubTile{});
-                // K 5D indexing: (_, _, head*kDimHalves+h, sparse_idx, batch)
+                // K 6D indexing: (_, _, h, head, sparse_idx, batch)
                 cute::copy(params.tma_load_K.with(*tma_bar),
-                        thr_tma_k.partition_S(gK_full(_, _, head * kDimHalves + h, sparse_idx, batch)),
+                        thr_tma_k.partition_S(gK_full(_, _, h, head, sparse_idx, batch)),
                         thr_tma_k.partition_D(sK_sub));
             }
         }
@@ -322,8 +340,9 @@ struct CollectiveMainloopFwd {
                 // V uses K-major sub-tile (same as K; data pre-transposed on host)
                 auto sV_sub = make_tensor(make_smem_ptr(
                         ml.smem_kv.begin() + smem_offset), SmemLayoutSubTile{});
+                // V 6D indexing: (_, _, h, head, sparse_idx, batch)
                 cute::copy(params.tma_load_V.with(*tma_bar),
-                        thr_tma_v.partition_S(gV_full(_, _, head * kDimHalves + h, sparse_idx, batch)),
+                        thr_tma_v.partition_S(gV_full(_, _, h, head, sparse_idx, batch)),
                         thr_tma_v.partition_D(sV_sub));
             }
         }

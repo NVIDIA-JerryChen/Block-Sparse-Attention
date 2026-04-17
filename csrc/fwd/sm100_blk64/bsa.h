@@ -12,7 +12,7 @@
 struct bsa_fwd_params {
     using index_t = int64_t;
 
-    // The QKV and O matrices (BSHD layout).
+    // The QKV and O matrices (BHSD layout: batch, num_heads, seqlen, head_dim).
     void const* __restrict__ q_ptr;
     void const* __restrict__ k_ptr;
     void const* __restrict__ v_ptr;

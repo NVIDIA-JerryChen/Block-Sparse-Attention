@@ -120,8 +120,8 @@ struct FusedAttnFwdSm100 {
         typename CollectiveEpilogue::TMA_O tma_store_O;
 
         typename CollectiveMainloop::ShapeQ5 shape_Q;
-        typename CollectiveMainloop::ShapeKV5 shape_K;
-        typename CollectiveMainloop::ShapeKV5 shape_V;
+        typename CollectiveMainloop::ShapeKV6 shape_K;
+        typename CollectiveMainloop::ShapeKV6 shape_V;
         typename CollectiveEpilogue::ShapeO5 shape_O;
     };
 

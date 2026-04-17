@@ -35,10 +35,11 @@ void set_params_fprop(bsa_fwd_params &params,
     params.o_ptr = out.data_ptr();
     params.softmax_lse_ptr = lse.data_ptr();
 
-    params.q_batch_stride = q.stride(0); params.q_row_stride = q.stride(1); params.q_head_stride = q.stride(2);
-    params.k_batch_stride = k.stride(0); params.k_row_stride = k.stride(1); params.k_head_stride = k.stride(2);
-    params.v_batch_stride = v.stride(0); params.v_row_stride = v.stride(1); params.v_head_stride = v.stride(2);
-    params.o_batch_stride = out.stride(0); params.o_row_stride = out.stride(1); params.o_head_stride = out.stride(2);
+    // BHSD layout: dim 0=batch, dim 1=head, dim 2=row (seq), dim 3=head_dim (stride=1).
+    params.q_batch_stride = q.stride(0); params.q_head_stride = q.stride(1); params.q_row_stride = q.stride(2);
+    params.k_batch_stride = k.stride(0); params.k_head_stride = k.stride(1); params.k_row_stride = k.stride(2);
+    params.v_batch_stride = v.stride(0); params.v_head_stride = v.stride(1); params.v_row_stride = v.stride(2);
+    params.o_batch_stride = out.stride(0); params.o_head_stride = out.stride(1); params.o_row_stride = out.stride(2);
 
     params.block_indices_ptr = block_indices.data_ptr<int>();
     params.block_sizes_ptr = block_sizes.defined() && block_sizes.numel() > 0
@@ -63,15 +64,22 @@ std::tuple<torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_impl(
         torch::Tensor block_sizes, double softmax_scale,
         torch::Tensor q2k_block_nums)
 {
+    // BHSD tensor convention: (batch, num_heads, seqlen, head_dim)
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "q/k/v must be CUDA");
     TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "q/k/v must be 4D");
     TORCH_CHECK(q.size(3) == 128, "requires D=128");
+    TORCH_CHECK(q.size(0) == k.size(0) && q.size(0) == v.size(0),
+                "q/k/v batch size mismatch");
+    TORCH_CHECK(q.size(1) == k.size(1) && q.size(1) == v.size(1),
+                "blk64 requires MHA: q/k/v must share num_heads (size(1))");
+    TORCH_CHECK(k.size(2) == v.size(2), "k/v seqlen mismatch");
+    TORCH_CHECK(v.size(3) == q.size(3), "v head_dim mismatch");
 
     const bool has_var_block_nums = q2k_block_nums.defined() && q2k_block_nums.numel() > 0;
 
-    const int b = q.size(0), seqlen_q = q.size(1), h = q.size(2), d = q.size(3);
-    const int seqlen_k = k.size(1);
-    const int h_k = k.size(2);
+    const int b = q.size(0), h = q.size(1), seqlen_q = q.size(2), d = q.size(3);
+    const int seqlen_k = k.size(2);
+    const int h_k = k.size(1);
 
     constexpr int kRows = 64, kSparseBlockSize = 64;
     constexpr int kOutputCols = 128;
@@ -79,7 +87,7 @@ std::tuple<torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_impl(
     const int seqlen_k_rounded = ((seqlen_k + kSparseBlockSize - 1) / kSparseBlockSize) * kSparseBlockSize;
     const int num_m_blocks = seqlen_q_rounded / kRows;
 
-    // ======== Q/K passed directly in BSHD (5D TMA handles strided access) ========
+    // ======== Q/K passed directly in BHSD (5D TMA handles strided access) ========
     // Python interface ensures seqlen_q/seqlen_k are multiples of kRows/kSparseBlockSize.
     torch::Tensor q_contig = q.contiguous();
     torch::Tensor k_contig = k.contiguous();
@@ -87,16 +95,19 @@ std::tuple<torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_impl(
     // V: sub-tile transpose (swap token↔dim within each 64×64 block).
     // Required because PV dual GEMM reduces over K direction (= tokens),
     // and K-major SMEM layout makes dim 1 contiguous.
+    // BHSD input layout: (b, h_k, total_sparse_blocks, kSparseBlockSize, kDimHalves, kDimHalf)
+    //   axes:            [ 0,   1,         2,                 3,              4,          5   ]
+    // Swap axis 3 (tokens) <-> axis 5 (dim_half) within each 64x64 sub-tile.
     constexpr int kDimHalf = 64;    // kDualK / 2
     constexpr int kDimHalves = 2;
     int total_sparse_blocks = seqlen_k_rounded / kSparseBlockSize;
-    torch::Tensor v_contig = v.view({b, total_sparse_blocks, kSparseBlockSize, h_k, kDimHalves, kDimHalf})
-                              .permute({0, 1, 5, 3, 4, 2})
-                              .reshape({b, seqlen_k_rounded, h_k, d})
+    torch::Tensor v_contig = v.view({b, h_k, total_sparse_blocks, kSparseBlockSize, kDimHalves, kDimHalf})
+                              .permute({0, 1, 2, 5, 4, 3})
+                              .reshape({b, h_k, seqlen_k_rounded, d})
                               .contiguous();
 
-    // ======== Output (BSHD, torch::empty) ========
-    auto out = torch::empty({b, seqlen_q_rounded, h, kOutputCols}, q.options());
+    // ======== Output (BHSD, torch::empty) ========
+    auto out = torch::empty({b, h, seqlen_q_rounded, kOutputCols}, q.options());
     auto lse = torch::empty({b, h, seqlen_q_rounded},
                             torch::dtype(torch::kFloat32).device(q.device()));
 
@@ -135,7 +146,7 @@ std::tuple<torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_impl(
         });
     });
 
-    // ======== Return BSHD output directly (Python handles slicing) ========
+    // ======== Return BHSD output directly (Python handles slicing) ========
     return std::make_tuple(out, lse);
 }
 
