@@ -10,11 +10,13 @@
 #include <c10/cuda/CUDAStream.h>
 
 #include "bsa.h"
+#include "static_switch.h"
 
 namespace flash {
 
-// Defined in bsa_fwd_launch_template.h, instantiated in instantiations/bsa_fwd_hdim128_bf16_sm100.cu
-template<int kHeadDim> void run_bsa_fwd(bsa_fwd_params const&, cudaStream_t);
+// Defined in bsa_fwd_launch_template.h, instantiated in instantiations/bsa_fwd_hdim128_bf16_{has,no}_bs_sm100.cu
+template<int kHeadDim, bool HasBlockSizes>
+void run_bsa_fwd(bsa_fwd_params const&, cudaStream_t);
 
 // FA Hopper pattern: populate bsa_fwd_params from torch tensors.
 void set_params_fprop(bsa_fwd_params &params,
@@ -126,7 +128,10 @@ std::tuple<torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_impl(
                      seqlen_q_rounded, seqlen_k_rounded);
 
     auto stream = c10::cuda::getCurrentCUDAStream(q.device().index()).stream();
-    run_bsa_fwd<128>(params, stream);
+    const bool has_block_sizes = (params.block_sizes_ptr != nullptr);
+    BOOL_SWITCH(has_block_sizes, HAS_BLOCK_SIZES, [&] {
+        run_bsa_fwd<128, HAS_BLOCK_SIZES>(params, stream);
+    });
 
     // ======== Return BSHD output directly (Python handles slicing) ========
     return std::make_tuple(out, lse);

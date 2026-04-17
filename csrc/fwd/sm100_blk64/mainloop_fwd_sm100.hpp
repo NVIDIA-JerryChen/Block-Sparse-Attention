@@ -724,7 +724,9 @@ struct CollectiveMainloopFwd {
             flash::tmem_load<kFrgTile>(tmem_s_cur + c * kFrgTile, &tSrS_t2r(c * kFrgTile));
         }
 
-        // 2b. Block-size mask (R2P bitmask pattern, matches blk128 mask.py)
+        // 2b. Block-size mask (R2P bitmask pattern, matches blk128 mask.py).
+        // block_size == kSparseBlockSize makes the mask a no-op (see apply_block_size_mask);
+        // block_size == 0 masks the whole sub-block (used for phantom blocks).
         apply_block_size_mask(tSrS_t2r, block_size_lo, 0);
         apply_block_size_mask(tSrS_t2r, block_size_hi, kSparseBlockSize);
 
@@ -812,7 +814,8 @@ struct CollectiveMainloopFwd {
 
     // Softmax outer loop (BSA: softmax_loop).
     // Stage is compile-time: enables constant folding for TMEM addresses, barrier IDs.
-    template<int Stage, typename SharedStorage, typename NamedBarriers>
+    template<int Stage, bool HasBlockSizes,
+             typename SharedStorage, typename NamedBarriers>
     CUTLASS_DEVICE SoftmaxState softmax(
             PipelineSPO& pipeline_s_p_o,
             PipelineSmStats& pipeline_sm_stats,
@@ -846,17 +849,24 @@ struct CollectiveMainloopFwd {
         // sub_lo = warp_col, sub_hi = warp_col + 2 (avoids array indexing → no LDL)
         const int warp_col = warp_in_wg / 2;
 
+        // HasBlockSizes=true:  look up per-block size via ptr_block_sizes; phantom → 0.
+        // HasBlockSizes=false: per-block size uniformly kSparseBlockSize; phantom → 0
+        //                     (mask still required so padded-out tail blocks contribute 0).
         auto get_block_sizes = [&] (int k, int& bs_lo, int& bs_hi) {
             int kv_block = num_kv_blocks - 1 - (2 * k + Stage);
             int logical_lo = kv_block * kSparseBlocksPerKV + warp_col;
             int logical_hi = kv_block * kSparseBlocksPerKV + warp_col + 2;
-            // Phantom block detection: index >= raw_block_count → block_size=0 (all masked)
-            int clamped_lo = (logical_lo < raw_block_count) ? logical_lo : max(raw_block_count - 1, 0);
-            int clamped_hi = (logical_hi < raw_block_count) ? logical_hi : max(raw_block_count - 1, 0);
-            int bi_lo = tile_block_indices[clamped_lo];
-            int bi_hi = tile_block_indices[clamped_hi];
-            bs_lo = (logical_lo < raw_block_count) ? ptr_block_sizes[bi_lo] : 0;
-            bs_hi = (logical_hi < raw_block_count) ? ptr_block_sizes[bi_hi] : 0;
+            if constexpr (HasBlockSizes) {
+                int clamped_lo = (logical_lo < raw_block_count) ? logical_lo : max(raw_block_count - 1, 0);
+                int clamped_hi = (logical_hi < raw_block_count) ? logical_hi : max(raw_block_count - 1, 0);
+                int bi_lo = tile_block_indices[clamped_lo];
+                int bi_hi = tile_block_indices[clamped_hi];
+                bs_lo = (logical_lo < raw_block_count) ? ptr_block_sizes[bi_lo] : 0;
+                bs_hi = (logical_hi < raw_block_count) ? ptr_block_sizes[bi_hi] : 0;
+            } else {
+                bs_lo = (logical_lo < raw_block_count) ? kSparseBlockSize : 0;
+                bs_hi = (logical_hi < raw_block_count) ? kSparseBlockSize : 0;
+            }
         };
 
         // BSA: acquire before loop

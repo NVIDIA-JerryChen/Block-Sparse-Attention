@@ -212,10 +212,14 @@ def pack_gqa_attn_bias(attn_bias_kv, nheads, qhead_per_kvhead, seqlen_q):
 # ============== Correctness helpers ==============
 
 def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloat16,
-                  use_variable_block_nums=False, blk_m=128, blk_n=128):
+                  use_variable_block_nums=False, use_block_sizes=True,
+                  blk_m=128, blk_n=128):
     """Run a single correctness test with random block-sparse pattern.
 
     blk_m/blk_n: block sizes. blk_n=64 routes to blk64 C++ AOT kernel.
+    use_block_sizes=False exercises the HasBlockSizes=false kernel path
+    (block_sizes passed as None / empty tensor; all KV tokens treated as valid).
+    Requires seqlen_k % blk_n == 0 so every KV block is fully populated.
     """
     device = "cuda"
     torch.manual_seed(0)
@@ -255,6 +259,19 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
             bs, seqlen_q_q2k, seqlen_k, nheads_q2k, blk_m=blk_m, blk_n=blk_n, device=device,
         )
 
+    # HasBlockSizes=false path: kernel receives None/empty block_sizes,
+    # reference must assume every KV block is fully populated (blk_n tokens).
+    if use_block_sizes:
+        block_sizes_kernel = block_sizes
+    else:
+        assert seqlen_k % blk_n == 0, (
+            f"use_block_sizes=False requires seqlen_k % blk_n == 0 "
+            f"(got seqlen_k={seqlen_k}, blk_n={blk_n})"
+        )
+        num_kv_blocks = seqlen_k // blk_n
+        block_sizes = torch.full((num_kv_blocks,), blk_n, dtype=torch.int32, device=device)
+        block_sizes_kernel = None
+
     attn_bias_kv = block_sparse_to_attn_bias(
         q2k_block_index, block_sparse_num, block_sizes, seqlen_q_q2k, seqlen_k,
         blk_m=blk_m, blk_n=blk_n, q2k_block_nums=q2k_block_nums,
@@ -283,10 +300,11 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
     if is_blk64:
         softmax_scale = 1.0 / math.sqrt(d)
         bn_arg = q2k_block_nums if use_variable_block_nums else torch.Tensor()
+        bs_arg = block_sizes_kernel if block_sizes_kernel is not None else torch.Tensor()
         out, lse = torch.ops.bsa_blk64.fwd(
-            q, k, v, q2k_block_index, block_sparse_num, block_sizes, softmax_scale, bn_arg)
+            q, k, v, q2k_block_index, block_sparse_num, bs_arg, softmax_scale, bn_arg)
     else:
-        out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes,
+        out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes_kernel,
                                  q2k_block_nums=q2k_block_nums, return_lse=True)
     out = torch.nan_to_num(out, nan=0.0)
 
@@ -306,6 +324,7 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
 
     blk_str = f" blk={blk_n}" if blk_n != 128 else ""
     mode_str = "var_bsn" if use_variable_block_nums else f"sparse_num={block_sparse_num}"
+    mode_str += " no_bs" if not use_block_sizes else ""
     tag = "PASS" if passed else "FAIL"
     print(
         f"  {tag} bs={bs} sq={seqlen_q} sk={seqlen_k} h={nheads}/{nheads_kv} d={d} "
@@ -344,6 +363,25 @@ def test_flash_fwd_sm100(seqlen_q, seqlen_k, d, mha_type, dtype, use_variable_bl
     blk_m = 64 if blk_n == 64 else 128
     _test_single(batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype,
                   use_variable_block_nums=use_variable_block_nums,
+                  blk_m=blk_m, blk_n=blk_n)
+
+
+# HasBlockSizes=false coverage (independent from main matrix; seqlen_k % blk_n == 0 required).
+# 2 × 2 × 3 = 12 testcases per blk, covering both (no_bs, no_vbn) and (no_bs, has_vbn).
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("use_variable_block_nums", [False, True])
+@pytest.mark.parametrize("blk_n", _BLK_SIZES)
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [(128, 512), (256, 1024), (1024, 1024)],
+)
+def test_flash_fwd_sm100_no_block_sizes(seqlen_q, seqlen_k, dtype, use_variable_block_nums, blk_n):
+    batch_size = 2
+    nheads = 4
+    blk_m = 64 if blk_n == 64 else 128
+    _test_single(batch_size, seqlen_q, seqlen_k, nheads, nheads, 128, dtype,
+                  use_variable_block_nums=use_variable_block_nums,
+                  use_block_sizes=False,
                   blk_m=blk_m, blk_n=blk_n)
 
 
@@ -409,6 +447,39 @@ def run_quick_tests():
         for bs, sq, sk, hq, hk, d in var_configs_64:
             _test_single(bs, sq, sk, hq, hk, d, use_variable_block_nums=True,
                           blk_m=64, blk_n=64)
+
+    # block_sizes=None path (HasBlockSizes=false): requires seqlen_k % blk_n == 0
+    if 128 in _BLK_SIZES:
+        print("-" * 70)
+        print("No-block_sizes tests (blk128)")
+        no_bs_configs_128 = [
+            (1, 128, 512, 4, 4, 128),                                 # fixed bsn
+            (1, 256, 1024, 4, 4, 128),                                # fixed bsn
+            (1, 128, 512, 4, 4, 128, True),                           # var bsn
+            (1, 256, 1024, 4, 4, 128, True),                          # var bsn
+        ]
+        for cfg in no_bs_configs_128:
+            bs, sq, sk, hq, hk, d = cfg[:6]
+            use_var = cfg[6] if len(cfg) > 6 else False
+            _test_single(bs, sq, sk, hq, hk, d, use_variable_block_nums=use_var,
+                          use_block_sizes=False)
+
+    if HAS_BLK64 and 64 in _BLK_SIZES:
+        print("-" * 70)
+        print("No-block_sizes tests (blk64)")
+        no_bs_configs_64 = [
+            (1, 128, 512, 4, 4, 128),                                 # fixed bsn, no-bs, no-vbn
+            (1, 256, 1024, 4, 4, 128),                                # fixed bsn, no-bs, no-vbn
+            (1, 1024, 1024, 4, 4, 128),                               # fixed bsn, no-bs, no-vbn
+            (1, 128, 512, 4, 4, 128, True),                           # var bsn,   no-bs, has-vbn
+            (1, 256, 1024, 4, 4, 128, True),                          # var bsn,   no-bs, has-vbn
+            (4, 1024, 1024, 4, 4, 128, True),                         # var bsn,   no-bs, has-vbn
+        ]
+        for cfg in no_bs_configs_64:
+            bs, sq, sk, hq, hk, d = cfg[:6]
+            use_var = cfg[6] if len(cfg) > 6 else False
+            _test_single(bs, sq, sk, hq, hk, d, use_variable_block_nums=use_var,
+                          use_block_sizes=False, blk_m=64, blk_n=64)
 
     print("=" * 70)
     print("All quick tests passed.")

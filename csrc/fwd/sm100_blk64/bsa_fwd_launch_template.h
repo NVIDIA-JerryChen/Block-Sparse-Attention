@@ -16,14 +16,14 @@
 
 namespace flash {
 
-template<int kHeadDim>
+template<int kHeadDim, bool HasBlockSizes>
 void run_bsa_fwd(bsa_fwd_params const& p, cudaStream_t stream) {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
     using namespace cute;
 
-    using Kernel = FusedAttnKernel;
-    using ML = Kernel::CollectiveMainloop;
-    using EL = Kernel::CollectiveEpilogue;
+    using Kernel = FusedAttnKernel<HasBlockSizes>;
+    using ML = typename Kernel::CollectiveMainloop;
+    using EL = typename Kernel::CollectiveEpilogue;
 
     // Build TMA descriptors from bsa_fwd_params
     auto tma_q = ML::make_tma_load_Q(p);

@@ -42,7 +42,8 @@ __device__ __forceinline__ void warpgroup_reg_set() {
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 
-template<typename CollectiveMainloop_, typename CollectiveEpilogue_, typename TileScheduler_>
+template<typename CollectiveMainloop_, typename CollectiveEpilogue_,
+         typename TileScheduler_, bool HasBlockSizes>
 struct FusedAttnFwdSm100 {
     using CollectiveMainloop = CollectiveMainloop_;
     using CollectiveEpilogue = CollectiveEpilogue_;
@@ -306,7 +307,7 @@ struct FusedAttnFwdSm100 {
                 tile_bi = params.fwd.block_indices_ptr
                         + tile_idx * params.fwd.block_indices_stride;
             }
-            softmax1_state = mainloop.template softmax</*Stage=*/1, SharedStorage, NamedBarriers>(
+            softmax1_state = mainloop.template softmax</*Stage=*/1, HasBlockSizes, SharedStorage, NamedBarriers>(
                     pipeline_s_p_o, pipeline_sm_stats, pipeline_p_lastsplit,
                     shared_storage, tmem_base, params.fwd.scale_softmax_log2, tile_nkv, softmax1_state,
                     tile_bi, params.fwd.block_sizes_ptr,
@@ -330,7 +331,7 @@ struct FusedAttnFwdSm100 {
                 tile_bi = params.fwd.block_indices_ptr
                         + tile_idx * params.fwd.block_indices_stride;
             }
-            softmax0_state = mainloop.template softmax</*Stage=*/0, SharedStorage, NamedBarriers>(
+            softmax0_state = mainloop.template softmax</*Stage=*/0, HasBlockSizes, SharedStorage, NamedBarriers>(
                     pipeline_s_p_o, pipeline_sm_stats, pipeline_p_lastsplit,
                     shared_storage, tmem_base, params.fwd.scale_softmax_log2, tile_nkv, softmax0_state,
                     tile_bi, params.fwd.block_sizes_ptr,
@@ -350,7 +351,9 @@ fused_attn_device(
     kernel(params, shared_memory);
 }
 
-using FusedAttnKernel = FusedAttnFwdSm100<CollectiveMainloopFwd, CollectiveEpilogueFwd, SingleTileScheduler>;
+template<bool HasBlockSizes>
+using FusedAttnKernel = FusedAttnFwdSm100<CollectiveMainloopFwd, CollectiveEpilogueFwd,
+                                          SingleTileScheduler, HasBlockSizes>;
 
 #endif
 } // namespace flash
