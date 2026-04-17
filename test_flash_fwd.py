@@ -301,15 +301,10 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
         softmax_scale = 1.0 / math.sqrt(d)
         bn_arg = q2k_block_nums if use_variable_block_nums else torch.Tensor()
         bs_arg = block_sizes_kernel if block_sizes_kernel is not None else torch.Tensor()
-        # blk64 kernel consumes BHSD natively; convert from BSHD test tensors
-        # at the boundary and convert the BHSD output back to BSHD for reference.
-        q_bhsd = q.transpose(1, 2).contiguous()
-        k_bhsd = k.transpose(1, 2).contiguous()
-        v_bhsd = v.transpose(1, 2).contiguous()
-        out_bhsd, lse = torch.ops.bsa_blk64.fwd(
-            q_bhsd, k_bhsd, v_bhsd, q2k_block_index, block_sparse_num,
+        # blk64 kernel is BSHD-only; test tensors are already BSHD so zero-copy.
+        out, lse = torch.ops.bsa_blk64.fwd(
+            q, k, v, q2k_block_index, block_sparse_num,
             bs_arg, softmax_scale, bn_arg)
-        out = out_bhsd.transpose(1, 2).contiguous()
     else:
         out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes_kernel,
                                  q2k_block_nums=q2k_block_nums, return_lse=True)
@@ -506,13 +501,11 @@ def _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n,
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
         bn_arg = q2k_block_nums if q2k_block_nums is not None else torch.Tensor()
         bs_arg = block_sizes if block_sizes is not None else torch.Tensor()
-        q_bhsd = q.transpose(1, 2).contiguous()
-        k_bhsd = k.transpose(1, 2).contiguous()
-        v_bhsd = v.transpose(1, 2).contiguous()
-        out_bhsd, _ = torch.ops.bsa_blk64.fwd(
-            q_bhsd, k_bhsd, v_bhsd, q2k_block_index, block_sparse_num,
+        # blk64 is BSHD-only — test tensors are already BSHD.
+        out, _ = torch.ops.bsa_blk64.fwd(
+            q, k, v, q2k_block_index, block_sparse_num,
             bs_arg, softmax_scale, bn_arg)
-        return out_bhsd.transpose(1, 2).contiguous()
+        return out
     else:
         return bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes,
                              q2k_block_nums=q2k_block_nums)[0]

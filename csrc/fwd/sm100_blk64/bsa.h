@@ -12,13 +12,14 @@
 struct bsa_fwd_params {
     using index_t = int64_t;
 
-    // The QKV and O matrices (BHSD layout: batch, num_heads, seqlen, head_dim).
+    // The QKV and O matrices (BSHD layout: batch, seqlen, num_heads, head_dim).
     void const* __restrict__ q_ptr;
     void const* __restrict__ k_ptr;
     void const* __restrict__ v_ptr;
     void*       __restrict__ o_ptr;
 
-    // The stride between rows of the Q, K, V and O matrices (in elements).
+    // The stride between axes of the Q, K, V and O matrices (in elements).
+    // row_stride is along the seqlen axis; head_stride is along the num_heads axis.
     index_t q_batch_stride, q_row_stride, q_head_stride;
     index_t k_batch_stride, k_row_stride, k_head_stride;
     index_t v_batch_stride, v_row_stride, v_head_stride;
@@ -35,10 +36,10 @@ struct bsa_fwd_params {
     // The dimensions.
     int b, seqlen_q, seqlen_k, d;
     int h, h_k;
-    int seqlen_q_rounded, seqlen_k_rounded;
+    int seqlen_k_rounded;    // used by K/V TMA descriptors to size the sparse-block axis
 
     // Tile counts.
-    int num_m_blocks;       // seqlen_q_rounded / kRows
+    int num_m_blocks;       // ceil(seqlen_q / kRows)
 
     // Sparse config.
     int block_indices_stride;

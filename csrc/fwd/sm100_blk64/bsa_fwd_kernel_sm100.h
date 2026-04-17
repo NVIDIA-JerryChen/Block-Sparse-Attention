@@ -115,14 +115,14 @@ struct FusedAttnFwdSm100 {
         bsa_fwd_params fwd;
 
         typename CollectiveMainloop::TMA_Q tma_load_Q;
-        typename CollectiveMainloop::TMA_KV tma_load_K;
-        typename CollectiveMainloop::TMA_KV tma_load_V;
+        typename CollectiveMainloop::TMA_K tma_load_K;
+        typename CollectiveMainloop::TMA_V tma_load_V;
         typename CollectiveEpilogue::TMA_O tma_store_O;
 
         typename CollectiveMainloop::ShapeQ5 shape_Q;
         typename CollectiveMainloop::ShapeKV6 shape_K;
-        typename CollectiveMainloop::ShapeKV6 shape_V;
-        typename CollectiveEpilogue::ShapeO5 shape_O;
+        typename CollectiveMainloop::ShapeV5 shape_V;
+        typename CollectiveEpilogue::ShapeO4 shape_O;
     };
 
     static dim3 get_grid_shape(Params const& params) {
@@ -278,14 +278,21 @@ struct FusedAttnFwdSm100 {
 
             int tile_nkv = CollectiveMainloop::template get_tile_num_kv_blocks<HasVarBlockNums>(
                     params.fwd, work.batch, work.head, work.m_block);
-            int lse_tile_offset = (work.batch * params.fwd.h + work.head)
-                                  * params.fwd.num_m_blocks + work.m_block;
+            // LSE tile pointer: base + (batch*h + head)*seqlen_q + m_block*kRows.
+            // lse_valid_rows: how many rows in this tile are within actual seqlen_q.
+            float* ptr_LSE_base = static_cast<float*>(params.fwd.softmax_lse_ptr);
+            float* ptr_LSE_tile = (ptr_LSE_base != nullptr)
+                ? ptr_LSE_base + (work.batch * params.fwd.h + work.head) * int64_t(params.fwd.seqlen_q)
+                               + work.m_block * CollectiveMainloop::kRows
+                : nullptr;
+            int lse_valid_rows = params.fwd.seqlen_q - work.m_block * CollectiveMainloop::kRows;
+            if (lse_valid_rows < 0) lse_valid_rows = 0;
             corr_state = mainloop.template correction<SharedStorage, NamedBarriers>(
                     params.fwd.scale_softmax_log2,
                     pipeline_s_p_o, pipeline_sm_stats, pipeline_o_acc, pipeline_o_epi,
                     shared_storage,
                     tmem_base, tile_nkv, corr_state,
-                    static_cast<float*>(params.fwd.softmax_lse_ptr), lse_tile_offset);
+                    ptr_LSE_tile, lse_valid_rows);
             pipeline_o_epi.producer_acquire(corr_state.o_epi_state);
         }
         else if (warp_idx >= 4) {

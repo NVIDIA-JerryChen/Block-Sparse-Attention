@@ -56,25 +56,32 @@ struct CollectiveMainloopFwd {
             kRows, kDualCols,
             cute::UMMA::Major::K, cute::UMMA::Major::K>{}));
 
-    // PV GEMM: ts mode (P in TMEM, V in SMEM) — dual pattern, V same layout as K
+    // PV GEMM: ts mode (P in TMEM, V in SMEM) — dual pattern.
+    // V is MN-major (MN axis = dim, the non-reduction axis for PV). MN-major SMEM
+    // has dim contig, matching natural V (dim contig at stride 1, BSHD or BHSD with
+    // head_dim innermost) — no host V transpose required.
     using PvTiledMma = decltype(cute::make_tiled_mma(cute::SM100_MMA_F16BF16_WS_TS_NOELECT<
             ElementA, ElementB, ElementAccumulator,
             kRows, kDualCols,
-            cute::UMMA::Major::K, cute::UMMA::Major::K>{}));
+            cute::UMMA::Major::K, cute::UMMA::Major::MN>{}));
 
     using ALogicalShape = cute::Shape<cute::Int<kRows>, cute::Int<kDualK>>;
 
     // ---- SMEM layouts ----
     using SmemLayoutQ = decltype(flash::make_umma_k_major_layout<kRows, kQkK, 128, ElementA>());
     using SmemLayoutB = decltype(flash::make_umma_k_major_layout<kOutputCols, kDualCols, 128, ElementB>());
+    // K uses K-major for QK GEMM (K of MMA = dim, dim contig in SMEM matches natural V's dim-contig layout).
     using SmemLayoutBDual = decltype(flash::make_umma_k_major_layout<kDualCols, kDualK, 128, ElementB>());
-
-    // V uses same K-major layout as K (dual GEMM: both reduce over K=dim direction)
+    // V uses MN-major for PV GEMM (MN of MMA = dim, dim contig matches natural V —
+    // no host transpose needed). Same cosize as SmemLayoutBDual, shares smem_kv stage buffer.
+    using SmemLayoutVDual = decltype(flash::make_umma_mn_major_layout<kDualCols, kDualK, 128, ElementB>());
 
     // ---- KV pipeline ----
     static constexpr int kKVStages = 3;
     static constexpr int kKVElemsPerStage = cute::cosize_v<SmemLayoutBDual>;
     static_assert(kKVElemsPerStage == cute::cosize_v<SmemLayoutB>);
+    static_assert(kKVElemsPerStage == cute::cosize_v<SmemLayoutVDual>,
+                  "V MN-major layout must share stage cosize with K-major BDual");
     static constexpr int kKVTotalElems = kKVElemsPerStage * kKVStages;
 
     // ---- TMEM constants (2 S stages + 2 O stages = 512 cols) ----
@@ -98,37 +105,55 @@ struct CollectiveMainloopFwd {
     static constexpr int kKVBytes = kDualCols * kDualK * sizeof(ElementB);
     static constexpr int kSubTileBytes = kSparseBlockSize * kDimHalf * sizeof(ElementB);  // 8KB per TMA
 
-    // ---- Compact (64,64) K-major SMEM layout for sparse TMA ----
+    // ---- Compact (64,64) K-major SMEM layout for K sparse TMA ----
     using SmemLayoutSubTile = decltype(cute::coalesce(cute::tile_to_shape(
             cute::UMMA::Layout_K_SW128_Atom<ElementB>{},
             cute::Shape<cute::Int<kSparseBlockSize>, cute::Int<kDimHalf>>{},
             cute::Step<cute::_1, cute::_2>{}), cute::Shape<cute::_1, cute::_1>{}));
+    // ---- MN-major SMEM sub-tile (128_dim, 64_tok) for V per-sparse-block TMA ----
+    // Derived via composition with the FULL SmemLayoutVDual so sub-tile inherits full's
+    // stride pattern (otherwise byte offsets for mode-1 atoms mismatch: standalone 2048
+    // bytes vs full's 4096 bytes per outer atom step → data corruption).
+    using SmemLayoutVSubTile = decltype(cute::composition(SmemLayoutVDual{},
+            cute::make_layout(cute::Shape<cute::Int<kDualK>, cute::Int<kSparseBlockSize>>{})));
 
     // ---- TMA types ----
-    // Q 5D from BHSD: (kRows, kQkK, H, num_m_blocks, B)
-    // Row/head/batch strides are runtime (from bsa_fwd_params) so the same TMA type
-    // supports any 4D physical layout (BSHD, BHSD, ...) as long as dim 3 is contiguous.
+    // Interface is BSHD (batch, seqlen, num_heads, head_dim). All seqlen/head/batch
+    // strides are runtime (from bsa_fwd_params); head_dim is always stride-1.
+    //
+    // Q 5D: (kRows, kQkK, H, num_m_blocks, B). mode 3 pairs with mode 0 to stride over
+    //   seqlen blocks: effective seq extent = kRows * num_m_blocks.
     using ShapeQ5 = cute::Shape<cute::Int<kRows>, cute::Int<kQkK>, int, int, int>;
     using StrideQ5 = cute::Stride<int, cute::_1, int, int, int64_t>;
-    // K/V 6D from BHSD: (64_tok, 64_dim_half, 2_halves, H_k, blocks, B)
-    // Splitting head and dim_half into separate modes lets the head stride stay
-    // runtime (= k_head_stride), so the kernel works for any contiguous layout
-    // of (B, H, S, D) or (B, S, H, D). The 2_halves mode keeps its static
-    // stride of kDimHalf since the two halves are adjacent inside head_dim=128.
+    // K 6D: (64_tok, 64_dim_half, 2_halves, H_k, sparse_blocks, B). K-major sub-tile
+    //   (mode 1 dim_half contig, stride 1). Mode 0 tok strided by k_row_stride.
     using ShapeKV6 = cute::Shape<cute::Int<kSparseBlockSize>, cute::Int<kDimHalf>,
                                  cute::Int<kDimHalves>, int, int, int>;
     using StrideKV6 = cute::Stride<int, cute::_1,
                                    cute::Int<kDimHalf>, int, int, int64_t>;
+    // V 5D (natural, no host transpose): (128_dim, 64_tok, H_k, sparse_blocks, B).
+    //   Mode 0 (128 dim) stride 1 (contig). Mode 1 (64 tok) stride v_row_stride.
+    //   Per-TMA box = (128_dim, 64_tok) = 1 sparse sub-block = 16KB. 4 TMAs per KV stage.
+    using ShapeV5 = cute::Shape<cute::Int<kDualK>, cute::Int<kSparseBlockSize>,
+                                int, int, int>;
+    using StrideV5 = cute::Stride<cute::_1, int, int, int, int64_t>;
 
     using TMA_Q = decltype(cute::make_tma_copy(cute::SM90_TMA_LOAD{},
             cute::make_tensor(cute::make_gmem_ptr(static_cast<ElementA const*>(nullptr)),
                                                 cute::make_layout(ShapeQ5{}, StrideQ5{})),
             SmemLayoutQ{}));
-    // K/V: same TMA type (K-major sub-tile, 6D indexing)
-    using TMA_KV = decltype(cute::make_tma_copy(cute::SM90_TMA_LOAD{},
+    // K: K-major sub-tile (64,64), 6D indexing.
+    using TMA_K = decltype(cute::make_tma_copy(cute::SM90_TMA_LOAD{},
             cute::make_tensor(cute::make_gmem_ptr(static_cast<ElementB const*>(nullptr)),
                                                 cute::make_layout(ShapeKV6{}, StrideKV6{})),
             SmemLayoutSubTile{}));
+    // V: per-sparse-block (128_dim, 64_tok) sub-tile into MN-major SMEM.
+    // SmemLayoutVSubTile is a composition of the full SmemLayoutVDual so its strides
+    // match full's — avoiding the atom offset mismatch for mode 1.
+    using TMA_V = decltype(cute::make_tma_copy(cute::SM90_TMA_LOAD{},
+            cute::make_tensor(cute::make_gmem_ptr(static_cast<ElementB const*>(nullptr)),
+                                                cute::make_layout(ShapeV5{}, StrideV5{})),
+            SmemLayoutVSubTile{}));
 
     // ---- TensorStorage ----
     struct TensorStorage {
@@ -144,7 +169,7 @@ struct CollectiveMainloopFwd {
 
     static TMA_Q make_tma_load_Q(bsa_fwd_params const& p) {
         using namespace cute;
-        // 5D TMA from BSHD: (kRows, kQkK, H, num_m_blocks, B)
+        // 5D TMA: (kRows, kQkK, H, num_m_blocks, B) — strides are runtime.
         auto shape_q  = make_shape(Int<kRows>{}, Int<kQkK>{}, p.h, p.num_m_blocks, p.b);
         auto stride_q = make_stride(int(p.q_row_stride), _1{}, int(p.q_head_stride),
                                     kRows * int(p.q_row_stride), p.q_batch_stride);
@@ -159,7 +184,7 @@ struct CollectiveMainloopFwd {
         return make_shape(Int<kRows>{}, Int<kQkK>{}, p.h, p.num_m_blocks, p.b);
     }
 
-    static TMA_KV make_tma_load_K(bsa_fwd_params const& p) {
+    static TMA_K make_tma_load_K(bsa_fwd_params const& p) {
         using namespace cute;
         int const total_sparse_blocks = p.seqlen_k_rounded / kSparseBlockSize;
         int stride_S = int(p.k_row_stride);
@@ -185,30 +210,29 @@ struct CollectiveMainloopFwd {
                           total_sparse_blocks, p.b);
     }
 
-    static TMA_KV make_tma_load_V(bsa_fwd_params const& p) {
+    // V loads natural V (BSHD): dim contig (stride 1), per-sparse-sub-block box (128_dim, 64_tok).
+    // 5D: (128_dim, 64_tok, H_k, sparse_blocks, B). No kDimHalves mode since dim=128 is
+    // fully spanned in mode 0 per TMA. Writes into MN-major SmemLayoutVSubTile (128,64).
+    static TMA_V make_tma_load_V(bsa_fwd_params const& p) {
         using namespace cute;
         int const total_k_blocks = (p.seqlen_k_rounded + kSparseBlockSize - 1) / kSparseBlockSize;
-        int stride_S = int(p.v_row_stride);
+        int stride_S = int(p.v_row_stride);   // BSHD with stride-1 dim: = H * D
         int stride_H = int(p.v_head_stride);
-        // 6D: (64_tok, 64_dim_half, 2_halves, H_k, sparse_blocks, B)
-        auto shape_v  = make_shape(Int<kSparseBlockSize>{}, Int<kDimHalf>{},
-                                   Int<kDimHalves>{}, p.h_k,
-                                   total_k_blocks, p.b);
-        auto stride_v = make_stride(stride_S, _1{},
-                                    Int<kDimHalf>{}, stride_H,
-                                    kSparseBlockSize * stride_S, p.v_batch_stride);
+        auto shape_v  = make_shape(Int<kDualK>{}, Int<kSparseBlockSize>{},
+                                   p.h_k, total_k_blocks, p.b);
+        auto stride_v = make_stride(_1{}, stride_S,
+                                    stride_H, kSparseBlockSize * stride_S, p.v_batch_stride);
         return make_tma_copy(SM90_TMA_LOAD{},
                 make_tensor(make_gmem_ptr(static_cast<ElementB const*>(p.v_ptr)),
                             make_layout(shape_v, stride_v)),
-                SmemLayoutSubTile{});
+                SmemLayoutVSubTile{});
     }
 
-    static ShapeKV6 make_shape_V(bsa_fwd_params const& p) {
+    static ShapeV5 make_shape_V(bsa_fwd_params const& p) {
         using namespace cute;
         int const total_k_blocks = (p.seqlen_k_rounded + kSparseBlockSize - 1) / kSparseBlockSize;
-        return make_shape(Int<kSparseBlockSize>{}, Int<kDimHalf>{},
-                          Int<kDimHalves>{}, p.h_k,
-                          total_k_blocks, p.b);
+        return make_shape(Int<kDualK>{}, Int<kSparseBlockSize>{},
+                          p.h_k, total_k_blocks, p.b);
     }
 
     // Helper: compute per-tile num_kv_blocks (pipeline iterations) and raw block count.
@@ -316,7 +340,12 @@ struct CollectiveMainloopFwd {
         return kv_st;
     }
 
-    // Load V: 8 TMAs per KV block (4 sparse blocks × 2 dim halves)
+    // Load V: 4 TMAs per KV block (one per sparse sub-block, (128_dim, 64_tok) box).
+    // Uses local_tile of full MN-major SmemLayoutVDual to get sub-view with full's
+    // strides — essential so atom-step strides in sub-tile match full's stride pattern
+    // (sub-tile's standalone mode 1 stride = 1024 bf16 ≠ full's 2048 → data corruption
+    // if placed naively at offset).
+    // Sub-tile coords in full (256, 128): (sub_i % 2 ∈ {0,1}, sub_i / 2 ∈ {0,1}).
     template<typename ThrTmaV, typename GVFull, typename MainloopStorage>
     CUTLASS_DEVICE static PipelineKVState load_V(
             int kv_block_idx, PipelineKVState kv_st,
@@ -329,22 +358,18 @@ struct CollectiveMainloopFwd {
         pipeline_kv.producer_acquire(kv_st);
         auto* tma_bar = pipeline_kv.producer_get_barrier(kv_st);
         int stage_base = kv_st.index() * kKVElemsPerStage;
+        auto sV_full = make_tensor(make_smem_ptr(
+                ml.smem_kv.begin() + stage_base), SmemLayoutVDual{});
         CUTLASS_PRAGMA_UNROLL
         for (int sub = 0; sub < kSparseBlocksPerKV; ++sub) {
             int sparse_idx = get_sparse_idx(kv_block_idx, sub, raw_block_count, tile_block_indices);
-            int slot = sub;  // sequential for V
-            CUTLASS_PRAGMA_UNROLL
-            for (int h = 0; h < kDimHalves; ++h) {
-                // V offsets: kVSubStride/kVHalfStride (adjacent dim_halves per block)
-                int smem_offset = stage_base + slot * kVSubStride + h * kVHalfStride;
-                // V uses K-major sub-tile (same as K; data pre-transposed on host)
-                auto sV_sub = make_tensor(make_smem_ptr(
-                        ml.smem_kv.begin() + smem_offset), SmemLayoutSubTile{});
-                // V 6D indexing: (_, _, h, head, sparse_idx, batch)
-                cute::copy(params.tma_load_V.with(*tma_bar),
-                        thr_tma_v.partition_S(gV_full(_, _, h, head, sparse_idx, batch)),
-                        thr_tma_v.partition_D(sV_sub));
-            }
+            // local_tile: sub_i%2-th tile along mode 0 (size 128), sub_i/2-th along mode 1 (size 64)
+            auto sV_sub = local_tile(sV_full,
+                    Shape<Int<kDualK>, Int<kSparseBlockSize>>{},
+                    make_coord(sub & 1, sub >> 1));
+            cute::copy(params.tma_load_V.with(*tma_bar),
+                    thr_tma_v.partition_S(gV_full(_, _, head, sparse_idx, batch)),
+                    thr_tma_v.partition_D(sV_sub));
         }
         ++kv_st;
         return kv_st;
@@ -545,7 +570,7 @@ struct CollectiveMainloopFwd {
                     tP.data() = tmem_s[stage];
                     auto sV = make_tensor(make_smem_ptr(
                             ml.smem_kv.begin() + kv_state.index() * kKVElemsPerStage),
-                            SmemLayoutBDual{});
+                            SmemLayoutVDual{});
                     uint32_t pls_addr = cute::cast_smem_ptr_to_uint(
                             &shared_storage.pipelines.p_lastsplit.full_barrier_[stage]);
                     utcmma_ts_split(pv_mma, tP, sV, tC_pv, !o_acc_s0,
@@ -585,7 +610,7 @@ struct CollectiveMainloopFwd {
                     tP.data() = tmem_s[stage];
                     auto sV = make_tensor(make_smem_ptr(
                             ml.smem_kv.begin() + kv_state.index() * kKVElemsPerStage),
-                            SmemLayoutBDual{});
+                            SmemLayoutVDual{});
                     uint32_t pls_addr = cute::cast_smem_ptr_to_uint(
                             &shared_storage.pipelines.p_lastsplit.full_barrier_[stage]);
                     utcmma_ts_split(pv_mma, tP, sV, tC_pv, !o_acc_s1,
@@ -626,7 +651,7 @@ struct CollectiveMainloopFwd {
                 tP.data() = tmem_s[stage];
                 auto sV = make_tensor(make_smem_ptr(
                         ml.smem_kv.begin() + kv_state.index() * kKVElemsPerStage),
-                        SmemLayoutBDual{});
+                        SmemLayoutVDual{});
                 uint32_t pls_addr = cute::cast_smem_ptr_to_uint(
                         &shared_storage.pipelines.p_lastsplit.full_barrier_[stage]);
                 utcmma_ts_split(pv_mma, tP, sV, tC_pv, !o_acc_s0,
@@ -651,7 +676,7 @@ struct CollectiveMainloopFwd {
                 tP.data() = tmem_s[stage];
                 auto sV = make_tensor(make_smem_ptr(
                         ml.smem_kv.begin() + kv_state.index() * kKVElemsPerStage),
-                        SmemLayoutBDual{});
+                        SmemLayoutVDual{});
                 uint32_t pls_addr = cute::cast_smem_ptr_to_uint(
                         &shared_storage.pipelines.p_lastsplit.full_barrier_[stage]);
                 utcmma_ts_split(pv_mma, tP, sV, tC_pv, !o_acc_s1,
@@ -1068,6 +1093,10 @@ struct CollectiveMainloopFwd {
         }
     }
 
+    // ptr_LSE_tile: base pointer for this tile's LSE output (caller pre-computes
+    //   ptr_LSE + (batch*h + head)*seqlen_q + m_block*kRows).
+    // lse_valid_rows: number of rows to write (= seqlen_q - m_block*kRows, clamped to [0, kRows]).
+    //   Writes are guarded so tensor can be allocated at actual seqlen_q (not rounded).
     template<typename SharedStorage, typename NamedBarriers>
     CUTLASS_DEVICE CorrState correction(
             float sm_scale_log2,
@@ -1077,7 +1106,7 @@ struct CollectiveMainloopFwd {
             SharedStorage& shared_storage,
             uint32_t tmem_base, int num_kv_blocks,
             CorrState corr_state,
-            float* ptr_LSE = nullptr, int lse_tile_offset = 0)
+            float* ptr_LSE_tile = nullptr, int lse_valid_rows = 0)
     {
         using namespace cute;
         using cutlass::arch::NamedBarrier;
@@ -1182,9 +1211,11 @@ struct CollectiveMainloopFwd {
             my_weight = my_rescale * inv_sum_total;
 
             // ---- Write LSE to global memory (one warp per warp-pair) ----
-            if (ptr_LSE != nullptr && corr_warp < 2) {
+            // Bounded by lse_valid_rows so LSE tensor can be sized at actual seqlen_q
+            // (not rounded). Matches blk128's pattern in flash_fwd_sm100.py:1942.
+            if (ptr_LSE_tile != nullptr && corr_warp < 2) {
                 int out_row = (corr_warp & 1) * 32 + lane_idx;
-                if (out_row < kRows) {
+                if (out_row < kRows && out_row < lse_valid_rows) {
                     float lse;
                     if (sum_total > 0.0f) {
                         lse = (max_total_safe * sm_scale_log2 + log2f(sum_total))
@@ -1192,7 +1223,7 @@ struct CollectiveMainloopFwd {
                     } else {
                         lse = -CUDART_INF_F;
                     }
-                    ptr_LSE[lse_tile_offset * kRows + out_row] = lse;
+                    ptr_LSE_tile[out_row] = lse;
                 }
             }
         }
