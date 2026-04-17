@@ -43,7 +43,7 @@ __device__ __forceinline__ void warpgroup_reg_set() {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 
 template<typename CollectiveMainloop_, typename CollectiveEpilogue_,
-         typename TileScheduler_, bool HasBlockSizes>
+         typename TileScheduler_, bool HasBlockSizes, bool HasVarBlockNums>
 struct FusedAttnFwdSm100 {
     using CollectiveMainloop = CollectiveMainloop_;
     using CollectiveEpilogue = CollectiveEpilogue_;
@@ -140,7 +140,6 @@ struct FusedAttnFwdSm100 {
 
         const int warp_idx = threadIdx.x / 32;
         const int lane_idx = threadIdx.x % 32;
-        const int global_num_kv_blocks = params.fwd.num_kv_iters;
 
         TileScheduler tile_sched;
         auto work = tile_sched.get_initial_work();
@@ -242,8 +241,8 @@ struct FusedAttnFwdSm100 {
 
             const uint32_t tmem_base = shared_storage.tmem_base_ptr;
             typename CollectiveMainloop::MmaState mma_state;
-            int tile_nkv = CollectiveMainloop::get_tile_num_kv_blocks(
-                    params.fwd, work.batch, work.head, work.m_block, global_num_kv_blocks);
+            int tile_nkv = CollectiveMainloop::template get_tile_num_kv_blocks<HasVarBlockNums>(
+                    params.fwd, work.batch, work.head, work.m_block);
             mma_state = mainloop.mma(pipeline_kv, pipeline_s_p_o, pipeline_o_acc, pipeline_p_lastsplit,
                                       shared_storage, tmem_base, tile_nkv, mma_state);
 
@@ -262,9 +261,9 @@ struct FusedAttnFwdSm100 {
             __threadfence_block();
 
             typename CollectiveMainloop::LoadState load_state;
-            int tile_nkv = CollectiveMainloop::get_tile_num_kv_blocks(
-                    params.fwd, work.batch, work.head, work.m_block, global_num_kv_blocks);
-            int raw_bc = CollectiveMainloop::get_tile_raw_block_count(
+            int tile_nkv = CollectiveMainloop::template get_tile_num_kv_blocks<HasVarBlockNums>(
+                    params.fwd, work.batch, work.head, work.m_block);
+            int raw_bc = CollectiveMainloop::template get_tile_raw_block_count<HasVarBlockNums>(
                     params.fwd, work.batch, work.head, work.m_block);
             load_state = mainloop.load(params, pipeline_kv, shared_storage,
                                         work.head, work.m_block, work.batch, params.fwd.num_m_blocks, tile_nkv,
@@ -277,8 +276,8 @@ struct FusedAttnFwdSm100 {
             const uint32_t tmem_base = shared_storage.tmem_base_ptr;
             typename CollectiveMainloop::CorrState corr_state;
 
-            int tile_nkv = CollectiveMainloop::get_tile_num_kv_blocks(
-                    params.fwd, work.batch, work.head, work.m_block, global_num_kv_blocks);
+            int tile_nkv = CollectiveMainloop::template get_tile_num_kv_blocks<HasVarBlockNums>(
+                    params.fwd, work.batch, work.head, work.m_block);
             int lse_tile_offset = (work.batch * params.fwd.h + work.head)
                                   * params.fwd.num_m_blocks + work.m_block;
             corr_state = mainloop.template correction<SharedStorage, NamedBarriers>(
@@ -299,8 +298,8 @@ struct FusedAttnFwdSm100 {
             softmax1_state.spo_state = PipeState(1, 0, 0);
             softmax1_state.sm_stats_state = PipeState(1, 1, 0);
 
-            int tile_nkv = CollectiveMainloop::get_tile_num_kv_blocks(
-                    params.fwd, work.batch, work.head, work.m_block, global_num_kv_blocks);
+            int tile_nkv = CollectiveMainloop::template get_tile_num_kv_blocks<HasVarBlockNums>(
+                    params.fwd, work.batch, work.head, work.m_block);
             int const* tile_bi = nullptr;
             if (params.fwd.block_indices_ptr != nullptr) {
                 int tile_idx = (work.batch * params.fwd.h + work.head) * params.fwd.num_m_blocks + work.m_block;
@@ -311,7 +310,7 @@ struct FusedAttnFwdSm100 {
                     pipeline_s_p_o, pipeline_sm_stats, pipeline_p_lastsplit,
                     shared_storage, tmem_base, params.fwd.scale_softmax_log2, tile_nkv, softmax1_state,
                     tile_bi, params.fwd.block_sizes_ptr,
-                    CollectiveMainloop::get_tile_raw_block_count(
+                    CollectiveMainloop::template get_tile_raw_block_count<HasVarBlockNums>(
                         params.fwd, work.batch, work.head, work.m_block));
         }
         else {
@@ -323,8 +322,8 @@ struct FusedAttnFwdSm100 {
             typename CollectiveMainloop::SoftmaxState softmax0_state;
             softmax0_state.sm_stats_state = PipeState(0, 1, 0);
 
-            int tile_nkv = CollectiveMainloop::get_tile_num_kv_blocks(
-                    params.fwd, work.batch, work.head, work.m_block, global_num_kv_blocks);
+            int tile_nkv = CollectiveMainloop::template get_tile_num_kv_blocks<HasVarBlockNums>(
+                    params.fwd, work.batch, work.head, work.m_block);
             int const* tile_bi = nullptr;
             if (params.fwd.block_indices_ptr != nullptr) {
                 int tile_idx = (work.batch * params.fwd.h + work.head) * params.fwd.num_m_blocks + work.m_block;
@@ -335,7 +334,7 @@ struct FusedAttnFwdSm100 {
                     pipeline_s_p_o, pipeline_sm_stats, pipeline_p_lastsplit,
                     shared_storage, tmem_base, params.fwd.scale_softmax_log2, tile_nkv, softmax0_state,
                     tile_bi, params.fwd.block_sizes_ptr,
-                    CollectiveMainloop::get_tile_raw_block_count(
+                    CollectiveMainloop::template get_tile_raw_block_count<HasVarBlockNums>(
                         params.fwd, work.batch, work.head, work.m_block));
         }
     }
@@ -351,9 +350,9 @@ fused_attn_device(
     kernel(params, shared_memory);
 }
 
-template<bool HasBlockSizes>
+template<bool HasBlockSizes, bool HasVarBlockNums>
 using FusedAttnKernel = FusedAttnFwdSm100<CollectiveMainloopFwd, CollectiveEpilogueFwd,
-                                          SingleTileScheduler, HasBlockSizes>;
+                                          SingleTileScheduler, HasBlockSizes, HasVarBlockNums>;
 
 #endif
 } // namespace flash

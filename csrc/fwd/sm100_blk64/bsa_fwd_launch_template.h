@@ -16,12 +16,12 @@
 
 namespace flash {
 
-template<int kHeadDim, bool HasBlockSizes>
+template<int kHeadDim, bool HasBlockSizes, bool HasVarBlockNums>
 void run_bsa_fwd(bsa_fwd_params const& p, cudaStream_t stream) {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
     using namespace cute;
 
-    using Kernel = FusedAttnKernel<HasBlockSizes>;
+    using Kernel = FusedAttnKernel<HasBlockSizes, HasVarBlockNums>;
     using ML = typename Kernel::CollectiveMainloop;
     using EL = typename Kernel::CollectiveEpilogue;
 

@@ -39,11 +39,10 @@ struct bsa_fwd_params {
 
     // Tile counts.
     int num_m_blocks;       // seqlen_q_rounded / kRows
-    int num_kv_iters;       // padded blocks / kSparseBlocksPerKV
 
     // Sparse config.
     int block_indices_stride;
-    int raw_block_sparse_num;
+    int uniform_block_sparse_num;  // per-tile raw block count when HasVarBlockNums=false
 
     // The scaling factors for the kernel.
     float scale_softmax;
