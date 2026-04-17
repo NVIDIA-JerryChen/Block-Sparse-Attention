@@ -943,7 +943,8 @@ struct CollectiveMainloopFwd {
     CUTLASS_DEVICE static void correction_combine(
             uint32_t tmem_o0, uint32_t tmem_o1,
             float my_scale0, float my_scale1,
-            int corr_warp, int lane_idx, int reduce_bar,
+            int corr_warp, int lane_idx,
+            uint32_t reduce_mbar_addr, int reduce_mbar_phase,
             EpiStorage& el, SmemTensorO& sO)
     {
         using namespace cute;
@@ -977,8 +978,11 @@ struct CollectiveMainloopFwd {
             }
         }
 
-        // Single barrier: all warps' exchange writes visible
-        cutlass::arch::NamedBarrier::arrive_and_wait(kRows, reduce_bar);
+        // Single barrier: all warps' exchange writes visible.
+        // mbarrier instead of NamedBarrier — see reduce_mbar comment in
+        // bsa_fwd_kernel_sm100.h (avoids sm_103a BAR.SYNC.DEFER_BLOCKING
+        // scoreboard bug).
+        flash::mbar_arrive_and_wait(reduce_mbar_addr, reduce_mbar_phase);
 
         // Pass 2: warps 0,1 read own + partner exchange data → add → bf16 → sO
         {
@@ -1111,14 +1115,18 @@ struct CollectiveMainloopFwd {
 
         // ---- (f) Warp-pair stats exchange + combine weight ----
         auto sO = make_tensor(make_smem_ptr(el.sO.begin()), SmemLayoutO{});
-        const int reduce_bar = (corr_warp & 1)
-                ? NamedBarriers::Reduce_13 : NamedBarriers::Reduce_02;
+        // mbarrier slot 0 ↔ warp pair (0,2), slot 1 ↔ warp pair (1,3).
+        // Replaces the Reduce_02/Reduce_13 NamedBarriers to sidestep ptxas
+        // BAR.SYNC.DEFER_BLOCKING scoreboard bug on sm_103a.
+        const int reduce_mbar_idx = corr_warp & 1;
+        const uint32_t reduce_mbar_addr = cute::cast_smem_ptr_to_uint(
+                &shared_storage.reduce_mbar[reduce_mbar_idx]);
 
         float my_weight;
         {
             el.o_staging[corr_warp ^ 2][lane_idx * 2 + 0] = my_sum;
             el.o_staging[corr_warp ^ 2][lane_idx * 2 + 1] = my_max;
-            NamedBarrier::arrive_and_wait(kRows, reduce_bar);
+            flash::mbar_arrive_and_wait(reduce_mbar_addr, /*phase=*/0);
 
             float partner_sum = el.o_staging[corr_warp][lane_idx * 2 + 0];
             float partner_max = el.o_staging[corr_warp][lane_idx * 2 + 1];
@@ -1153,7 +1161,9 @@ struct CollectiveMainloopFwd {
         float my_scale1 = scale1 * my_weight;
         correction_combine<decltype(sO), decltype(el), NamedBarriers>(
                 tmem_o0, tmem_o1, my_scale0, my_scale1,
-                corr_warp, lane_idx, reduce_bar, el, sO);
+                corr_warp, lane_idx,
+                reduce_mbar_addr, /*reduce_mbar_phase=*/1,
+                el, sO);
 
         // ---- (h) Fence + signal epilogue warp ----
         cutlass::arch::fence_view_async_shared();

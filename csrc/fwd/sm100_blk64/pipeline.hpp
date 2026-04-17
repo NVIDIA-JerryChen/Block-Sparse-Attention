@@ -47,6 +47,24 @@ __device__ __forceinline__ void wait_barrier_addr(uint32_t addr, int phase) {
         : : "r"(addr), "r"(phase), "r"(kMBarTicks) : "memory");
 }
 
+// Atomic arrive + try_wait on a SMEM mbarrier. Drop-in replacement for
+// NamedBarrier::arrive_and_wait when ptxas's BAR.SYNC.DEFER_BLOCKING on
+// sm_103a is unsafe (see comment on reduce_mbar in bsa_fwd_kernel_sm100.h).
+// `phase` is the parity to wait for; caller toggles it between calls.
+__device__ __forceinline__ void mbar_arrive_and_wait(uint32_t addr, int phase) {
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" : : "r"(addr) : "memory");
+    asm volatile(
+    "{\n"
+    ".reg .pred P1;\n"
+    "WAIT_MBAR_%=:\n"
+    "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1, %2;\n"
+    "@P1 bra.uni DONE_MBAR_%=;\n"
+    "bra.uni WAIT_MBAR_%=;\n"
+    "DONE_MBAR_%=:\n"
+    "}\n"
+        : : "r"(addr), "r"(phase), "r"(kMBarTicks) : "memory");
+}
+
 // ============================================================================
 // PipelineKV: TMA producer, UMMA consumer (3-stage, 1CTA cluster)
 // ============================================================================

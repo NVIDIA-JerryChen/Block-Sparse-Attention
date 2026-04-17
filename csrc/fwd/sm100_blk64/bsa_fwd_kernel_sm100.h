@@ -97,6 +97,13 @@ struct FusedAttnFwdSm100 {
 
         alignas(16) cute::uint32_t tmem_base_ptr;
         alignas(4) int tmem_ready;
+        // mbarrier replacements for Reduce_02 / Reduce_13 NamedBarriers.
+        // On SM103a (B300, CUDA 13.2) ptxas always emits BAR.SYNC as
+        // BAR.SYNC.DEFER_BLOCKING; the scoreboard slot that variant registers
+        // is not reliably released, so a downstream scoreboard-dependent
+        // instruction (a constant-bank LDCU in correction rescale) can hang
+        // forever. mbarrier has no "defer" counterpart.
+        alignas(16) cute::uint64_t reduce_mbar[2];
     };
 
     static constexpr int SharedStorageSize = sizeof(SharedStorage);
@@ -194,6 +201,8 @@ struct FusedAttnFwdSm100 {
             pipeline_p_lastsplit.init_barriers(shared_storage.pipelines.p_lastsplit, pls_params);
             if (lane_predicate) {
                 cute::initialize_barrier(shared_storage.pipelines.bar_q_ready, 1);
+                cute::initialize_barrier(shared_storage.reduce_mbar[0], 64);
+                cute::initialize_barrier(shared_storage.reduce_mbar[1], 64);
                 shared_storage.tmem_ready = 0;
             }
         }
