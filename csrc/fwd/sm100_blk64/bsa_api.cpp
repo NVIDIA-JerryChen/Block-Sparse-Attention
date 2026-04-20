@@ -14,8 +14,8 @@
 
 namespace flash {
 
-// Defined in bsa_fwd_launch_template.h, instantiated in instantiations/bsa_fwd_hdim128_bf16_hbs{0,1}_hvbn{0,1}_sm100.cu
-template<int kHeadDim, bool HasBlockSizes, bool HasVarBlockNums>
+// Defined in bsa_fwd_launch_template.h, instantiated in instantiations/bsa_fwd_hdim128_bf16_hbs{0,1}_hvbn{0,1}_{,clc_}sm100.cu
+template<int kHeadDim, bool HasBlockSizes, bool HasVarBlockNums, bool UseClc>
 void run_bsa_fwd(bsa_fwd_params const&, cudaStream_t);
 
 // FA Hopper pattern: populate bsa_fwd_params from torch tensors.
@@ -62,7 +62,8 @@ std::tuple<torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_impl(
         torch::Tensor q, torch::Tensor k, torch::Tensor v,
         torch::Tensor q2k_block_index, int64_t block_sparse_num,
         torch::Tensor block_sizes, double softmax_scale,
-        torch::Tensor q2k_block_nums)
+        torch::Tensor q2k_block_nums,
+        bool use_clc)
 {
     // BHSD tensor convention: (batch, num_heads, seqlen, head_dim)
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "q/k/v must be CUDA");
@@ -142,7 +143,9 @@ std::tuple<torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_impl(
     const bool has_block_sizes = (params.block_sizes_ptr != nullptr);
     BOOL_SWITCH(has_block_sizes, HAS_BLOCK_SIZES, [&] {
         BOOL_SWITCH(has_var_block_nums, HAS_VAR_BLOCK_NUMS, [&] {
-            run_bsa_fwd<128, HAS_BLOCK_SIZES, HAS_VAR_BLOCK_NUMS>(params, stream);
+            BOOL_SWITCH(use_clc, USE_CLC, [&] {
+                run_bsa_fwd<128, HAS_BLOCK_SIZES, HAS_VAR_BLOCK_NUMS, USE_CLC>(params, stream);
+            });
         });
     });
 
@@ -166,7 +169,7 @@ PyObject* PyInit_bsa_fwd_blk64_ext(void) {
 TORCH_LIBRARY(bsa_blk64, m) {
     m.def("fwd(Tensor q, Tensor k, Tensor v, Tensor q2k_block_index, "
           "int block_sparse_num, Tensor block_sizes, float scale, "
-          "Tensor q2k_block_nums) -> (Tensor, Tensor)");
+          "Tensor q2k_block_nums, bool use_clc) -> (Tensor, Tensor)");
 }
 // Note: schema uses "int" (maps to int64_t) and "float" (maps to double) in C++.
 

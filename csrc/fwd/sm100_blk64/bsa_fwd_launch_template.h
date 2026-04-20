@@ -11,17 +11,19 @@
 #include <cuda_runtime.h>
 #include <nvtx3/nvToolsExt.h>
 
+#include "cutlass/cluster_launch.hpp"
+
 #include "bsa.h"
 #include "bsa_fwd_kernel_sm100.h"
 
 namespace flash {
 
-template<int kHeadDim, bool HasBlockSizes, bool HasVarBlockNums>
+template<int kHeadDim, bool HasBlockSizes, bool HasVarBlockNums, bool UseClc>
 void run_bsa_fwd(bsa_fwd_params const& p, cudaStream_t stream) {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
     using namespace cute;
 
-    using Kernel = FusedAttnKernel<HasBlockSizes, HasVarBlockNums>;
+    using Kernel = FusedAttnKernel<HasBlockSizes, HasVarBlockNums, UseClc>;
     using ML = typename Kernel::CollectiveMainloop;
     using EL = typename Kernel::CollectiveEpilogue;
 
@@ -38,6 +40,15 @@ void run_bsa_fwd(bsa_fwd_params const& p, cudaStream_t stream) {
         EL::make_shape_O(p),
     };
 
+    if constexpr (UseClc) {
+        int device_id = 0;
+        C10_CUDA_CHECK(cudaGetDevice(&device_id));
+        int sm_count = 0;
+        C10_CUDA_CHECK(cudaDeviceGetAttribute(
+                &sm_count, cudaDevAttrMultiProcessorCount, device_id));
+        kernel_params.sm_count = sm_count;
+    }
+
     dim3 dim_grid = Kernel::get_grid_shape(kernel_params);
     dim3 dim_block = Kernel::get_block_shape();
     int smem_bytes = Kernel::SharedStorageSize;
@@ -45,11 +56,22 @@ void run_bsa_fwd(bsa_fwd_params const& p, cudaStream_t stream) {
     auto* kernel_ptr = &fused_attn_device<Kernel>;
     C10_CUDA_CHECK(cudaFuncSetAttribute(
             kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
-    C10_CUDA_CHECK(cudaFuncSetAttribute(
-            kernel_ptr, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+    if constexpr (UseClc) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(
+                kernel_ptr, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+    }
 
     nvtxRangePushA("bsa_attn_fwd_kernel");
-    fused_attn_device<Kernel><<<dim_grid, dim_block, smem_bytes, stream>>>(kernel_params);
+    if constexpr (UseClc) {
+        dim3 dim_cluster = Kernel::get_cluster_shape();
+        void* args[] = {&kernel_params};
+        cutlass::ClusterLauncher::launch(
+                dim_grid, dim_cluster, dim_block,
+                static_cast<size_t>(smem_bytes), stream,
+                reinterpret_cast<void const*>(kernel_ptr), args);
+    } else {
+        fused_attn_device<Kernel><<<dim_grid, dim_block, smem_bytes, stream>>>(kernel_params);
+    }
     nvtxRangePop();
     C10_CUDA_CHECK(cudaGetLastError());
 #else

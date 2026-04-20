@@ -8,13 +8,17 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 CUTLASS_ROOT = PROJECT_ROOT / "third_party" / "cutlass"
 SRC_DIR = Path(__file__).resolve().parent
 
-# Kernel instantiation (nvcc, separate TU per (HasBlockSizes, HasVarBlockNums) variant
-# for register allocation isolation)
+# Kernel instantiation (nvcc, separate TU per (HasBlockSizes, HasVarBlockNums, UseClc)
+# variant for register allocation isolation)
 instantiation_sources = [
     str(SRC_DIR / "instantiations" / "bsa_fwd_hdim128_bf16_hbs0_hvbn0_sm100.cu"),
     str(SRC_DIR / "instantiations" / "bsa_fwd_hdim128_bf16_hbs0_hvbn1_sm100.cu"),
     str(SRC_DIR / "instantiations" / "bsa_fwd_hdim128_bf16_hbs1_hvbn0_sm100.cu"),
     str(SRC_DIR / "instantiations" / "bsa_fwd_hdim128_bf16_hbs1_hvbn1_sm100.cu"),
+    str(SRC_DIR / "instantiations" / "bsa_fwd_hdim128_bf16_hbs0_hvbn0_clc_sm100.cu"),
+    str(SRC_DIR / "instantiations" / "bsa_fwd_hdim128_bf16_hbs0_hvbn1_clc_sm100.cu"),
+    str(SRC_DIR / "instantiations" / "bsa_fwd_hdim128_bf16_hbs1_hvbn0_clc_sm100.cu"),
+    str(SRC_DIR / "instantiations" / "bsa_fwd_hdim128_bf16_hbs1_hvbn1_clc_sm100.cu"),
 ]
 
 nvcc_flags = [

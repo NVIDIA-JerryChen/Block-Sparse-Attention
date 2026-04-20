@@ -213,13 +213,15 @@ def pack_gqa_attn_bias(attn_bias_kv, nheads, qhead_per_kvhead, seqlen_q):
 
 def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloat16,
                   use_variable_block_nums=False, use_block_sizes=True,
-                  blk_m=128, blk_n=128):
+                  blk_m=128, blk_n=128, use_clc=False):
     """Run a single correctness test with random block-sparse pattern.
 
     blk_m/blk_n: block sizes. blk_n=64 routes to blk64 C++ AOT kernel.
     use_block_sizes=False exercises the HasBlockSizes=false kernel path
     (block_sizes passed as None / empty tensor; all KV tokens treated as valid).
     Requires seqlen_k % blk_n == 0 so every KV block is fully populated.
+    use_clc: for blk64 only, toggle the CLC persistent scheduler path
+    (ignored when blk_n=128; blk128 has its own scheduling knob).
     """
     device = "cuda"
     torch.manual_seed(0)
@@ -308,7 +310,7 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
         v_bhsd = v.transpose(1, 2).contiguous()
         out_bhsd, lse = torch.ops.bsa_blk64.fwd(
             q_bhsd, k_bhsd, v_bhsd, q2k_block_index, block_sparse_num,
-            bs_arg, softmax_scale, bn_arg)
+            bs_arg, softmax_scale, bn_arg, use_clc)
         out = out_bhsd.transpose(1, 2).contiguous()
     else:
         out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes_kernel,
@@ -348,6 +350,7 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
 @pytest.mark.parametrize("mha_type", ["mha", "gqa", "mqa"])
 @pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("use_variable_block_nums", [False, True])
+@pytest.mark.parametrize("use_clc", [False, True])
 @pytest.mark.parametrize("blk_n", _BLK_SIZES)
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -363,33 +366,39 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
         (4096, 4096),
     ],
 )
-def test_flash_fwd_sm100(seqlen_q, seqlen_k, d, mha_type, dtype, use_variable_block_nums, blk_n):
+def test_flash_fwd_sm100(seqlen_q, seqlen_k, d, mha_type, dtype, use_variable_block_nums, use_clc, blk_n):
+    # use_clc only affects blk64; skip the duplicate blk128 case.
+    if blk_n != 64 and use_clc:
+        pytest.skip("use_clc only affects blk64")
     batch_size = 4 if seqlen_k <= 2048 else 2
     nheads = 6
     nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
     blk_m = 64 if blk_n == 64 else 128
     _test_single(batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype,
                   use_variable_block_nums=use_variable_block_nums,
-                  blk_m=blk_m, blk_n=blk_n)
+                  blk_m=blk_m, blk_n=blk_n, use_clc=use_clc)
 
 
 # HasBlockSizes=false coverage (independent from main matrix; seqlen_k % blk_n == 0 required).
 # 2 × 2 × 3 = 12 testcases per blk, covering both (no_bs, no_vbn) and (no_bs, has_vbn).
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_variable_block_nums", [False, True])
+@pytest.mark.parametrize("use_clc", [False, True])
 @pytest.mark.parametrize("blk_n", _BLK_SIZES)
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [(128, 512), (256, 1024), (1024, 1024)],
 )
-def test_flash_fwd_sm100_no_block_sizes(seqlen_q, seqlen_k, dtype, use_variable_block_nums, blk_n):
+def test_flash_fwd_sm100_no_block_sizes(seqlen_q, seqlen_k, dtype, use_variable_block_nums, use_clc, blk_n):
+    if blk_n != 64 and use_clc:
+        pytest.skip("use_clc only affects blk64")
     batch_size = 2
     nheads = 4
     blk_m = 64 if blk_n == 64 else 128
     _test_single(batch_size, seqlen_q, seqlen_k, nheads, nheads, 128, dtype,
                   use_variable_block_nums=use_variable_block_nums,
                   use_block_sizes=False,
-                  blk_m=blk_m, blk_n=blk_n)
+                  blk_m=blk_m, blk_n=blk_n, use_clc=use_clc)
 
 
 # ============== Quick test (make tt) ==============
@@ -422,8 +431,9 @@ def run_quick_tests():
             (1, 1024, 1024, 4, 4, 128),
             (1, 2048, 2048, 4, 4, 128),
         ]
-        for bs, sq, sk, hq, hk, d in configs_64:
-            _test_single(bs, sq, sk, hq, hk, d, blk_m=64, blk_n=64)
+        for use_clc in (False, True):
+            for bs, sq, sk, hq, hk, d in configs_64:
+                _test_single(bs, sq, sk, hq, hk, d, blk_m=64, blk_n=64, use_clc=use_clc)
 
     if 128 in _BLK_SIZES:
         print("-" * 70)
@@ -451,9 +461,10 @@ def run_quick_tests():
             (1, 256, 1024, 4, 4, 128),
             (4, 1024, 1024, 4, 4, 128),
         ]
-        for bs, sq, sk, hq, hk, d in var_configs_64:
-            _test_single(bs, sq, sk, hq, hk, d, use_variable_block_nums=True,
-                          blk_m=64, blk_n=64)
+        for use_clc in (False, True):
+            for bs, sq, sk, hq, hk, d in var_configs_64:
+                _test_single(bs, sq, sk, hq, hk, d, use_variable_block_nums=True,
+                              blk_m=64, blk_n=64, use_clc=use_clc)
 
     # block_sizes=None path (HasBlockSizes=false): requires seqlen_k % blk_n == 0
     if 128 in _BLK_SIZES:
@@ -482,11 +493,12 @@ def run_quick_tests():
             (1, 256, 1024, 4, 4, 128, True),                          # var bsn,   no-bs, has-vbn
             (4, 1024, 1024, 4, 4, 128, True),                         # var bsn,   no-bs, has-vbn
         ]
-        for cfg in no_bs_configs_64:
-            bs, sq, sk, hq, hk, d = cfg[:6]
-            use_var = cfg[6] if len(cfg) > 6 else False
-            _test_single(bs, sq, sk, hq, hk, d, use_variable_block_nums=use_var,
-                          use_block_sizes=False, blk_m=64, blk_n=64)
+        for use_clc in (False, True):
+            for cfg in no_bs_configs_64:
+                bs, sq, sk, hq, hk, d = cfg[:6]
+                use_var = cfg[6] if len(cfg) > 6 else False
+                _test_single(bs, sq, sk, hq, hk, d, use_variable_block_nums=use_var,
+                              use_block_sizes=False, blk_m=64, blk_n=64, use_clc=use_clc)
 
     print("=" * 70)
     print("All quick tests passed.")
@@ -495,11 +507,12 @@ def run_quick_tests():
 # ============== Kernel dispatch helper ==============
 
 def _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n,
-                 q2k_block_nums=None, softmax_scale=None):
+                 q2k_block_nums=None, softmax_scale=None, use_clc=False):
     """Dispatch to blk64 or blk128 kernel based on blk_n.
 
     q/k/v are BSHD (batch, seq, heads, dim). blk64 expects BHSD, so we transpose
     at the boundary; blk128 consumes BSHD directly via bsa_attn_fwd.
+    use_clc: blk64-only toggle for the CLC persistent scheduler; ignored for blk128.
     """
     if blk_n == 64:
         if softmax_scale is None:
@@ -511,7 +524,7 @@ def _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n,
         v_bhsd = v.transpose(1, 2).contiguous()
         out_bhsd, _ = torch.ops.bsa_blk64.fwd(
             q_bhsd, k_bhsd, v_bhsd, q2k_block_index, block_sparse_num,
-            bs_arg, softmax_scale, bn_arg)
+            bs_arg, softmax_scale, bn_arg, use_clc)
         return out_bhsd.transpose(1, 2).contiguous()
     else:
         return bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes,
@@ -521,11 +534,11 @@ def _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n,
 # ============== Benchmark (make bb) ==============
 
 def _benchmark_one(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n,
-                   q2k_block_nums=None, niters=10):
+                   q2k_block_nums=None, niters=10, use_clc=False):
     """Warmup + benchmark a single kernel config. Returns median time in ms."""
     for _ in range(2):
         _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n,
-                     q2k_block_nums=q2k_block_nums)
+                     q2k_block_nums=q2k_block_nums, use_clc=use_clc)
     torch.cuda.synchronize()
 
     evts = [
@@ -535,7 +548,7 @@ def _benchmark_one(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_
     for s, e in evts:
         s.record()
         _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n,
-                     q2k_block_nums=q2k_block_nums)
+                     q2k_block_nums=q2k_block_nums, use_clc=use_clc)
         e.record()
     torch.cuda.synchronize()
     times = sorted([s.elapsed_time(e) for s, e in evts])
@@ -545,9 +558,9 @@ def _benchmark_one(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_
 def run_benchmark_suite():
     # (bs, nheads, seqlen, hdim)
     configs = [
-        # (1, 40, 4096, 128),
-        # (1, 40, 8192, 128),
-        # (1, 40, 16384, 128),
+        (1, 40, 4096, 128),
+        (1, 40, 8192, 128),
+        (1, 40, 16384, 128),
         (1, 1,  102400, 128),
     ]
 
@@ -560,8 +573,14 @@ def run_benchmark_suite():
             print(f"[blk{blk_n}] skipped (not built)")
             continue
 
-        print(f"\n{'Config (blk=' + str(blk_n) + ')':<48} {'ms':>8} {'TFLOPS':>8}")
-        print("-" * 68)
+        # For blk64 benchmark both use_clc=False/True side-by-side.
+        use_clc_settings = [False, True] if blk_n == 64 else [False]
+        # Each CLC variant prints "ms TFLOPS" (16 wide incl. separator).
+        header_clc = " ".join(
+                f"{'clc=' + str(int(uc)) + ' ms':>10} {'TFLOPS':>6}"
+                for uc in use_clc_settings)
+        print(f"\n{'Config (blk=' + str(blk_n) + ')':<48} {header_clc}")
+        print("-" * (48 + len(header_clc) + 2))
 
         for bs, nheads, seqlen, hdim in configs:
             dtype = torch.bfloat16
@@ -591,12 +610,14 @@ def run_benchmark_suite():
                     label = f"bs={bs} h={nheads} sq={seqlen} d={hdim} topk={topk_even}"
                     effective_sk = topk_even * blk_n
 
-                print(f"  {label:<46} ...", end="", flush=True)
-                med = _benchmark_one(q, k, v, q2k_block_index, bsn, bsizes, blk_n,
-                                     q2k_block_nums=q2k_block_nums)
                 f = flops(bs, nheads, seqlen, effective_sk, hdim, hdim)
-                tflops = f / (med * 1e-3) / 1e12
-                print(f"\r  {label:<46} {med:>8.3f} {tflops:>8.1f}")
+                print(f"  {label:<46}", end="", flush=True)
+                for use_clc in use_clc_settings:
+                    med = _benchmark_one(q, k, v, q2k_block_index, bsn, bsizes, blk_n,
+                                         q2k_block_nums=q2k_block_nums, use_clc=use_clc)
+                    tflops = f / (med * 1e-3) / 1e12
+                    print(f" {med:>10.3f} {tflops:>6.1f}", end="", flush=True)
+                print()
 
 
 # ============== Profile (make profile) ==============

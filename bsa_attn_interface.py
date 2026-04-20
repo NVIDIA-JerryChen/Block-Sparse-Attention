@@ -71,6 +71,7 @@ def bsa_attn_fwd_blk64(
     q2k_block_nums: torch.Tensor,
     softmax_scale: Optional[float] = None,
     layout: str = "bshd",
+    use_clc: bool = False,
 ):
     """BSA forward attention (blk64 backend, bf16 only, D=128).
 
@@ -85,6 +86,8 @@ def bsa_attn_fwd_blk64(
         q2k_block_nums: (B, H, Q_tiles) int32
         softmax_scale: default 1/sqrt(D)
         layout: "bshd" or "bhsd"
+        use_clc: enable the SM100 CLC persistent scheduler path. Default False
+            uses the SingleTileScheduler fallback (one tile per CTA).
     """
     assert q.dtype == torch.bfloat16, "blk64 requires bf16"
     assert q.is_cuda and k.is_cuda and v.is_cuda
@@ -116,7 +119,7 @@ def bsa_attn_fwd_blk64(
 
     import bsa_fwd_blk64_ext  # triggers TORCH_LIBRARY registration
     out, lse = torch.ops.bsa_blk64.fwd(
-        q, k, v, q2k_block_index, 0, block_sizes, softmax_scale, q2k_block_nums)
+        q, k, v, q2k_block_index, 0, block_sizes, softmax_scale, q2k_block_nums, use_clc)
 
     # Kernel returns out as BHSD (B, H, S_q_rounded, D). Trim seqlen (dim 2).
     if out.size(2) != seqlen_q:
