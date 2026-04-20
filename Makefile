@@ -6,7 +6,10 @@
 #   make tt BLK=64            - Quick test blk64 only
 #   make vt                   - Full pytest suite (blk64+128)
 #   make vt BLK=64            - Full pytest blk64 only
+#   make ttb                  - Quick correctness test for blk64 backward
+#   make vtb                  - Full pytest suite for blk64 backward
 #   make bb                   - Performance benchmark
+#   make bbb                  - Backward benchmark (blk64)
 #   make profile              - Single fwd run for ncu
 #   make help                 - Show all targets
 
@@ -14,6 +17,7 @@ SHELL := /bin/bash
 PYTHON := python
 PYTEST := python -m pytest
 TEST_FILE := test_flash_fwd.py
+BWD_TEST_FILE := test_flash_bwd.py
 FA_DIR := /home/scratch.cjerry_sw/next-dsa/flash-attention
 FA_TEST := flash_attn/cute/test_flash_fwd_sm100.py
 
@@ -29,7 +33,7 @@ BLKSZ ?= 0
 # Env prefix for profile/bm targets
 PROF_ENV := BSA_BLK=$(BLK) BSA_VAR_BN=$(VAR_BN) BSA_BLKSZ=$(BLKSZ)
 
-.PHONY: setup tt vt bb profile bm bm-cli clean compare help
+.PHONY: setup tt vt ttb vtb bb bbb profile bm bm-cli clean compare help
 
 setup:
 	@if [ ! -f third_party/cutlass/include/cutlass/cutlass.h ]; then \
@@ -51,6 +55,15 @@ vt:
 
 bb:
 	BSA_BLK=$(BLK) $(PYTHON) -u $(TEST_FILE) benchmark
+
+ttb:
+	$(PYTHON) -u $(BWD_TEST_FILE)
+
+vtb:
+	$(PYTEST) $(BWD_TEST_FILE) -v -x -s
+
+bbb:
+	$(PYTHON) -u $(BWD_TEST_FILE) benchmark
 
 profile:
 	$(PROF_ENV) $(PYTHON) -u $(TEST_FILE) profile
@@ -102,7 +115,10 @@ help:
 	@echo "  make setup [BLK=64]             Build blk64 C++ extension"
 	@echo "  make tt    [BLK=64|128|64,128]  Quick correctness test (default: both)"
 	@echo "  make vt    [BLK=64|128|64,128]  Full pytest suite (default: both)"
+	@echo "  make ttb                         Quick bwd correctness (blk64)"
+	@echo "  make vtb                         Full bwd pytest suite (blk64)"
 	@echo "  make bb                          Performance benchmark"
+	@echo "  make bbb                         Backward benchmark (blk64)"
 	@echo "  make profile                     Single fwd run for ncu"
 	@echo "  make bm                          ncu full profile (NVTX-filtered)"
 	@echo "  make bm-cli                      ncu register/spill/smem analysis"

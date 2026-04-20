@@ -13,6 +13,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32
+from cutlass.cute.runtime import from_dlpack
 from utils.cache_utils import get_jit_cache
 from utils.testing import is_fake_mode
 
@@ -20,6 +21,10 @@ from csrc.fwd.sm100_blk128 import utils
 from utils import fa_logging
 from csrc.fwd.sm100_blk128.cute_dsl_utils import to_cute_tensor
 from csrc.fwd.sm100_blk128.flash_fwd_sm100 import FlashAttentionForwardSm100
+from csrc.bwd.sm100_blk64.flash_bwd_sm100 import BlockSparseAttnBackward
+
+BSA_BWD_SPARSE_BLOCK_SIZE = 64
+BSA_BWD_HEAD_DIM = 128
 
 _bsa_clc_enabled: bool = os.environ.get("BSA_CLC", "1") == "1"
 
@@ -324,3 +329,256 @@ def bsa_attn_fwd(
 
 
 bsa_attn_fwd.compile_cache = get_jit_cache("bsa_fwd")
+
+
+def convert_q2k_to_k2q(
+    q2k_block_index: torch.Tensor,
+    block_sparse_num: int,
+    num_kv_blocks: int,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Invert ``q2k_block_index`` into the ``k2q`` layout expected by the bwd kernel.
+
+    Args:
+        q2k_block_index: ``(batch, num_heads, num_q_blocks, max_kv_blocks)`` int32.
+            For each (batch, head, q_block), the attended KV block indices.
+        block_sparse_num: Number of valid entries per Q block (used only when
+            ``q2k_block_nums`` is None).
+        num_kv_blocks: Total number of KV blocks.
+        q2k_block_nums: Optional ``(batch, num_heads, num_q_blocks)`` int32 holding
+            per-Q-block valid counts (overrides ``block_sparse_num`` when set).
+
+    Returns:
+        k2q_block_index: ``(batch, num_heads, num_kv_blocks, num_q_blocks)`` int32.
+            For each (batch, head, kv_block), the attending Q block indices,
+            padded with zeros.
+        k2q_block_nums: ``(batch, num_heads, num_kv_blocks)`` int32 holding the
+            number of attending Q blocks per KV block.
+    """
+    from utils.block_sparse_index import convert_q2k_to_k2q_triton
+    return convert_q2k_to_k2q_triton(
+        q2k_block_index, block_sparse_num, num_kv_blocks,
+        q2k_block_nums=q2k_block_nums,
+    )
+
+
+def bsa_attn_bwd(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    block_sparse_num: int,
+    block_sizes: Optional[torch.Tensor] = None,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    dq: Optional[torch.Tensor] = None,
+    dk: Optional[torch.Tensor] = None,
+    dv: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Backward pass for BSA block-sparse attention (SM100 blk64 only).
+
+    Paired with ``bsa_attn_fwd`` (or the blk64 C++ fwd), this recomputes
+    dQ, dK, dV from stored ``out``/``lse`` and the upstream ``dout`` gradient.
+
+    Args:
+        dout: Upstream gradient w.r.t. ``out`` (batch, num_heads, seqlen_q, head_dim), bf16.
+        q, k, v: Forward inputs (batch, num_heads, seqlen, head_dim), bf16.
+            Note this is the ``BHSD`` layout, not the ``BSHD`` layout that
+            ``bsa_attn_fwd`` takes — callers that hold BSHD tensors should
+            ``.transpose(1, 2)`` before calling this function.
+        out: Forward output (same shape/dtype as ``q``).
+        lse: Forward log-sum-exp (batch, num_heads, seqlen_q), float32.
+        q2k_block_index: Same tensor used for the forward
+            (batch, num_heads, num_q_blocks, max_kv_blocks), int32.
+        block_sparse_num: Same as forward.
+        block_sizes: Same as forward (optional, shape ``(num_kv_blocks,)`` int32).
+            When None, all KV blocks are treated as full ``sparse_block_size``.
+        q2k_block_nums: Optional per-Q-block variable block count (same semantics
+            as forward).
+        softmax_scale: Softmax scale (default: 1/sqrt(head_dim)).
+        dq, dk, dv: Optional pre-allocated output buffers matching the shapes of
+            q/k/v. When None, fresh zero-initialized tensors are allocated.
+
+    Returns:
+        (dq, dk, dv): Gradients w.r.t. q, k, v in the same ``BHSD`` layout as
+        the forward inputs.
+
+    Notes:
+        * Only ``head_dim == 128``, bf16, MHA (num_heads == num_heads_kv) is
+          supported. No GQA/MQA, no causal/local, no varlen.
+        * Block size is fixed at 64 (``sparse_block_size``) and must match the
+          ``blk_m == blk_n == 64`` used for the forward.
+    """
+    q, k, v, out, dout = [maybe_contiguous(t) for t in (q, k, v, out, dout)]
+    lse = maybe_contiguous(lse)
+
+    assert q.dtype == torch.bfloat16, "bwd only supports bfloat16"
+    assert q.dtype == k.dtype == v.dtype == out.dtype == dout.dtype
+    assert lse.dtype == torch.float32
+    if not is_fake_mode():
+        assert all(t.is_cuda for t in (q, k, v, out, dout, lse))
+
+    batch_size, num_heads, seqlen_q, head_dim = q.shape
+    num_heads_kv, seqlen_k = k.shape[1], k.shape[2]
+
+    assert head_dim == BSA_BWD_HEAD_DIM, (
+        f"bwd only supports head_dim={BSA_BWD_HEAD_DIM}, got {head_dim}"
+    )
+    assert num_heads == num_heads_kv, "bwd does not support GQA/MQA"
+    assert k.shape == v.shape == (batch_size, num_heads, seqlen_k, head_dim)
+    assert out.shape == (batch_size, num_heads, seqlen_q, head_dim)
+    assert dout.shape == out.shape
+    assert lse.shape == (batch_size, num_heads, seqlen_q)
+
+    arch = _get_device_arch()
+    assert arch // 10 in [10, 11], "BSA bwd only supports SM100/SM110"
+
+    sparse_block_size = BSA_BWD_SPARSE_BLOCK_SIZE
+    num_q_blocks = (seqlen_q + sparse_block_size - 1) // sparse_block_size
+    num_kv_blocks = (seqlen_k + sparse_block_size - 1) // sparse_block_size
+
+    assert q2k_block_index.dtype == torch.int32
+    assert q2k_block_index.shape[:3] == (batch_size, num_heads, num_q_blocks), (
+        f"q2k_block_index has shape {tuple(q2k_block_index.shape)}, expected "
+        f"(b={batch_size}, h={num_heads}, num_q_blocks={num_q_blocks}, max_kv_blocks)"
+    )
+    if q2k_block_nums is not None:
+        assert q2k_block_nums.dtype == torch.int32
+        assert q2k_block_nums.shape == (batch_size, num_heads, num_q_blocks)
+
+    k2q_block_index, k2q_block_nums = convert_q2k_to_k2q(
+        q2k_block_index, block_sparse_num, num_kv_blocks, q2k_block_nums=q2k_block_nums,
+    )
+
+    if block_sizes is None:
+        variable_block_sizes = torch.full(
+            (batch_size, num_kv_blocks),
+            sparse_block_size,
+            dtype=torch.int32,
+            device=q.device,
+        )
+    else:
+        assert block_sizes.dtype == torch.int32
+        if block_sizes.ndim == 1:
+            assert block_sizes.shape == (num_kv_blocks,)
+            variable_block_sizes = (
+                block_sizes.unsqueeze(0).expand(batch_size, -1).contiguous()
+            )
+        else:
+            assert block_sizes.shape == (batch_size, num_kv_blocks)
+            variable_block_sizes = block_sizes.contiguous()
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    if dq is None:
+        dq = torch.zeros_like(q)
+    else:
+        dq.zero_()
+    if dk is None:
+        dk = torch.zeros_like(k)
+    else:
+        dk.zero_()
+    if dv is None:
+        dv = torch.zeros_like(v)
+    else:
+        dv.zero_()
+
+    workspace_shape = BlockSparseAttnBackward._get_workspace_size(
+        q=seqlen_q, d=head_dim, h=num_heads, b=batch_size,
+        acc_dtype=Float32,
+    )
+    workspace = torch.zeros(workspace_shape, dtype=torch.uint8, device=q.device)
+
+    problem_shape = (seqlen_q, seqlen_k, head_dim, (num_heads, batch_size))
+
+    current_stream = (
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        if is_fake_mode()
+        else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    )
+
+    compile_key = (
+        q.dtype,
+        head_dim,
+        num_heads,
+        sparse_block_size,
+        arch,
+        fa_logging.get_fa_log_level(),
+    )
+
+    def convert_to_cute_tensor(t: torch.Tensor, enable_tvm_ffi: bool = True) -> cute.Tensor:
+        return (
+            from_dlpack(t.detach(), assumed_align=16, enable_tvm_ffi=enable_tvm_ffi)
+            .mark_layout_dynamic()
+            .mark_compact_shape_dynamic(
+                mode=3, stride_order=t.dim_order(), divisibility=128
+            )
+        )
+
+    if compile_key not in bsa_attn_bwd.compile_cache:
+        dO_t = convert_to_cute_tensor(dout)
+        O_t = convert_to_cute_tensor(out)
+        Q_t = convert_to_cute_tensor(q)
+        K_t = convert_to_cute_tensor(k)
+        V_t = convert_to_cute_tensor(v)
+        dQ_t = convert_to_cute_tensor(dq)
+        dK_t = convert_to_cute_tensor(dk)
+        dV_t = convert_to_cute_tensor(dv)
+        LSE_t = to_cute_tensor(lse, leading_dim=2)
+        k2q_idx_t = to_cute_tensor(k2q_block_index, leading_dim=3)
+        k2q_num_t = to_cute_tensor(k2q_block_nums, leading_dim=2)
+        var_bs_t = to_cute_tensor(variable_block_sizes, leading_dim=1)
+        ws_t = to_cute_tensor(workspace, fully_dynamic=True)
+
+        bwd_kernel = BlockSparseAttnBackward(sparse_block_size=sparse_block_size)
+
+        bsa_attn_bwd.compile_cache[compile_key] = cute.compile(
+            bwd_kernel,
+            problem_shape,
+            dO_t,
+            O_t,
+            Q_t,
+            K_t,
+            V_t,
+            LSE_t,
+            dQ_t,
+            dK_t,
+            dV_t,
+            k2q_idx_t,
+            k2q_num_t,
+            var_bs_t,
+            ws_t,
+            softmax_scale,
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+
+    if not is_fake_mode():
+        with torch.cuda.nvtx.range("bsa_attn_bwd_kernel"):
+            bsa_attn_bwd.compile_cache[compile_key](
+                problem_shape,
+                dout,
+                out,
+                q,
+                k,
+                v,
+                lse,
+                dq,
+                dk,
+                dv,
+                k2q_block_index,
+                k2q_block_nums,
+                variable_block_sizes,
+                workspace,
+                softmax_scale,
+                current_stream,
+            )
+
+    return dq, dk, dv
+
+
+bsa_attn_bwd.compile_cache = get_jit_cache("bsa_bwd")
