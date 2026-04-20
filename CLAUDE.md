@@ -2,12 +2,15 @@
 
 ## Project Overview
 
-**Supported**: bf16/fp16, MHA/GQA/MQA, hdim 64/96/128/(192,128), persistent scheduling, CLC persistent scheduling, pack_gqa, block-sparse attention
+**Supported**: bf16/fp16, MHA/GQA/MQA, hdim 64/96/128/(192,128), persistent scheduling, CLC persistent scheduling, pack_gqa, block-sparse attention, forward + backward (blk64 only)
 **Not supported**: causal, local, mask_mod, score_mod, split-kv, paged_kv, softcap, varlen
 
-Two kernel backends:
+Forward kernel backends:
 - **blk128** (`csrc/fwd/sm100_blk128/`): CuTe DSL / JIT compiled, tile_m=128, tile_n=128
 - **blk64** (`csrc/fwd/sm100_blk64/`): C++ AOT / CUTLASS compiled, tile_m=64, tile_n=64 (kDualCols=256, kSparseBlocksPerKV=4), bf16 only
+
+Backward kernel backend:
+- **blk64** (`csrc/bwd/sm100_blk64/`): CuTe DSL / JIT compiled, sparse_block_size=64, head_dim=128, MHA only, bf16 only. Pairs with the blk64 forward (same 64×64 sparsity block)
 
 ## Build & Install
 
@@ -39,6 +42,11 @@ make vt BLK=64
 # Benchmark
 make bb
 
+# Backward (blk64 only — bf16, MHA, hdim=128)
+make ttb                # quick correctness
+make vtb                # parametric pytest
+make bbb                # dense-bwd benchmark
+
 # ncu full / register-spill-smem analysis
 make bm-cli
 ```
@@ -47,6 +55,8 @@ make bm-cli
 
 ### Public API (`bsa_attn_interface.py`)
 - `bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes, ...)` — SM100 block-sparse forward attention (blk128 backend)
+- `bsa_attn_bwd(dout, q, k, v, out, lse, q2k_block_index, block_sparse_num, block_sizes=None, q2k_block_nums=None, softmax_scale=None, dq=None, dk=None, dv=None)` — SM100 block-sparse backward attention (blk64 backend, bf16/MHA/hdim=128). q/k/v/out/dout/dq/dk/dv are all in **BHSD** (`(batch, num_heads, seqlen, head_dim)`) layout — differs from `bsa_attn_fwd`'s BSHD. Returns `(dq, dk, dv)`. Reuses the `q2k_block_index` / `block_sparse_num` / `block_sizes` / `q2k_block_nums` from the forward call; the wrapper inverts `q2k → k2q` internally and allocates the fp32 workspace needed by the kernel
+- `convert_q2k_to_k2q(q2k_block_index, block_sparse_num, num_kv_blocks, q2k_block_nums=None)` — helper that inverts the forward's per-Q-block KV-attendee list into the per-KV-block Q-attendee list + per-KV-block count tensors the backward kernel consumes directly. Implemented via the two-stage Triton kernels in ``utils/block_sparse_index.py`` (scatter q→kv map, then pack set bits into a dense index tensor)
 
 Tensor layout: `(batch, seqlen, num_heads, head_dim)`, last dim contiguous, 16-byte aligned.
 
@@ -76,6 +86,15 @@ For dense (full) attention, construct `q2k_block_index = [0,1,...,N-1]` for all 
 - `utils.py` — Hash functions, reductions, shift ops, warp helpers
 - `fast_math.py` — exp2 polynomial coefficients
 - `cute_dsl_utils.py` — Tensor alignment helpers, patched compile
+
+### blk64 — CuTe DSL Backward Kernel (`csrc/bwd/sm100_blk64/`)
+- `flash_bwd_sm100.py` — `BlockSparseAttnBackward`: Blackwell backward, `sparse_block_size=64`, MHA + bf16 + `head_dim=128` only. Exposes a single `__call__(problem_shape, dO, O, Q, K, V, LSE, dQ, dK, dV, k2q_index, k2q_num, variable_block_sizes, workspace, scale_softmax, stream)` entry. `problem_shape` is `(seqlen_q, seqlen_k, head_dim, (num_heads, batch))`. All Q/K/V/O/dO/dQ/dK/dV tensors are passed in **(batch, num_heads, seqlen, head_dim)** layout (`bsa_attn_bwd` takes BHSD directly — callers holding the forward's BSHD layout must `.transpose(1, 2)` themselves). Indexing layout differs from the forward:
+  - `k2q_index`: `(batch, num_heads, num_kv_blocks, num_q_blocks)` int32 — per-KV-block list of attending Q-block indices (the inverse of `q2k_block_index`)
+  - `k2q_num`: `(batch, num_heads, num_kv_blocks)` int32 — per-KV-block count of attending Q blocks
+  - `variable_block_sizes`: `(batch, num_kv_blocks)` int32 — per-batch, per-KV-block valid token count (the wrapper expands a shared `(num_kv_blocks,)` `block_sizes` to this layout)
+  - `workspace`: `(Q_pad, batch, num_heads, (D_pad+2)*4)` uint8 zero-initialized scratch space. The wrapper computes the shape (`_get_workspace_size`) and handles allocation
+- Kernel pipeline: one CTA per (kv_block, head, batch) triple. Launches three sub-kernels back-to-back: `sum_OdO` (rowwise `sum(O ⊙ dO)` + `scaled_LSE = -log2(e)*LSE`), `bwd` (main loop producing dS/dK/dV tiles and accumulating dQ into the fp32 workspace via TMA reduce), and `convert` (casts fp32 dQ_acc to bf16 dQ, scaled by softmax_scale). The main `bwd` loop loads two Q-blocks per iteration (`q_block_idx_0`, `q_block_idx_1`); odd `k2q_num` values are padded with `seqlen_q // sparse_block_size` so the out-of-range TMA load fills zeros
+- `sm_100a` target only. MMA tilers are hardcoded at `(*, 64, 128)`, i.e. head_dim must be 128
 
 ### blk64 — C++ AOT Forward Kernel (`csrc/fwd/sm100_blk64/`)
 - `flash_fwd_kernel_sm100.h` — `FusedAttnKernel`: kernel entry point, templated on `HasVarBlockNums` and `HasBlockSizes`
