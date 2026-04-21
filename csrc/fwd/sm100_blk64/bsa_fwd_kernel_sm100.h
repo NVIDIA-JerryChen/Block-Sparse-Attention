@@ -112,11 +112,12 @@ struct FusedAttnFwdSm100 {
         alignas(16) cute::uint32_t tmem_base_ptr;
         alignas(4) int tmem_ready;
         // mbarrier replacements for Reduce_02 / Reduce_13 NamedBarriers.
-        // On SM103a (B300, CUDA 13.2) ptxas always emits BAR.SYNC as
-        // BAR.SYNC.DEFER_BLOCKING; the scoreboard slot that variant registers
-        // is not reliably released, so a downstream scoreboard-dependent
-        // instruction (a constant-bank LDCU in correction rescale) can hang
-        // forever. mbarrier has no "defer" counterpart.
+        // The Reduce_02 / Reduce_13 user ids (4, 5) collide with
+        // SmStatsNotify[stage=1, warp=0/1] (= hw bars 12, 13). The "reused
+        // after sm_stats done" pattern relies on ptxas not reordering across
+        // the phase boundary, which isn't guaranteed. Switching to SMEM
+        // mbarrier sidesteps the hw-id collision entirely. A raw-PTX
+        // bar.sync on a free hw id (e.g. 2 or 3) would also work.
         alignas(16) cute::uint64_t reduce_mbar[2];
     };
 

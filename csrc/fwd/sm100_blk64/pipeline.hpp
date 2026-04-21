@@ -48,8 +48,9 @@ __device__ __forceinline__ void wait_barrier_addr(uint32_t addr, int phase) {
 }
 
 // Atomic arrive + try_wait on a SMEM mbarrier. Drop-in replacement for
-// NamedBarrier::arrive_and_wait when ptxas's BAR.SYNC.DEFER_BLOCKING on
-// sm_103a is unsafe (see comment on reduce_mbar in bsa_fwd_kernel_sm100.h).
+// NamedBarrier::arrive_and_wait when the latter would hit a hw-id
+// collision (in blk64: Reduce_02/Reduce_13 vs SmStatsNotify — see the
+// reduce_mbar comment in bsa_fwd_kernel_sm100.h).
 // `phase` is the parity to wait for; caller toggles it between calls.
 __device__ __forceinline__ void mbar_arrive_and_wait(uint32_t addr, int phase) {
     asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" : : "r"(addr) : "memory");

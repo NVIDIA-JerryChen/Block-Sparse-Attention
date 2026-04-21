@@ -1021,9 +1021,9 @@ struct CollectiveMainloopFwd {
         }
 
         // Single barrier: all warps' exchange writes visible.
-        // mbarrier instead of NamedBarrier — see reduce_mbar comment in
-        // bsa_fwd_kernel_sm100.h (avoids sm_103a BAR.SYNC.DEFER_BLOCKING
-        // scoreboard bug).
+        // mbarrier instead of NamedBarrier — avoids the Reduce_02/Reduce_13
+        // hw-id collision with SmStatsNotify; see reduce_mbar comment in
+        // bsa_fwd_kernel_sm100.h.
         flash::mbar_arrive_and_wait(reduce_mbar_addr, reduce_mbar_phase);
 
         // Pass 2: warps 0,1 read own + partner exchange data → add → bf16 → sO
@@ -1158,8 +1158,9 @@ struct CollectiveMainloopFwd {
         // ---- (f) Warp-pair stats exchange + combine weight ----
         auto sO = make_tensor(make_smem_ptr(el.sO.begin()), SmemLayoutO{});
         // mbarrier slot 0 ↔ warp pair (0,2), slot 1 ↔ warp pair (1,3).
-        // Replaces the Reduce_02/Reduce_13 NamedBarriers to sidestep ptxas
-        // BAR.SYNC.DEFER_BLOCKING scoreboard bug on sm_103a.
+        // Replaces the Reduce_02/Reduce_13 NamedBarriers — see
+        // SharedStorage::reduce_mbar comment for the hw-id collision
+        // those NamedBarriers had with SmStatsNotify.
         const int reduce_mbar_idx = corr_warp & 1;
         const uint32_t reduce_mbar_addr = cute::cast_smem_ptr_to_uint(
                 &shared_storage.reduce_mbar[reduce_mbar_idx]);
