@@ -57,6 +57,8 @@ static __device__ __forceinline__ void fadd2(float& a0, float& a1, float b0, flo
 }
 
 // Emulated exp2 for 2 values (FMA pipe polynomial + ALU pipe integer combine).
+// Used on B200 (sm_100a) to offload some exp2 work off the MUFU pipe;
+// B300 (sm_103a) has enough MUFU throughput to skip this and go full ex2.approx.
 static __device__ __forceinline__ void exp2_emu2(float& x, float& y) {
     unsigned int int0, int1, frac0, frac1;
     asm volatile(

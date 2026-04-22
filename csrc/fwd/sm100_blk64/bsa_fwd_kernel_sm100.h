@@ -199,30 +199,39 @@ struct FusedAttnFwdSm100 {
                                cute::Shape<cute::_1, cute::_1, cute::_1>{},
                                cute::false_type{}, cute::false_type{});
 
+        // initializing_warp lets us distribute pipeline barrier init across warps
+        // 0–5 (warp 6 below handles bar_q_ready + reduce_mbar). init_barriers
+        // internally gates on `warp_idx == params.initializing_warp`, so each
+        // pipeline's init runs on exactly one warp in parallel with the others.
         PipelineSPO::Params spo_params;
         spo_params.producer_arv_count = 1;
         spo_params.consumer_arv_count = 256;
         spo_params.role = PipelineSPO::ThreadCategory::ProducerConsumer;
+        spo_params.initializing_warp = 1;
 
         PipelineOAcc::Params oacc_params;
         oacc_params.producer_arv_count = 1;
         oacc_params.consumer_arv_count = 1;
         oacc_params.role = PipelineOAcc::ThreadCategory::ProducerConsumer;
+        oacc_params.initializing_warp = 2;
 
         PipelineSmStats::Params smstats_params;
         smstats_params.producer_arv_count = 128;
         smstats_params.consumer_arv_count = 128;
         smstats_params.role = PipelineSmStats::ThreadCategory::ProducerConsumer;
+        smstats_params.initializing_warp = 3;
 
         PipelineOEpi::Params oepi_params;
         oepi_params.producer_arv_count = 128;
         oepi_params.consumer_arv_count = 1;
         oepi_params.role = PipelineOEpi::ThreadCategory::ProducerConsumer;
+        oepi_params.initializing_warp = 4;
 
         PipelinePLastSplit::Params pls_params;
         pls_params.producer_arv_count = 4;
         pls_params.consumer_arv_count = 1;
         pls_params.role = PipelinePLastSplit::ThreadCategory::ProducerConsumer;
+        pls_params.initializing_warp = 5;
 
         PipelineSPO     pipeline_s_p_o(shared_storage.pipelines.spo, spo_params, cute::false_type{});
         PipelineOAcc    pipeline_o_acc(shared_storage.pipelines.o_acc, oacc_params, cute::false_type{});
@@ -260,20 +269,42 @@ struct FusedAttnFwdSm100 {
                 shared_storage.pipelines.clc_pipe, clc_params,
                 typename ClcSched::ClusterShape{});
 
-        if (warp_idx == 0) {
-            PipelineKV::init_barriers(shared_storage.pipelines.kv, pipeline_kv_params,
-                                     cute::Shape<cute::_1, cute::_1, cute::_1>{});
-            pipeline_s_p_o.init_barriers(shared_storage.pipelines.spo, spo_params);
-            pipeline_o_acc.init_barriers(shared_storage.pipelines.o_acc, oacc_params);
-            pipeline_sm_stats.init_barriers(shared_storage.pipelines.sm_stats, smstats_params);
-            pipeline_o_epi.init_barriers(shared_storage.pipelines.o_epi, oepi_params);
-            pipeline_p_lastsplit.init_barriers(shared_storage.pipelines.p_lastsplit, pls_params);
-            if (lane_predicate) {
-                cute::initialize_barrier(shared_storage.pipelines.bar_q_ready, 1);
-                cute::initialize_barrier(shared_storage.reduce_mbar[0], 64);
-                cute::initialize_barrier(shared_storage.reduce_mbar[1], 64);
-                shared_storage.tmem_ready = 0;
-            }
+        // Distribute mbarrier init across 7 warps. Each init_barriers path does
+        // its own elect_one_sync internally, and every pipeline's mbarrier SMEM
+        // lives at a disjoint address — so running them in parallel is safe and
+        // the earlier serial path on warp 0 was leaving 15 warps idle in the
+        // post-init __syncthreads. The final fence_barrier_init + syncthreads
+        // below still gates all warps before the pipelines are used.
+        switch (warp_idx) {
+            case 0:
+                PipelineKV::init_barriers(shared_storage.pipelines.kv, pipeline_kv_params,
+                                         cute::Shape<cute::_1, cute::_1, cute::_1>{});
+                break;
+            case 1:
+                pipeline_s_p_o.init_barriers(shared_storage.pipelines.spo, spo_params);
+                break;
+            case 2:
+                pipeline_o_acc.init_barriers(shared_storage.pipelines.o_acc, oacc_params);
+                break;
+            case 3:
+                pipeline_sm_stats.init_barriers(shared_storage.pipelines.sm_stats, smstats_params);
+                break;
+            case 4:
+                pipeline_o_epi.init_barriers(shared_storage.pipelines.o_epi, oepi_params);
+                break;
+            case 5:
+                pipeline_p_lastsplit.init_barriers(shared_storage.pipelines.p_lastsplit, pls_params);
+                break;
+            case 6:
+                if (cute::elect_one_sync()) {
+                    cute::initialize_barrier(shared_storage.pipelines.bar_q_ready, 1);
+                    cute::initialize_barrier(shared_storage.reduce_mbar[0], 64);
+                    cute::initialize_barrier(shared_storage.reduce_mbar[1], 64);
+                    shared_storage.tmem_ready = 0;
+                }
+                break;
+            default:
+                break;
         }
         fence_barrier_init();
         // Post-init sync. CLC mbarriers are cluster-scope; the CUTLASS test
@@ -355,17 +386,17 @@ struct FusedAttnFwdSm100 {
             tmem_alloc.free(shared_storage.tmem_base_ptr, TmemAllocator::Sm100TmemCapacityColumns);
         }
         else if (warp_idx == kEpiWarp) {
-            while (!*reinterpret_cast<volatile int*>(&shared_storage.tmem_ready)) {}
-            __threadfence_block();
+            // Epilogue warp does not touch tmem — skip the tmem_ready spin so it
+            // can race ahead and block only on pipeline_o_epi.consumer_wait.
             typename CollectiveEpilogue::EpiState epi_state;
             epi_state = epilogue.tma_store(
                     params, pipeline_o_epi, shared_storage,
                     work.head, work.m_block, work.batch, params.fwd.num_m_blocks, epi_state);
         }
         else if (warp_idx == kLoadWarp) {
-            while (!*reinterpret_cast<volatile int*>(&shared_storage.tmem_ready)) {}
-            __threadfence_block();
-
+            // Load warp only drives TMA into SMEM (smem_q, smem_kv); it never
+            // reads tmem_base_ptr. Skipping the tmem_ready spin lets Q + first
+            // KV TMAs overlap with MMA warp's tmem_alloc.allocate (~580 ns).
             typename CollectiveMainloop::LoadState load_state;
             int tile_nkv = CollectiveMainloop::template get_tile_num_kv_blocks<HasVarBlockNums>(
                     params.fwd, work.batch, work.head, work.m_block);
@@ -498,8 +529,7 @@ struct FusedAttnFwdSm100 {
             tmem_alloc.free(shared_storage.tmem_base_ptr, TmemAllocator::Sm100TmemCapacityColumns);
         }
         else if (warp_idx == kEpiWarp) {
-            while (!*reinterpret_cast<volatile int*>(&shared_storage.tmem_ready)) {}
-            __threadfence_block();
+            // Epilogue warp does not touch tmem — skip the tmem_ready spin.
             typename CollectiveEpilogue::EpiState epi_state;
 
             auto work = ClcSched::get_initial_work();
@@ -511,9 +541,9 @@ struct FusedAttnFwdSm100 {
             }
         }
         else if (warp_idx == kLoadWarp) {
-            while (!*reinterpret_cast<volatile int*>(&shared_storage.tmem_ready)) {}
-            __threadfence_block();
-
+            // Load warp only drives TMA into SMEM; never reads tmem_base_ptr.
+            // Skip the tmem_ready spin so Q + first KV TMAs overlap with MMA
+            // warp's tmem_alloc.allocate (~580 ns).
             typename CollectiveMainloop::LoadState load_state;
             auto work = ClcSched::get_initial_work();
             while (work.is_valid_tile) {

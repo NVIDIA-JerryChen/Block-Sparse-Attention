@@ -784,6 +784,14 @@ struct CollectiveMainloopFwd {
 
         // 6. apply_exp2_convert (per-fragment: exp2 → bf16 → TMEM store, matches blk128)
         {
+            // B200 (sm_100a) mixes MUFU ex2.approx with FMA-pipe polynomial
+            // emulation to spread exp2 work across pipes. B300 (sm_103a) has
+            // enough MUFU throughput that pure ex2.approx wins, so skip the mix.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1030
+            constexpr bool kUseExp2Emu = false;
+#else
+            constexpr bool kUseExp2Emu = true;
+#endif
             constexpr int kEmuFreq = 12;
             constexpr int kEmuRes = 4;
             constexpr int kEmuStartFrg = 0;
@@ -794,10 +802,11 @@ struct CollectiveMainloopFwd {
 
             CUTLASS_PRAGMA_UNROLL
             for (int frag = 0; frag < kFrgCount; ++frag) {
-                // exp2 in-place (with partial FMA emulation)
+                // exp2 in-place (with partial FMA emulation on B200)
                 CUTLASS_PRAGMA_UNROLL
                 for (int i = 0; i < kFrgTile; i += 2) {
-                    if (frag < kEmuStartFrg || frag >= kFrgCount - 1 ||
+                    if (!kUseExp2Emu || frag < kEmuStartFrg ||
+                            frag >= kFrgCount - 1 ||
                             i % kEmuFreq < kEmuFreq - kEmuRes) {
                         tSrS_frg(i, frag) = exp2f(tSrS_frg(i, frag));
                         tSrS_frg(i + 1, frag) = exp2f(tSrS_frg(i + 1, frag));
