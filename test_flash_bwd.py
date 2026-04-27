@@ -20,7 +20,7 @@ from test_flash_fwd import (
     make_topk_block_sparse_args,
     block_sparse_to_attn_bias,
 )
-from utils.bench_utils import flops
+from utils.bench_utils import flops, bwd_flops
 
 
 # The bwd kernel only exists for blk64 (sparse_block_size=64, head_dim=128, MHA, bf16).
@@ -199,10 +199,6 @@ def run_quick_tests():
 
 # ============== Benchmark ==============
 
-# Bwd roughly has 5 matmuls vs fwd's 2 → 2.5x the fwd flops (standard convention).
-_BWD_FLOPS_MULTIPLIER = 2.5
-
-
 def _bench_bwd_one(dout, q, k, v, out, lse, q2k, bsn, bsize, q2k_block_nums=None,
                     niters=10):
     """Warmup + time a single bwd call. Returns median ms."""
@@ -227,52 +223,66 @@ def run_benchmark_suite():
     device = "cuda"
     dtype = torch.bfloat16
     d = 128
-    # (bs, nheads, seqlen, hdim)
+    # (bs, nheads, seqlen_q, seqlen_k, hdim)
     configs = [
-        (1, 40, 8192, 128),
-        (1, 1, 102400, 128),
+        # (1, 4, 6400, 6400, 128),
+        # (1, 4, 19200, 19200, 128),
+        # (1, 4, 32000, 32000, 128),
+        # (1, 4, 51200, 51200, 128),
+        # (1, 4, 64000, 64000, 128),
+        # (1, 4, 83200, 83200, 128),
+        # (1, 4, 96000, 96000, 128),
+        (1, 4, 116160, 118528, 128),
+        (1, 4, 109312, 111040, 128),
+        (1, 4, 216832, 219200, 128),
+        #(1, 1, 216832, 219200, 128),
+        (1, 4, 349440, 351168, 128),
+        (1, 4, 695040, 697408, 128),
+        #(1, 1, 695040, 697408, 128),
     ]
     # topK values to benchmark (0 = dense)
     topk_values = [0, 32, 64, 128, 256]
 
-    print(f"\n{'Config (bwd blk=64)':<54} {'ms':>8} {'TFLOPS':>8}")
+    print(f"\n{'Config (bwd blk=64)':<54} {'ms':>8} {'TFLOPS':>8} {'MFU':>8}")
     print("-" * 74)
 
-    for bs, nheads, seqlen, hdim in configs:
-        q = torch.randn(bs, nheads, seqlen, hdim, device=device, dtype=dtype)
-        k = torch.randn(bs, nheads, seqlen, hdim, device=device, dtype=dtype)
-        v = torch.randn(bs, nheads, seqlen, hdim, device=device, dtype=dtype)
+    for bs, nheads, seqlen_q, seqlen_k, hdim in configs:
+        q = torch.randn(bs, nheads, seqlen_q, hdim, device=device, dtype=dtype)
+        k = torch.randn(bs, nheads, seqlen_k, hdim, device=device, dtype=dtype)
+        v = torch.randn(bs, nheads, seqlen_k, hdim, device=device, dtype=dtype)
         dout = torch.randn_like(q)
         out = torch.zeros_like(q)
-        lse = torch.zeros(bs, nheads, seqlen, device=device, dtype=torch.float32)
+        lse = torch.zeros(bs, nheads, seqlen_q, device=device, dtype=torch.float32)
 
-        num_kv_blocks = (seqlen + BLK - 1) // BLK
+        num_kv_blocks = (seqlen_k + BLK - 1) // BLK
+        topk_values = [int(num_kv_blocks * 0.1)]
 
         for topk in topk_values:
             if topk == 0:
                 q2k, bsn, bsize = make_dense_block_sparse_args(
-                    bs, seqlen, seqlen, nheads, blk_m=BLK, blk_n=BLK, device=device,
+                    bs, seqlen_q, seqlen_k, nheads, blk_m=BLK, blk_n=BLK, device=device,
                 )
                 q2k_block_nums = None
-                label = f"bs={bs} h={nheads} sq={seqlen} d={hdim} dense"
-                effective_sk = seqlen
+                label = f"bs={bs} h={nheads} sq={seqlen_q} sk={seqlen_k} d={hdim} dense"
+                effective_sk = seqlen_k
             else:
                 if topk > num_kv_blocks:
                     continue
                 topk_even = topk if topk % 2 == 0 else topk + 1
                 q2k, bsn, bsize, q2k_block_nums = make_topk_block_sparse_args(
-                    bs, seqlen, seqlen, nheads, topk_even,
+                    bs, seqlen_q, seqlen_k, nheads, topk_even,
                     blk_m=BLK, blk_n=BLK, device=device,
                 )
-                label = f"bs={bs} h={nheads} sq={seqlen} d={hdim} topk={topk_even}"
+                label = f"bs={bs} h={nheads} sq={seqlen_q} sk={seqlen_k} d={hdim} topk={topk_even}"
                 effective_sk = topk_even * BLK
 
             print(f"  {label:<52} ...", end="", flush=True)
             med = _bench_bwd_one(dout, q, k, v, out, lse, q2k, bsn, bsize,
                                   q2k_block_nums=q2k_block_nums)
-            f = flops(bs, nheads, seqlen, effective_sk, hdim, hdim) * _BWD_FLOPS_MULTIPLIER
+            f = bwd_flops(bs, nheads, seqlen_q, effective_sk, hdim, hdim)
             tflops = f / (med * 1e-3) / 1e12
-            print(f"\r  {label:<52} {med:>8.3f} {tflops:>8.1f}")
+            mfu = tflops / 2250.0 * 100.0
+            print(f"\r  {label:<52} {med:>8.3f}ms {tflops:>8.1f} tflops {mfu:>8.1f}%")
 
 
 if __name__ == "__main__":

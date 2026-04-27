@@ -918,9 +918,9 @@ class BlockSparseAttnBackward:
         sLSE = storage.sLSE.get_tensor(LSE_smem_layout)
         sSum_OdO = storage.sSum_OdO.get_tensor(sum_OdO_smem_layout)
 
-        tmem_holding_buf = storage.tmem_holding_buf
+        tmem_holding_buf = storage.tmem_holding_buf.ptr
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            tmem_holding_buf,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
         )

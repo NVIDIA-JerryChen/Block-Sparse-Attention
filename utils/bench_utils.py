@@ -37,6 +37,11 @@ def flops(
             avg_seqlen = (col_right - col_left + 1).float().mean().item()
     return batch * nheads * 2 * seqlen_q * avg_seqlen * (headdim + headdim_v)
 
+def bwd_flops(
+    batch, nheads, seqlen_q, seqlen_k, headdim, headdim_v
+):
+    return batch * nheads * 2 * seqlen_q * seqlen_k * (4 * headdim + headdim_v)
+
 
 # ── Reference attention ─────────────────────────────────────────────────────
 
