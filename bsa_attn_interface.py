@@ -14,6 +14,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32
 from cutlass.cute.runtime import from_dlpack
+import triton
+import triton.language as tl
 from utils.cache_utils import get_jit_cache
 from utils.testing import is_fake_mode
 
@@ -22,6 +24,9 @@ from utils import fa_logging
 from csrc.fwd.sm100_blk128.cute_dsl_utils import to_cute_tensor
 from csrc.fwd.sm100_blk128.flash_fwd_sm100 import FlashAttentionForwardSm100
 from csrc.bwd.sm100_blk64.flash_bwd_sm100 import BlockSparseAttnBackward
+from csrc.bwd.sm100_blk64.flash_bwd_sm100_qbucket import (
+    BlockSparseAttnBackwardQRangeBucketed,
+)
 
 BSA_BWD_SPARSE_BLOCK_SIZE = 64
 BSA_BWD_HEAD_DIM = 128
@@ -585,3 +590,471 @@ def bsa_attn_bwd(
 
 
 bsa_attn_bwd.compile_cache = get_jit_cache("bsa_bwd")
+
+
+@triton.jit
+def _qb_count_edges_kernel(
+    counts,
+    q2k_index,
+    q2k_nums,
+    idx_b_s: tl.constexpr,
+    idx_h_s: tl.constexpr,
+    idx_q_s: tl.constexpr,
+    idx_k_s: tl.constexpr,
+    nums_b_s: tl.constexpr,
+    nums_h_s: tl.constexpr,
+    nums_q_s: tl.constexpr,
+    num_heads: tl.constexpr,
+    num_kv_blocks: tl.constexpr,
+    num_q_groups: tl.constexpr,
+    q_bucket_size_blocks: tl.constexpr,
+    max_k: tl.constexpr,
+    block_sparse_num: tl.constexpr,
+    has_variable_nums: tl.constexpr,
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    q = tl.program_id(2)
+
+    n = block_sparse_num
+    if has_variable_nums:
+        n = tl.load(q2k_nums + b * nums_b_s + h * nums_h_s + q * nums_q_s)
+
+    q_group = q // q_bucket_size_blocks
+    q2k_base = q2k_index + b * idx_b_s + h * idx_h_s + q * idx_q_s
+    count_base = ((b * num_heads + h) * num_q_groups + q_group) * num_kv_blocks
+
+    for i in tl.range(0, max_k):
+        if i < n:
+            kv = tl.load(q2k_base + i * idx_k_s)
+            if (kv >= 0) & (kv < num_kv_blocks):
+                tl.atomic_add(counts + count_base + kv, 1, sem="relaxed")
+
+
+@triton.jit
+def _qb_local_offsets_kernel(
+    counts,
+    local_offsets,
+    group_totals,
+    num_heads: tl.constexpr,
+    num_kv_blocks: tl.constexpr,
+    num_q_groups: tl.constexpr,
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    g = tl.program_id(2)
+
+    count_base = ((b * num_heads + h) * num_q_groups + g) * num_kv_blocks
+    offset_base = ((b * num_heads + h) * num_q_groups + g) * (num_kv_blocks + 1)
+
+    running = tl.full((), 0, tl.int32)
+    for kv in tl.range(0, num_kv_blocks):
+        tl.store(local_offsets + offset_base + kv, running)
+        running += tl.load(counts + count_base + kv)
+    tl.store(local_offsets + offset_base + num_kv_blocks, running)
+    tl.store(group_totals + (b * num_heads + h) * num_q_groups + g, running)
+
+
+@triton.jit
+def _qb_finalize_offsets_kernel(
+    local_offsets,
+    group_totals,
+    task_offsets,
+    task_kv,
+    num_heads: tl.constexpr,
+    num_kv_blocks: tl.constexpr,
+    num_q_groups: tl.constexpr,
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    g = tl.program_id(2)
+
+    bh_group_base = (b * num_heads + h) * num_q_groups
+    base = tl.full((), 0, tl.int32)
+    for prev_g in tl.range(0, num_q_groups):
+        if prev_g < g:
+            base += tl.load(group_totals + bh_group_base + prev_g)
+
+    local_base = (bh_group_base + g) * (num_kv_blocks + 1)
+    task_offset_base = (bh_group_base + g) * (num_kv_blocks + 1)
+    task_kv_base = (bh_group_base + g) * num_kv_blocks
+
+    for kv in tl.range(0, num_kv_blocks):
+        tl.store(task_offsets + task_offset_base + kv, base + tl.load(local_offsets + local_base + kv))
+        tl.store(task_kv + task_kv_base + kv, kv)
+    tl.store(
+        task_offsets + task_offset_base + num_kv_blocks,
+        base + tl.load(local_offsets + local_base + num_kv_blocks),
+    )
+
+
+@triton.jit
+def _qb_scatter_q_indices_kernel(
+    cursors,
+    task_offsets,
+    task_q_indices,
+    q2k_index,
+    q2k_nums,
+    idx_b_s: tl.constexpr,
+    idx_h_s: tl.constexpr,
+    idx_q_s: tl.constexpr,
+    idx_k_s: tl.constexpr,
+    nums_b_s: tl.constexpr,
+    nums_h_s: tl.constexpr,
+    nums_q_s: tl.constexpr,
+    num_heads: tl.constexpr,
+    num_kv_blocks: tl.constexpr,
+    num_q_groups: tl.constexpr,
+    q_bucket_size_blocks: tl.constexpr,
+    max_edges_per_bh: tl.constexpr,
+    max_k: tl.constexpr,
+    block_sparse_num: tl.constexpr,
+    has_variable_nums: tl.constexpr,
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    q = tl.program_id(2)
+
+    n = block_sparse_num
+    if has_variable_nums:
+        n = tl.load(q2k_nums + b * nums_b_s + h * nums_h_s + q * nums_q_s)
+
+    q_group = q // q_bucket_size_blocks
+    q2k_base = q2k_index + b * idx_b_s + h * idx_h_s + q * idx_q_s
+    cursor_base = ((b * num_heads + h) * num_q_groups + q_group) * num_kv_blocks
+    offset_base = ((b * num_heads + h) * num_q_groups + q_group) * (num_kv_blocks + 1)
+    q_indices_base = (b * num_heads + h) * max_edges_per_bh
+
+    for i in tl.range(0, max_k):
+        if i < n:
+            kv = tl.load(q2k_base + i * idx_k_s)
+            if (kv >= 0) & (kv < num_kv_blocks):
+                pos = tl.atomic_add(cursors + cursor_base + kv, 1, sem="relaxed")
+                task_offset = tl.load(task_offsets + offset_base + kv)
+                tl.store(task_q_indices + q_indices_base + task_offset + pos, q)
+
+
+def build_q_range_bucketed_tasks(
+    q2k_block_index: torch.Tensor,
+    block_sparse_num: int,
+    num_kv_blocks: int,
+    *,
+    q_bucket_size_blocks: int = 512,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Build per-(B,H) q-range CSR tasks on GPU for the q-bucket bwd path."""
+    assert q2k_block_index.dtype == torch.int32
+    assert q2k_block_index.is_cuda
+    B, H, num_q_blocks, max_kv = q2k_block_index.shape
+    G = q_bucket_size_blocks
+    num_q_groups = (num_q_blocks + G - 1) // G
+
+    q2k_block_index = q2k_block_index.contiguous()
+    if q2k_block_nums is None:
+        nums = q2k_block_index
+        max_edges = num_q_blocks * int(block_sparse_num)
+        max_k = int(block_sparse_num)
+        has_variable_nums = False
+    else:
+        assert q2k_block_nums.dtype == torch.int32
+        assert q2k_block_nums.shape == (B, H, num_q_blocks)
+        nums = q2k_block_nums.contiguous()
+        max_edges = num_q_blocks * max_kv
+        max_k = max_kv
+        has_variable_nums = True
+
+    max_edges = max(1, max_edges)
+    max_tasks_per_group = num_kv_blocks
+
+    counts = torch.zeros(
+        (B, H, num_q_groups, num_kv_blocks),
+        dtype=torch.int32,
+        device=q2k_block_index.device,
+    )
+    local_offsets = torch.empty(
+        (B, H, num_q_groups, num_kv_blocks + 1),
+        dtype=torch.int32,
+        device=q2k_block_index.device,
+    )
+    group_totals = torch.empty(
+        (B, H, num_q_groups),
+        dtype=torch.int32,
+        device=q2k_block_index.device,
+    )
+    task_offsets = torch.empty_like(local_offsets)
+    task_kv = torch.empty_like(counts)
+    task_q_indices = torch.empty(
+        (B, H, max_edges), dtype=torch.int32, device=q2k_block_index.device
+    )
+
+    grid_q = (B, H, num_q_blocks)
+    _qb_count_edges_kernel[grid_q](
+        counts,
+        q2k_block_index,
+        nums,
+        q2k_block_index.stride(0),
+        q2k_block_index.stride(1),
+        q2k_block_index.stride(2),
+        q2k_block_index.stride(3),
+        nums.stride(0) if has_variable_nums else 0,
+        nums.stride(1) if has_variable_nums else 0,
+        nums.stride(2) if has_variable_nums else 0,
+        H,
+        num_kv_blocks,
+        num_q_groups,
+        G,
+        max_k,
+        int(block_sparse_num),
+        has_variable_nums,
+    )
+
+    grid_group = (B, H, num_q_groups)
+    _qb_local_offsets_kernel[grid_group](
+        counts,
+        local_offsets,
+        group_totals,
+        H,
+        num_kv_blocks,
+        num_q_groups,
+    )
+    _qb_finalize_offsets_kernel[grid_group](
+        local_offsets,
+        group_totals,
+        task_offsets,
+        task_kv,
+        H,
+        num_kv_blocks,
+        num_q_groups,
+    )
+
+    cursors = torch.zeros_like(counts)
+    _qb_scatter_q_indices_kernel[grid_q](
+        cursors,
+        task_offsets,
+        task_q_indices,
+        q2k_block_index,
+        nums,
+        q2k_block_index.stride(0),
+        q2k_block_index.stride(1),
+        q2k_block_index.stride(2),
+        q2k_block_index.stride(3),
+        nums.stride(0) if has_variable_nums else 0,
+        nums.stride(1) if has_variable_nums else 0,
+        nums.stride(2) if has_variable_nums else 0,
+        H,
+        num_kv_blocks,
+        num_q_groups,
+        G,
+        max_edges,
+        max_k,
+        int(block_sparse_num),
+        has_variable_nums,
+    )
+
+    return task_kv, task_offsets, task_q_indices, num_q_groups, max_tasks_per_group
+
+
+def bsa_attn_bwd_qbucket(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    block_sparse_num: int,
+    block_sizes: Optional[torch.Tensor] = None,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    dq: Optional[torch.Tensor] = None,
+    dk: Optional[torch.Tensor] = None,
+    dv: Optional[torch.Tensor] = None,
+    q_bucket_size_blocks: int = 512,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Q-range bucketed backward pass for BSA block-sparse attention.
+
+    This has the same tensor contract as :func:`bsa_attn_bwd`, but builds a
+    compact q-range task layout and runs the bucketed SM100 blk64 backward
+    kernel. Bucket task construction is performed on GPU with Triton on every
+    call, so this path is suitable when the sparse pattern changes each
+    backward.
+    """
+    q, k, v, out, dout = [maybe_contiguous(t) for t in (q, k, v, out, dout)]
+    lse = maybe_contiguous(lse)
+
+    assert q.dtype == torch.bfloat16, "q-bucket bwd only supports bfloat16"
+    assert q.dtype == k.dtype == v.dtype == out.dtype == dout.dtype
+    assert lse.dtype == torch.float32
+    if not is_fake_mode():
+        assert all(t.is_cuda for t in (q, k, v, out, dout, lse))
+
+    batch_size, num_heads, seqlen_q, head_dim = q.shape
+    num_heads_kv, seqlen_k = k.shape[1], k.shape[2]
+    assert head_dim == BSA_BWD_HEAD_DIM
+    assert num_heads == num_heads_kv, "q-bucket bwd does not support GQA/MQA"
+    assert k.shape == v.shape == (batch_size, num_heads, seqlen_k, head_dim)
+    assert out.shape == (batch_size, num_heads, seqlen_q, head_dim)
+    assert dout.shape == out.shape
+    assert lse.shape == (batch_size, num_heads, seqlen_q)
+
+    arch = _get_device_arch()
+    assert arch // 10 in [10, 11], "BSA q-bucket bwd only supports SM100/SM110"
+
+    sparse_block_size = BSA_BWD_SPARSE_BLOCK_SIZE
+    num_q_blocks = (seqlen_q + sparse_block_size - 1) // sparse_block_size
+    num_kv_blocks = (seqlen_k + sparse_block_size - 1) // sparse_block_size
+
+    assert q2k_block_index.dtype == torch.int32
+    assert q2k_block_index.shape[:3] == (batch_size, num_heads, num_q_blocks)
+    if q2k_block_nums is not None:
+        q2k_block_nums = maybe_contiguous(q2k_block_nums)
+        assert q2k_block_nums.dtype == torch.int32
+        assert q2k_block_nums.shape == (batch_size, num_heads, num_q_blocks)
+
+    task_kv, task_offsets, task_q_indices, _num_q_groups, _max_tasks_per_group = (
+        build_q_range_bucketed_tasks(
+            q2k_block_index,
+            block_sparse_num,
+            num_kv_blocks,
+            q_bucket_size_blocks=q_bucket_size_blocks,
+            q2k_block_nums=q2k_block_nums,
+        )
+    )
+
+    if block_sizes is None:
+        variable_block_sizes = torch.full(
+            (batch_size, num_kv_blocks),
+            sparse_block_size,
+            dtype=torch.int32,
+            device=q.device,
+        )
+    else:
+        assert block_sizes.dtype == torch.int32
+        if block_sizes.ndim == 1:
+            assert block_sizes.shape == (num_kv_blocks,)
+            variable_block_sizes = (
+                block_sizes.unsqueeze(0).expand(batch_size, -1).contiguous()
+            )
+        else:
+            assert block_sizes.shape == (batch_size, num_kv_blocks)
+            variable_block_sizes = block_sizes.contiguous()
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    if dq is None:
+        dq = torch.zeros_like(q)
+    else:
+        dq.zero_()
+    if dk is None:
+        dk = torch.zeros_like(k)
+    else:
+        dk.zero_()
+    if dv is None:
+        dv = torch.zeros_like(v)
+    else:
+        dv.zero_()
+
+    workspace_shape = BlockSparseAttnBackwardQRangeBucketed._get_workspace_size(
+        q=seqlen_q,
+        k=seqlen_k,
+        d=head_dim,
+        h=num_heads,
+        b=batch_size,
+        acc_dtype=Float32,
+    )
+    workspace = torch.zeros(workspace_shape, dtype=torch.uint8, device=q.device)
+
+    problem_shape = (seqlen_q, seqlen_k, head_dim, (num_heads, batch_size))
+    current_stream = (
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        if is_fake_mode()
+        else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    )
+
+    compile_key = (
+        q.dtype,
+        head_dim,
+        num_heads,
+        sparse_block_size,
+        arch,
+        fa_logging.get_fa_log_level(),
+    )
+
+    def convert_to_cute_tensor(t: torch.Tensor, enable_tvm_ffi: bool = True) -> cute.Tensor:
+        return (
+            from_dlpack(t.detach(), assumed_align=16, enable_tvm_ffi=enable_tvm_ffi)
+            .mark_layout_dynamic()
+            .mark_compact_shape_dynamic(
+                mode=3, stride_order=t.dim_order(), divisibility=128
+            )
+        )
+
+    if compile_key not in bsa_attn_bwd_qbucket.compile_cache:
+        dO_t = convert_to_cute_tensor(dout)
+        O_t = convert_to_cute_tensor(out)
+        Q_t = convert_to_cute_tensor(q)
+        K_t = convert_to_cute_tensor(k)
+        V_t = convert_to_cute_tensor(v)
+        dQ_t = convert_to_cute_tensor(dq)
+        dK_t = convert_to_cute_tensor(dk)
+        dV_t = convert_to_cute_tensor(dv)
+        LSE_t = to_cute_tensor(lse, leading_dim=2)
+        task_kv_t = to_cute_tensor(task_kv, leading_dim=3)
+        task_offsets_t = to_cute_tensor(task_offsets, leading_dim=3)
+        task_q_indices_t = to_cute_tensor(task_q_indices, leading_dim=2)
+        var_bs_t = to_cute_tensor(variable_block_sizes, leading_dim=1)
+        ws_t = to_cute_tensor(workspace, fully_dynamic=True)
+
+        bwd_kernel = BlockSparseAttnBackwardQRangeBucketed(
+            sparse_block_size=sparse_block_size,
+        )
+
+        bsa_attn_bwd_qbucket.compile_cache[compile_key] = cute.compile(
+            bwd_kernel,
+            problem_shape,
+            dO_t,
+            O_t,
+            Q_t,
+            K_t,
+            V_t,
+            LSE_t,
+            dQ_t,
+            dK_t,
+            dV_t,
+            task_kv_t,
+            task_offsets_t,
+            task_q_indices_t,
+            var_bs_t,
+            ws_t,
+            softmax_scale,
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+
+    if not is_fake_mode():
+        with torch.cuda.nvtx.range("bsa_attn_bwd_qbucket_kernel"):
+            bsa_attn_bwd_qbucket.compile_cache[compile_key](
+                problem_shape,
+                dout,
+                out,
+                q,
+                k,
+                v,
+                lse,
+                dq,
+                dk,
+                dv,
+                task_kv,
+                task_offsets,
+                task_q_indices,
+                variable_block_sizes,
+                workspace,
+                softmax_scale,
+                current_stream,
+            )
+
+    return dq, dk, dv
+
+
+bsa_attn_bwd_qbucket.compile_cache = get_jit_cache("bsa_bwd_qbucket")

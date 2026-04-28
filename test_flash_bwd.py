@@ -12,7 +12,7 @@ import math
 import pytest
 import torch
 
-from bsa_attn_interface import bsa_attn_bwd, convert_q2k_to_k2q
+from bsa_attn_interface import bsa_attn_bwd, bsa_attn_bwd_qbucket, convert_q2k_to_k2q
 from test_flash_fwd import (
     make_dense_block_sparse_args,
     make_random_block_sparse_args,
@@ -58,7 +58,16 @@ def _torch_ref_bwd(q, k, v, dout, attn_bias, softmax_scale, upcast=True):
     )
 
 
-def _test_bwd_single(bs, seqlen_q, seqlen_k, nheads, *, use_variable_block_nums=False):
+def _test_bwd_single(
+    bs,
+    seqlen_q,
+    seqlen_k,
+    nheads,
+    *,
+    use_variable_block_nums=False,
+    impl="baseline",
+    q_bucket_size_blocks=512,
+):
     """One bwd correctness iteration."""
     device = "cuda"
     dtype = torch.bfloat16
@@ -104,12 +113,23 @@ def _test_bwd_single(bs, seqlen_q, seqlen_k, nheads, *, use_variable_block_nums=
     dk_pt = torch.nan_to_num(dk_pt.float(), nan=0.0, posinf=0.0, neginf=0.0)
     dv_pt = torch.nan_to_num(dv_pt.float(), nan=0.0, posinf=0.0, neginf=0.0)
 
-    dq, dk, dv = bsa_attn_bwd(
-        dout, q, k, v, out_ref, lse_ref,
-        q2k_block_index, block_sparse_num, block_sizes,
-        q2k_block_nums=q2k_block_nums,
-        softmax_scale=softmax_scale,
-    )
+    if impl == "baseline":
+        dq, dk, dv = bsa_attn_bwd(
+            dout, q, k, v, out_ref, lse_ref,
+            q2k_block_index, block_sparse_num, block_sizes,
+            q2k_block_nums=q2k_block_nums,
+            softmax_scale=softmax_scale,
+        )
+    elif impl == "qbuck":
+        dq, dk, dv = bsa_attn_bwd_qbucket(
+            dout, q, k, v, out_ref, lse_ref,
+            q2k_block_index, block_sparse_num, block_sizes,
+            q2k_block_nums=q2k_block_nums,
+            softmax_scale=softmax_scale,
+            q_bucket_size_blocks=q_bucket_size_blocks,
+        )
+    else:
+        raise ValueError(f"unknown bwd correctness impl: {impl}")
 
     def _max_abs(a, b):
         return (a.float() - b.float()).abs().max().item()
@@ -133,7 +153,7 @@ def _test_bwd_single(bs, seqlen_q, seqlen_k, nheads, *, use_variable_block_nums=
     mode_str = "var_bsn" if use_variable_block_nums else f"sparse_num={block_sparse_num}"
     tag = "PASS" if passed else "FAIL"
     print(
-        f"  {tag} bs={bs} sq={seqlen_q} sk={seqlen_k} h={nheads} d={d} {mode_str}: "
+        f"  {tag} {impl} bs={bs} sq={seqlen_q} sk={seqlen_k} h={nheads} d={d} {mode_str}: "
         f"dq={dq_diff:.4f}/{dq_tol:.4f} "
         f"dk={dk_diff:.4f}/{dk_tol:.4f} "
         f"dv={dv_diff:.4f}/{dv_tol:.4f}"
@@ -166,6 +186,41 @@ def test_flash_bwd_sm100_blk64(seqlen_q, seqlen_k, use_variable_block_nums):
                      use_variable_block_nums=use_variable_block_nums)
 
 
+@pytest.mark.parametrize("use_variable_block_nums", [False, True])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (128, 256),
+        (256, 512),
+        (1024, 1024),
+    ],
+)
+def test_flash_bwd_qbucket_sm100_blk64(seqlen_q, seqlen_k, use_variable_block_nums):
+    bs = 2 if seqlen_k <= 512 else 1
+    nheads = 4
+    _test_bwd_single(
+        bs,
+        seqlen_q,
+        seqlen_k,
+        nheads,
+        use_variable_block_nums=use_variable_block_nums,
+        impl="qbuck",
+    )
+
+
+@pytest.mark.parametrize("use_variable_block_nums", [False, True])
+def test_flash_bwd_qbucket_multi_group_sm100_blk64(use_variable_block_nums):
+    _test_bwd_single(
+        1,
+        512,
+        768,
+        4,
+        use_variable_block_nums=use_variable_block_nums,
+        impl="qbuck",
+        q_bucket_size_blocks=2,
+    )
+
+
 # ============== Quick test (make ttb) ==============
 
 def run_quick_tests():
@@ -193,6 +248,23 @@ def run_quick_tests():
     for bs, sq, sk, h in var_configs:
         _test_bwd_single(bs, sq, sk, h, use_variable_block_nums=True)
 
+    print("-" * 70)
+    print("Q-bucket correctness tests (bwd blk64)")
+    qbucket_configs = [
+        (1, 128, 256, 4, False),
+        (1, 256, 512, 4, False),
+        (1, 128, 512, 4, True),
+    ]
+    for bs, sq, sk, h, use_var in qbucket_configs:
+        _test_bwd_single(
+            bs,
+            sq,
+            sk,
+            h,
+            use_variable_block_nums=use_var,
+            impl="qbuck",
+        )
+
     print("=" * 70)
     print("All bwd quick tests passed.")
 
@@ -200,19 +272,30 @@ def run_quick_tests():
 # ============== Benchmark ==============
 
 def _bench_bwd_one(dout, q, k, v, out, lse, q2k, bsn, bsize, q2k_block_nums=None,
-                    niters=10):
+                    niters=10, impl="baseline", q_bucket_size_blocks=512):
     """Warmup + time a single bwd call. Returns median ms."""
-    for _ in range(2):
-        bsa_attn_bwd(dout, q, k, v, out, lse, q2k, bsn, bsize,
-                     q2k_block_nums=q2k_block_nums)
+    def _run_once():
+        if impl == "baseline":
+            bsa_attn_bwd(dout, q, k, v, out, lse, q2k, bsn, bsize,
+                         q2k_block_nums=q2k_block_nums)
+        elif impl == "qbuck":
+            bsa_attn_bwd_qbucket(
+                dout, q, k, v, out, lse, q2k, bsn, bsize,
+                q2k_block_nums=q2k_block_nums,
+                q_bucket_size_blocks=q_bucket_size_blocks,
+            )
+        else:
+            raise ValueError(f"unknown bwd benchmark impl: {impl}")
+
+    for _ in range(int(os.environ.get("BSA_BWD_WARMUP", "5"))):
+        _run_once()
     torch.cuda.synchronize()
 
     evts = [(torch.cuda.Event(enable_timing=True),
              torch.cuda.Event(enable_timing=True)) for _ in range(niters)]
     for s, e in evts:
         s.record()
-        bsa_attn_bwd(dout, q, k, v, out, lse, q2k, bsn, bsize,
-                     q2k_block_nums=q2k_block_nums)
+        _run_once()
         e.record()
     torch.cuda.synchronize()
     times = sorted([s.elapsed_time(e) for s, e in evts])
@@ -223,28 +306,27 @@ def run_benchmark_suite():
     device = "cuda"
     dtype = torch.bfloat16
     d = 128
+    bench_impls = [
+        x.strip()
+        for x in os.environ.get("BSA_BWD_BENCH_IMPL", "baseline,qbuck").split(",")
+        if x.strip()
+    ]
+    q_bucket_size_blocks = int(os.environ.get("BSA_Q_BUCKET_BLOCKS", "512"))
     # (bs, nheads, seqlen_q, seqlen_k, hdim)
     configs = [
-        # (1, 4, 6400, 6400, 128),
-        # (1, 4, 19200, 19200, 128),
-        # (1, 4, 32000, 32000, 128),
-        # (1, 4, 51200, 51200, 128),
-        # (1, 4, 64000, 64000, 128),
-        # (1, 4, 83200, 83200, 128),
-        # (1, 4, 96000, 96000, 128),
         (1, 4, 116160, 118528, 128),
         (1, 4, 109312, 111040, 128),
         (1, 4, 216832, 219200, 128),
-        #(1, 1, 216832, 219200, 128),
+        (1, 1, 216832, 219200, 128),
         (1, 4, 349440, 351168, 128),
         (1, 4, 695040, 697408, 128),
-        #(1, 1, 695040, 697408, 128),
+        (1, 1, 695040, 697408, 128),
     ]
     # topK values to benchmark (0 = dense)
     topk_values = [0, 32, 64, 128, 256]
 
-    print(f"\n{'Config (bwd blk=64)':<54} {'ms':>8} {'TFLOPS':>8} {'MFU':>8}")
-    print("-" * 74)
+    print(f"\n{'Config (bwd blk=64)':<54} {'impl':>10} {'ms':>8} {'TFLOPS':>8} {'MFU':>8}")
+    print("-" * 85)
 
     for bs, nheads, seqlen_q, seqlen_k, hdim in configs:
         q = torch.randn(bs, nheads, seqlen_q, hdim, device=device, dtype=dtype)
@@ -276,13 +358,24 @@ def run_benchmark_suite():
                 label = f"bs={bs} h={nheads} sq={seqlen_q} sk={seqlen_k} d={hdim} topk={topk_even}"
                 effective_sk = topk_even * BLK
 
-            print(f"  {label:<52} ...", end="", flush=True)
-            med = _bench_bwd_one(dout, q, k, v, out, lse, q2k, bsn, bsize,
-                                  q2k_block_nums=q2k_block_nums)
-            f = bwd_flops(bs, nheads, seqlen_q, effective_sk, hdim, hdim)
-            tflops = f / (med * 1e-3) / 1e12
-            mfu = tflops / 2250.0 * 100.0
-            print(f"\r  {label:<52} {med:>8.3f}ms {tflops:>8.1f} tflops {mfu:>8.1f}%")
+            for impl in bench_impls:
+                impl_label = impl
+                if impl == "qbuck":
+                    impl_label = f"qbuck{q_bucket_size_blocks}"
+                print(f"  {label:<52} {impl_label:>10} ...", end="", flush=True)
+                med = _bench_bwd_one(
+                    dout, q, k, v, out, lse, q2k, bsn, bsize,
+                    q2k_block_nums=q2k_block_nums,
+                    impl=impl,
+                    q_bucket_size_blocks=q_bucket_size_blocks,
+                )
+                f = bwd_flops(bs, nheads, seqlen_q, effective_sk, hdim, hdim)
+                tflops = f / (med * 1e-3) / 1e12
+                mfu = tflops / 2250.0 * 100.0
+                print(
+                    f"\r  {label:<52} {impl_label:>10} "
+                    f"{med:>8.3f}ms {tflops:>8.1f} tflops {mfu:>8.1f}%"
+                )
 
 
 if __name__ == "__main__":

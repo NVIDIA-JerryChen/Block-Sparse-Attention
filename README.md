@@ -20,8 +20,9 @@
 
 ```
 BSA/
-├── bsa_attn_interface.py         # Public API (bsa_attn_fwd, blk128 backend)
-├── test_flash_fwd.py             # Tests & benchmarks (blk64 + blk128)
+├── bsa_attn_interface.py         # Public API (fwd, bwd, qbucket bwd)
+├── test_flash_fwd.py             # Forward tests & benchmarks (blk64 + blk128)
+├── test_flash_bwd.py             # Backward tests & benchmarks (blk64)
 ├── requirements.txt              # Python dependencies
 ├── Makefile                      # Build & test automation
 │
@@ -47,6 +48,11 @@ BSA/
 │       ├── tile_scheduler.hpp            # Tile scheduler
 │       ├── bindings.cpp                  # PyTorch C++ bindings (returns [out, lse])
 │       └── setup.py                      # Build script (bdist_wheel + CUDAExtension)
+│
+├── csrc/bwd/
+│   └── sm100_blk64/                      # blk64 backward — CuTe DSL / JIT compiled
+│       ├── flash_bwd_sm100.py            # KV-major backward kernel
+│       └── flash_bwd_sm100_qbucket.py    # Q-range bucketed backward kernel
 │
 ├── utils/
 │   ├── cache_utils.py            # JIT compilation cache
@@ -87,7 +93,7 @@ make setup
 
 ```python
 import torch
-from bsa_attn_interface import bsa_attn_fwd
+from bsa_attn_interface import bsa_attn_fwd, bsa_attn_bwd, bsa_attn_bwd_qbucket
 
 q = torch.randn(1, 1024, 8, 128, device="cuda", dtype=torch.bfloat16)
 k = torch.randn(1, 1024, 8, 128, device="cuda", dtype=torch.bfloat16)
@@ -98,6 +104,25 @@ out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes)
 # Variable per-Q-block KV block counts
 out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, 0, block_sizes,
                          q2k_block_nums=q2k_block_nums)
+
+# Backward uses BHSD layout: (batch, heads, seqlen, dim)
+q_bhsd = q.transpose(1, 2).contiguous()
+k_bhsd = k.transpose(1, 2).contiguous()
+v_bhsd = v.transpose(1, 2).contiguous()
+out_bhsd = out.transpose(1, 2).contiguous()
+dout_bhsd = torch.randn_like(out_bhsd)
+
+dq, dk, dv = bsa_attn_bwd(
+    dout_bhsd, q_bhsd, k_bhsd, v_bhsd, out_bhsd, lse,
+    q2k_block_index, block_sparse_num, block_sizes,
+)
+
+# Long-sequence experimental path: Q-range bucketed backward
+dq, dk, dv = bsa_attn_bwd_qbucket(
+    dout_bhsd, q_bhsd, k_bhsd, v_bhsd, out_bhsd, lse,
+    q2k_block_index, block_sparse_num, block_sizes,
+    q_bucket_size_blocks=512,
+)
 ```
 
 ## API Reference
@@ -152,6 +177,67 @@ block_sparse_num = N                  # must be even, >= 2
 block_sizes = [tile_n] * N            # last block adjusted for seqlen remainder
 ```
 
+### `bsa_attn_bwd(dout, q, k, v, out, lse, q2k_block_index, block_sparse_num, block_sizes, ...)`
+
+SM100 block-sparse backward attention (blk64 backend only).
+
+This recomputes the attention probabilities from `q/k/v`, `out`, and `lse`, then returns gradients `(dq, dk, dv)`.
+
+**Tensor layout:** `(batch, num_heads, seqlen, head_dim)` (`BHSD`), last dim contiguous.
+
+#### Backward Inputs
+
+| Tensor | Shape | Type | Description |
+|--------|-------|------|-------------|
+| `dout` | (batch, num_heads, seqlen_q, head_dim) | bf16 | Upstream gradient |
+| `q` | (batch, num_heads, seqlen_q, head_dim) | bf16 | Query |
+| `k` | (batch, num_heads, seqlen_k, head_dim) | bf16 | Key |
+| `v` | (batch, num_heads, seqlen_k, head_dim) | bf16 | Value |
+| `out` | (batch, num_heads, seqlen_q, head_dim) | bf16 | Forward output |
+| `lse` | (batch, num_heads, seqlen_q) | fp32 | Forward log-sum-exp |
+
+The block-sparse arguments have the same meaning as forward:
+
+| Parameter | Shape | Type | Description |
+|-----------|-------|------|-------------|
+| `q2k_block_index` | (batch, num_heads, num_q_blocks, max_kv_blocks) | int32 | Per Q-block list of KV block indices |
+| `block_sparse_num` | scalar | int | Fixed KV block count per Q block. Ignored when `q2k_block_nums` is provided |
+| `block_sizes` | (num_kv_blocks,) or (batch, num_kv_blocks) | int32 | Actual token count per KV block |
+| `q2k_block_nums` | (batch, num_heads, num_q_blocks) | int32 | Optional variable KV block count per Q block |
+
+#### Backward Outputs
+
+| Tensor | Shape | Type | Description |
+|--------|-------|------|-------------|
+| `dq` | same as `q` | bf16 | Gradient w.r.t. Q |
+| `dk` | same as `k` | bf16 | Gradient w.r.t. K |
+| `dv` | same as `v` | bf16 | Gradient w.r.t. V |
+
+#### Backward Limitations
+
+Backward currently supports:
+
+```text
+backend: blk64 CuTe DSL
+dtype: bf16
+head_dim: 128
+attention: MHA only, num_heads == num_heads_kv
+block size: 64
+architecture: SM100/SM110
+```
+
+### `bsa_attn_bwd_qbucket(..., q_bucket_size_blocks=512)`
+
+Q-range bucketed backward path for long-sequence sparse attention.
+
+It has the same tensor contract as `bsa_attn_bwd`, but builds a GPU-side Q-range task layout from `q2k_block_index` on every call. The main backward kernel then runs one task per `(q_group, kv_block)` instead of one task per `kv_block`.
+
+This path is intended for long sequences with random-ish topK sparsity where the baseline KV-major backward suffers from poor `dQ_acc` locality. The tradeoff is extra task construction, K/V reloads, and fp32 partial `dK/dV` accumulation.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `q_bucket_size_blocks` | `512` | Number of Q blocks per bucket. Larger values reduce task count; smaller values improve `dQ_acc` locality |
+
 ## Tests & Benchmarks
 
 ```bash
@@ -168,4 +254,9 @@ make bm-cli                     # ncu register/spill/smem analysis
 make compare                    # Compare BSA vs FA4 performance
 make clean                      # Clear compile caches + blk64 build
 make help                       # Show all targets
+
+python test_flash_bwd.py                    # Backward quick correctness tests
+python test_flash_bwd.py benchmark          # Backward benchmark
+BSA_BWD_BENCH_IMPL=baseline python test_flash_bwd.py benchmark
+BSA_BWD_BENCH_IMPL=qbuck BSA_Q_BUCKET_BLOCKS=512 python test_flash_bwd.py benchmark
 ```
