@@ -75,8 +75,14 @@ std::tuple<torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_impl(
                 "blk64 requires MHA: q/k/v must share num_heads (size(1))");
     TORCH_CHECK(k.size(2) == v.size(2), "k/v seqlen mismatch");
     TORCH_CHECK(v.size(3) == q.size(3), "v head_dim mismatch");
+    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
+                "q/k/v must be BHSD-contiguous");
+    TORCH_CHECK(q2k_block_index.is_contiguous(), "q2k_block_index must be contiguous");
 
     const bool has_var_block_nums = q2k_block_nums.defined() && q2k_block_nums.numel() > 0;
+    if (has_var_block_nums) {
+        TORCH_CHECK(q2k_block_nums.is_contiguous(), "q2k_block_nums must be contiguous");
+    }
 
     const int b = q.size(0), h = q.size(1), seqlen_q = q.size(2), d = q.size(3);
     const int seqlen_k = k.size(2);
@@ -87,11 +93,6 @@ std::tuple<torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_impl(
     const int seqlen_q_rounded = ((seqlen_q + kRows - 1) / kRows) * kRows;
     const int seqlen_k_rounded = ((seqlen_k + kSparseBlockSize - 1) / kSparseBlockSize) * kSparseBlockSize;
     const int num_m_blocks = seqlen_q_rounded / kRows;
-
-    // ======== Q/K passed directly in BHSD (5D TMA handles strided access) ========
-    // Python interface ensures seqlen_q/seqlen_k are multiples of kRows/kSparseBlockSize.
-    torch::Tensor q_contig = q.contiguous();
-    torch::Tensor k_contig = k.contiguous();
 
     // V: sub-tile transpose (swap token↔dim within each 64×64 block).
     // Required because PV dual GEMM reduces over K direction (= tokens),
@@ -112,29 +113,24 @@ std::tuple<torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_impl(
     auto lse = torch::empty({b, h, seqlen_q_rounded},
                             torch::dtype(torch::kFloat32).device(q.device()));
 
-    // ======== Block indices ========
-    auto bi_flat = q2k_block_index.reshape({b * h, num_m_blocks, -1}).contiguous();
-    int block_indices_stride = static_cast<int>(bi_flat.size(2));
+    // ======== Block indices (use input pointer directly; layout (b,h,m,n) ========
+    // contiguous gives flat (b*h*m, n) layout the kernel expects).
+    int block_indices_stride = static_cast<int>(q2k_block_index.size(3));
 
-    // q2k_block_nums: only reshape/materialize when user supplied a non-empty tensor.
-    // Otherwise pass nullptr and let the kernel read the uniform scalar via
-    // params.uniform_block_sparse_num (HasVarBlockNums=false compile-time branch).
-    // bn_flat must outlive the kernel launch, so keep it in scope here.
-    torch::Tensor bn_flat;
-    int const* q2k_block_nums_ptr = nullptr;
-    if (has_var_block_nums) {
-        bn_flat = q2k_block_nums.reshape({b * h * num_m_blocks}).contiguous();
-        q2k_block_nums_ptr = bn_flat.data_ptr<int>();
-    }
+    // q2k_block_nums: pass pointer directly when present; nullptr otherwise so the
+    // HasVarBlockNums=false compile-time branch reads uniform_block_sparse_num.
+    int const* q2k_block_nums_ptr = has_var_block_nums
+                                    ? q2k_block_nums.data_ptr<int>()
+                                    : nullptr;
 
     // ======== Populate params (FA Hopper set_params_fprop pattern) ========
     bsa_fwd_params params{};
     set_params_fprop(params,
                      b, seqlen_q, seqlen_k, h, h_k, d,
-                     q_contig, k_contig, v_contig,
+                     q, k, v_contig,
                      out, lse,
                      softmax_scale,
-                     bi_flat, block_indices_stride,
+                     q2k_block_index, block_indices_stride,
                      block_sizes, q2k_block_nums_ptr,
                      static_cast<int>(block_sparse_num), num_m_blocks,
                      seqlen_q_rounded, seqlen_k_rounded);

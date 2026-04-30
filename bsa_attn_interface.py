@@ -28,6 +28,11 @@ from csrc.bwd.sm100_blk64.flash_bwd_sm100_qbucket import (
     BlockSparseAttnBackwardQRangeBucketed,
 )
 
+try:
+    import bsa_fwd_blk64_ext  # triggers TORCH_LIBRARY registration of bsa_blk64.fwd
+except ImportError:
+    pass  # blk64 wheel not built — bsa_attn_fwd_blk64 will fail at call time
+
 BSA_BWD_SPARSE_BLOCK_SIZE = 64
 BSA_BWD_HEAD_DIM = 128
 
@@ -122,7 +127,6 @@ def bsa_attn_fwd_blk64(
         k = torch.nn.functional.pad(k, (0, 0, 0, pad_k))
         v = torch.nn.functional.pad(v, (0, 0, 0, pad_k))
 
-    import bsa_fwd_blk64_ext  # triggers TORCH_LIBRARY registration
     out, lse = torch.ops.bsa_blk64.fwd(
         q, k, v, q2k_block_index, 0, block_sizes, softmax_scale, q2k_block_nums, use_clc)
 
