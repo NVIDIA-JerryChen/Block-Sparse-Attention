@@ -308,7 +308,7 @@ def run_benchmark_suite():
     d = 128
     bench_impls = [
         x.strip()
-        for x in os.environ.get("BSA_BWD_BENCH_IMPL", "baseline,qbuck").split(",")
+        for x in os.environ.get("BSA_BWD_BENCH_IMPL", "qbuck").split(",")
         if x.strip()
     ]
     q_bucket_size_blocks = int(os.environ.get("BSA_Q_BUCKET_BLOCKS", "512"))
