@@ -226,7 +226,7 @@ block size: 64
 architecture: SM100/SM110
 ```
 
-### `bsa_attn_bwd_qbucket(..., q_bucket_size_blocks=512)`
+### `bsa_attn_bwd_qbucket(..., q_bucket_size_blocks=1024)`
 
 Q-range bucketed backward path for long-sequence sparse attention.
 
@@ -234,9 +234,11 @@ It has the same tensor contract as `bsa_attn_bwd`, but builds a GPU-side Q-range
 
 This path is intended for long sequences with random-ish topK sparsity where the baseline KV-major backward suffers from poor `dQ_acc` locality. The tradeoff is extra task construction, K/V reloads, and fp32 partial `dK/dV` accumulation.
 
+For full-block long-sequence cases (`block_sizes=None`, `num_q_blocks >= 3000`), `bsa_attn_bwd` automatically dispatches to this qbucket path by default. Set `BSA_BWD_AUTO_QBUCKET=0` to force the KV-major path, or `BSA_BWD_AUTO_Q_BUCKET_BLOCKS=<n>` to tune the automatic bucket size.
+
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `q_bucket_size_blocks` | `512` | Number of Q blocks per bucket. Larger values reduce task count; smaller values improve `dQ_acc` locality |
+| `q_bucket_size_blocks` | `1024` | Number of Q blocks per bucket. Larger values reduce task count; smaller values improve `dQ_acc` locality |
 
 ## Tests & Benchmarks
 
@@ -258,5 +260,5 @@ make help                       # Show all targets
 python test_flash_bwd.py                    # Backward quick correctness tests
 python test_flash_bwd.py benchmark          # Backward benchmark
 BSA_BWD_BENCH_IMPL=baseline python test_flash_bwd.py benchmark
-BSA_BWD_BENCH_IMPL=qbuck BSA_Q_BUCKET_BLOCKS=512 python test_flash_bwd.py benchmark
+BSA_BWD_BENCH_IMPL=qbuck BSA_Q_BUCKET_BLOCKS=1024 python test_flash_bwd.py benchmark
 ```

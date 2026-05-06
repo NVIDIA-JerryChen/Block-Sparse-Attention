@@ -35,6 +35,8 @@ except ImportError:
 
 BSA_BWD_SPARSE_BLOCK_SIZE = 64
 BSA_BWD_HEAD_DIM = 128
+BSA_BWD_AUTO_QBUCKET = os.environ.get("BSA_BWD_AUTO_QBUCKET", "1") == "1"
+BSA_BWD_AUTO_Q_BUCKET_BLOCKS = int(os.environ.get("BSA_BWD_AUTO_Q_BUCKET_BLOCKS", "1024"))
 
 _bsa_clc_enabled: bool = os.environ.get("BSA_CLC", "1") == "1"
 
@@ -461,16 +463,40 @@ def bsa_attn_bwd(
         assert q2k_block_nums.dtype == torch.int32
         assert q2k_block_nums.shape == (batch_size, num_heads, num_q_blocks)
 
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    if (
+        BSA_BWD_AUTO_QBUCKET
+        and block_sizes is None
+        and num_q_blocks >= 3000
+    ):
+        return bsa_attn_bwd_qbucket(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            lse,
+            q2k_block_index,
+            block_sparse_num,
+            block_sizes=block_sizes,
+            q2k_block_nums=q2k_block_nums,
+            softmax_scale=softmax_scale,
+            dq=dq,
+            dk=dk,
+            dv=dv,
+            q_bucket_size_blocks=BSA_BWD_AUTO_Q_BUCKET_BLOCKS,
+        )
+
     k2q_block_index, k2q_block_nums = convert_q2k_to_k2q(
         q2k_block_index, block_sparse_num, num_kv_blocks, q2k_block_nums=q2k_block_nums,
     )
 
-    if block_sizes is None:
-        variable_block_sizes = torch.full(
-            (batch_size, num_kv_blocks),
-            sparse_block_size,
-            dtype=torch.int32,
-            device=q.device,
+    has_block_sizes = block_sizes is not None
+    if not has_block_sizes:
+        variable_block_sizes = torch.empty(
+            (1, 1), dtype=torch.int32, device=q.device
         )
     else:
         assert block_sizes.dtype == torch.int32
@@ -482,9 +508,6 @@ def bsa_attn_bwd(
         else:
             assert block_sizes.shape == (batch_size, num_kv_blocks)
             variable_block_sizes = block_sizes.contiguous()
-
-    if softmax_scale is None:
-        softmax_scale = 1.0 / math.sqrt(head_dim)
 
     if dq is None:
         dq = torch.zeros_like(q)
@@ -519,6 +542,7 @@ def bsa_attn_bwd(
         num_heads,
         sparse_block_size,
         arch,
+        has_block_sizes,
         fa_logging.get_fa_log_level(),
     )
 
@@ -546,7 +570,10 @@ def bsa_attn_bwd(
         var_bs_t = to_cute_tensor(variable_block_sizes, leading_dim=1)
         ws_t = to_cute_tensor(workspace, fully_dynamic=True)
 
-        bwd_kernel = BlockSparseAttnBackward(sparse_block_size=sparse_block_size)
+        bwd_kernel = BlockSparseAttnBackward(
+            sparse_block_size=sparse_block_size,
+            has_block_sizes=has_block_sizes,
+        )
 
         bsa_attn_bwd.compile_cache[compile_key] = cute.compile(
             bwd_kernel,
@@ -636,6 +663,38 @@ def _qb_count_edges_kernel(
 
 
 @triton.jit
+def _qb_count_edges_fixed_vec_kernel(
+    counts,
+    q2k_index,
+    idx_b_s: tl.constexpr,
+    idx_h_s: tl.constexpr,
+    idx_q_s: tl.constexpr,
+    idx_k_s: tl.constexpr,
+    num_heads: tl.constexpr,
+    num_kv_blocks: tl.constexpr,
+    num_q_groups: tl.constexpr,
+    q_bucket_size_blocks: tl.constexpr,
+    block_sparse_num: tl.constexpr,
+    num_k_tiles: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    qk_tile = tl.program_id(2)
+    q = qk_tile // num_k_tiles
+    k_tile = qk_tile - q * num_k_tiles
+
+    offs = k_tile * BLOCK_K + tl.arange(0, BLOCK_K)
+    mask = offs < block_sparse_num
+    q_group = q // q_bucket_size_blocks
+    q2k_base = q2k_index + b * idx_b_s + h * idx_h_s + q * idx_q_s
+    count_base = ((b * num_heads + h) * num_q_groups + q_group) * num_kv_blocks
+
+    kv = tl.load(q2k_base + offs * idx_k_s, mask=mask, other=0)
+    tl.atomic_add(counts + count_base + kv, 1, sem="relaxed", mask=mask)
+
+
+@triton.jit
 def _qb_local_offsets_kernel(
     counts,
     local_offsets,
@@ -664,7 +723,7 @@ def _qb_finalize_offsets_kernel(
     local_offsets,
     group_totals,
     task_offsets,
-    task_kv,
+    cursors,
     num_heads: tl.constexpr,
     num_kv_blocks: tl.constexpr,
     num_q_groups: tl.constexpr,
@@ -681,11 +740,12 @@ def _qb_finalize_offsets_kernel(
 
     local_base = (bh_group_base + g) * (num_kv_blocks + 1)
     task_offset_base = (bh_group_base + g) * (num_kv_blocks + 1)
-    task_kv_base = (bh_group_base + g) * num_kv_blocks
+    cursor_base = (bh_group_base + g) * num_kv_blocks
 
     for kv in tl.range(0, num_kv_blocks):
-        tl.store(task_offsets + task_offset_base + kv, base + tl.load(local_offsets + local_base + kv))
-        tl.store(task_kv + task_kv_base + kv, kv)
+        offset = base + tl.load(local_offsets + local_base + kv)
+        tl.store(task_offsets + task_offset_base + kv, offset)
+        tl.store(cursors + cursor_base + kv, offset)
     tl.store(
         task_offsets + task_offset_base + num_kv_blocks,
         base + tl.load(local_offsets + local_base + num_kv_blocks),
@@ -695,7 +755,6 @@ def _qb_finalize_offsets_kernel(
 @triton.jit
 def _qb_scatter_q_indices_kernel(
     cursors,
-    task_offsets,
     task_q_indices,
     q2k_index,
     q2k_nums,
@@ -726,7 +785,6 @@ def _qb_scatter_q_indices_kernel(
     q_group = q // q_bucket_size_blocks
     q2k_base = q2k_index + b * idx_b_s + h * idx_h_s + q * idx_q_s
     cursor_base = ((b * num_heads + h) * num_q_groups + q_group) * num_kv_blocks
-    offset_base = ((b * num_heads + h) * num_q_groups + q_group) * (num_kv_blocks + 1)
     q_indices_base = (b * num_heads + h) * max_edges_per_bh
 
     for i in tl.range(0, max_k):
@@ -734,8 +792,43 @@ def _qb_scatter_q_indices_kernel(
             kv = tl.load(q2k_base + i * idx_k_s)
             if (kv >= 0) & (kv < num_kv_blocks):
                 pos = tl.atomic_add(cursors + cursor_base + kv, 1, sem="relaxed")
-                task_offset = tl.load(task_offsets + offset_base + kv)
-                tl.store(task_q_indices + q_indices_base + task_offset + pos, q)
+                tl.store(task_q_indices + q_indices_base + pos, q)
+
+
+@triton.jit
+def _qb_scatter_q_indices_fixed_vec_kernel(
+    cursors,
+    task_q_indices,
+    q2k_index,
+    idx_b_s: tl.constexpr,
+    idx_h_s: tl.constexpr,
+    idx_q_s: tl.constexpr,
+    idx_k_s: tl.constexpr,
+    num_heads: tl.constexpr,
+    num_kv_blocks: tl.constexpr,
+    num_q_groups: tl.constexpr,
+    q_bucket_size_blocks: tl.constexpr,
+    max_edges_per_bh: tl.constexpr,
+    block_sparse_num: tl.constexpr,
+    num_k_tiles: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    qk_tile = tl.program_id(2)
+    q = qk_tile // num_k_tiles
+    k_tile = qk_tile - q * num_k_tiles
+
+    offs = k_tile * BLOCK_K + tl.arange(0, BLOCK_K)
+    mask = offs < block_sparse_num
+    q_group = q // q_bucket_size_blocks
+    q2k_base = q2k_index + b * idx_b_s + h * idx_h_s + q * idx_q_s
+    cursor_base = ((b * num_heads + h) * num_q_groups + q_group) * num_kv_blocks
+    q_indices_base = (b * num_heads + h) * max_edges_per_bh
+
+    kv = tl.load(q2k_base + offs * idx_k_s, mask=mask, other=0)
+    pos = tl.atomic_add(cursors + cursor_base + kv, 1, sem="relaxed", mask=mask)
+    tl.store(task_q_indices + q_indices_base + pos, q, mask=mask)
 
 
 def build_q_range_bucketed_tasks(
@@ -743,9 +836,9 @@ def build_q_range_bucketed_tasks(
     block_sparse_num: int,
     num_kv_blocks: int,
     *,
-    q_bucket_size_blocks: int = 512,
+    q_bucket_size_blocks: int = 1152,
     q2k_block_nums: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
     """Build per-(B,H) q-range CSR tasks on GPU for the q-bucket bwd path."""
     assert q2k_block_index.dtype == torch.int32
     assert q2k_block_index.is_cuda
@@ -786,31 +879,51 @@ def build_q_range_bucketed_tasks(
         device=q2k_block_index.device,
     )
     task_offsets = torch.empty_like(local_offsets)
-    task_kv = torch.empty_like(counts)
+    cursors = torch.empty_like(counts)
     task_q_indices = torch.empty(
         (B, H, max_edges), dtype=torch.int32, device=q2k_block_index.device
     )
 
     grid_q = (B, H, num_q_blocks)
-    _qb_count_edges_kernel[grid_q](
-        counts,
-        q2k_block_index,
-        nums,
-        q2k_block_index.stride(0),
-        q2k_block_index.stride(1),
-        q2k_block_index.stride(2),
-        q2k_block_index.stride(3),
-        nums.stride(0) if has_variable_nums else 0,
-        nums.stride(1) if has_variable_nums else 0,
-        nums.stride(2) if has_variable_nums else 0,
-        H,
-        num_kv_blocks,
-        num_q_groups,
-        G,
-        max_k,
-        int(block_sparse_num),
-        has_variable_nums,
-    )
+    if has_variable_nums:
+        _qb_count_edges_kernel[grid_q](
+            counts,
+            q2k_block_index,
+            nums,
+            q2k_block_index.stride(0),
+            q2k_block_index.stride(1),
+            q2k_block_index.stride(2),
+            q2k_block_index.stride(3),
+            nums.stride(0),
+            nums.stride(1),
+            nums.stride(2),
+            H,
+            num_kv_blocks,
+            num_q_groups,
+            G,
+            max_k,
+            int(block_sparse_num),
+            has_variable_nums,
+        )
+    else:
+        block_k = 1024
+        num_k_tiles = triton.cdiv(max_k, block_k)
+        grid_qk = (B, H, num_q_blocks * num_k_tiles)
+        _qb_count_edges_fixed_vec_kernel[grid_qk](
+            counts,
+            q2k_block_index,
+            q2k_block_index.stride(0),
+            q2k_block_index.stride(1),
+            q2k_block_index.stride(2),
+            q2k_block_index.stride(3),
+            H,
+            num_kv_blocks,
+            num_q_groups,
+            G,
+            int(block_sparse_num),
+            num_k_tiles,
+            BLOCK_K=block_k,
+        )
 
     grid_group = (B, H, num_q_groups)
     _qb_local_offsets_kernel[grid_group](
@@ -825,37 +938,60 @@ def build_q_range_bucketed_tasks(
         local_offsets,
         group_totals,
         task_offsets,
-        task_kv,
-        H,
-        num_kv_blocks,
-        num_q_groups,
-    )
-
-    cursors = torch.zeros_like(counts)
-    _qb_scatter_q_indices_kernel[grid_q](
         cursors,
-        task_offsets,
-        task_q_indices,
-        q2k_block_index,
-        nums,
-        q2k_block_index.stride(0),
-        q2k_block_index.stride(1),
-        q2k_block_index.stride(2),
-        q2k_block_index.stride(3),
-        nums.stride(0) if has_variable_nums else 0,
-        nums.stride(1) if has_variable_nums else 0,
-        nums.stride(2) if has_variable_nums else 0,
         H,
         num_kv_blocks,
         num_q_groups,
-        G,
-        max_edges,
-        max_k,
-        int(block_sparse_num),
-        has_variable_nums,
     )
 
-    return task_kv, task_offsets, task_q_indices, num_q_groups, max_tasks_per_group
+    if has_variable_nums:
+        _qb_scatter_q_indices_kernel[grid_q](
+            cursors,
+            task_q_indices,
+            q2k_block_index,
+            nums,
+            q2k_block_index.stride(0),
+            q2k_block_index.stride(1),
+            q2k_block_index.stride(2),
+            q2k_block_index.stride(3),
+            nums.stride(0),
+            nums.stride(1),
+            nums.stride(2),
+            H,
+            num_kv_blocks,
+            num_q_groups,
+            G,
+            max_edges,
+            max_k,
+            int(block_sparse_num),
+            has_variable_nums,
+        )
+    else:
+        _qb_scatter_q_indices_fixed_vec_kernel[grid_qk](
+            cursors,
+            task_q_indices,
+            q2k_block_index,
+            q2k_block_index.stride(0),
+            q2k_block_index.stride(1),
+            q2k_block_index.stride(2),
+            q2k_block_index.stride(3),
+            H,
+            num_kv_blocks,
+            num_q_groups,
+            G,
+            max_edges,
+            int(block_sparse_num),
+            num_k_tiles,
+            BLOCK_K=block_k,
+        )
+
+    return task_offsets, task_q_indices, num_q_groups, max_tasks_per_group
+
+
+def _default_q_bucket_size_blocks(num_q_blocks: int) -> int:
+    if num_q_blocks < 2048 or num_q_blocks >= 8192:
+        return 1088
+    return 1152
 
 
 def bsa_attn_bwd_qbucket(
@@ -873,7 +1009,7 @@ def bsa_attn_bwd_qbucket(
     dq: Optional[torch.Tensor] = None,
     dk: Optional[torch.Tensor] = None,
     dv: Optional[torch.Tensor] = None,
-    q_bucket_size_blocks: int = 512,
+    q_bucket_size_blocks: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Q-range bucketed backward pass for BSA block-sparse attention.
 
@@ -907,6 +1043,8 @@ def bsa_attn_bwd_qbucket(
     sparse_block_size = BSA_BWD_SPARSE_BLOCK_SIZE
     num_q_blocks = (seqlen_q + sparse_block_size - 1) // sparse_block_size
     num_kv_blocks = (seqlen_k + sparse_block_size - 1) // sparse_block_size
+    if q_bucket_size_blocks is None or q_bucket_size_blocks <= 0:
+        q_bucket_size_blocks = _default_q_bucket_size_blocks(num_q_blocks)
 
     assert q2k_block_index.dtype == torch.int32
     assert q2k_block_index.shape[:3] == (batch_size, num_heads, num_q_blocks)
@@ -915,7 +1053,7 @@ def bsa_attn_bwd_qbucket(
         assert q2k_block_nums.dtype == torch.int32
         assert q2k_block_nums.shape == (batch_size, num_heads, num_q_blocks)
 
-    task_kv, task_offsets, task_q_indices, _num_q_groups, _max_tasks_per_group = (
+    task_offsets, task_q_indices, _num_q_groups, _max_tasks_per_group = (
         build_q_range_bucketed_tasks(
             q2k_block_index,
             block_sparse_num,
@@ -925,12 +1063,10 @@ def bsa_attn_bwd_qbucket(
         )
     )
 
-    if block_sizes is None:
-        variable_block_sizes = torch.full(
-            (batch_size, num_kv_blocks),
-            sparse_block_size,
-            dtype=torch.int32,
-            device=q.device,
+    has_block_sizes = block_sizes is not None
+    if not has_block_sizes:
+        variable_block_sizes = torch.empty(
+            (1, 1), dtype=torch.int32, device=q.device
         )
     else:
         assert block_sizes.dtype == torch.int32
@@ -947,17 +1083,11 @@ def bsa_attn_bwd_qbucket(
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
     if dq is None:
-        dq = torch.zeros_like(q)
-    else:
-        dq.zero_()
+        dq = torch.empty_like(q)
     if dk is None:
-        dk = torch.zeros_like(k)
-    else:
-        dk.zero_()
+        dk = torch.empty_like(k)
     if dv is None:
-        dv = torch.zeros_like(v)
-    else:
-        dv.zero_()
+        dv = torch.empty_like(v)
 
     workspace_shape = BlockSparseAttnBackwardQRangeBucketed._get_workspace_size(
         q=seqlen_q,
@@ -976,12 +1106,19 @@ def bsa_attn_bwd_qbucket(
         else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     )
 
+    full_kv_blocks = (
+        seqlen_k % sparse_block_size == 0
+        and head_dim == BSA_BWD_HEAD_DIM
+    )
+
     compile_key = (
         q.dtype,
         head_dim,
         num_heads,
         sparse_block_size,
         arch,
+        has_block_sizes,
+        full_kv_blocks,
         fa_logging.get_fa_log_level(),
     )
 
@@ -1004,7 +1141,6 @@ def bsa_attn_bwd_qbucket(
         dK_t = convert_to_cute_tensor(dk)
         dV_t = convert_to_cute_tensor(dv)
         LSE_t = to_cute_tensor(lse, leading_dim=2)
-        task_kv_t = to_cute_tensor(task_kv, leading_dim=3)
         task_offsets_t = to_cute_tensor(task_offsets, leading_dim=3)
         task_q_indices_t = to_cute_tensor(task_q_indices, leading_dim=2)
         var_bs_t = to_cute_tensor(variable_block_sizes, leading_dim=1)
@@ -1012,6 +1148,8 @@ def bsa_attn_bwd_qbucket(
 
         bwd_kernel = BlockSparseAttnBackwardQRangeBucketed(
             sparse_block_size=sparse_block_size,
+            has_block_sizes=has_block_sizes,
+            full_kv_blocks=full_kv_blocks,
         )
 
         bsa_attn_bwd_qbucket.compile_cache[compile_key] = cute.compile(
@@ -1026,7 +1164,6 @@ def bsa_attn_bwd_qbucket(
             dQ_t,
             dK_t,
             dV_t,
-            task_kv_t,
             task_offsets_t,
             task_q_indices_t,
             var_bs_t,
@@ -1049,7 +1186,6 @@ def bsa_attn_bwd_qbucket(
                 dq,
                 dk,
                 dv,
-                task_kv,
                 task_offsets,
                 task_q_indices,
                 variable_block_sizes,

@@ -15,8 +15,9 @@ from typing import Tuple, Type
 import math
 
 class BlockSparseAttnBackward:
-    def __init__(self, sparse_block_size: int):
+    def __init__(self, sparse_block_size: int, has_block_sizes: bool = True):
         self.sparse_block_size = sparse_block_size
+        self.has_block_sizes = has_block_sizes
 
         self.QK_mma_tiler = (128,64,128)
         self.fake_QK_mma_tiler = (64,64,128)
@@ -2069,8 +2070,6 @@ class BlockSparseAttnBackward:
         tTR_tdP = thr_t2r.partition_S(tdPtdP)
         tTR_tdP = self.split_wg(tTR_tdP, num_warp_groups, wg_idx)
 
-        block_size_k = variable_block_sizes[blk_coord_b, blk_coord_k]
-
         while iter_count > 0:
             # Wait for S and P
             mma_compute_S_pipeline.consumer_wait(mma_compute_S_consumer_state)
@@ -2081,12 +2080,14 @@ class BlockSparseAttnBackward:
             # Compute P = softmax(S, LSE)
             cute.copy(tiled_t2r, tTR_tS, tTR_rS)
 
-            # TODO: The mask aligns with the triton version which only considers
-            # the block size in K.
-            for i in cutlass.range_constexpr(cute.size(tTR_rS)):
-                index_q, index_k = tTR_cS[i]
-                is_valid = index_k < block_size_k
-                tTR_rS[i] = tTR_rS[i] if is_valid else -Float32.inf
+            if cutlass.const_expr(self.has_block_sizes):
+                block_size_k = variable_block_sizes[blk_coord_b, blk_coord_k]
+                # TODO: The mask aligns with the triton version which only considers
+                # the block size in K.
+                for i in cutlass.range_constexpr(cute.size(tTR_rS)):
+                    index_q, index_k = tTR_cS[i]
+                    is_valid = index_k < block_size_k
+                    tTR_rS[i] = tTR_rS[i] if is_valid else -Float32.inf
             
             log2_e = Float32(math.log2(math.e))
             softmax_scale_log2_e = scale_softmax * log2_e

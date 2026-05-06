@@ -623,14 +623,17 @@ def run_benchmark_suite():
 # ============== Profile (make profile) ==============
 
 def make_topk_block_sparse_args(batch_size, seqlen_q, seqlen_k, nheads, topk, blk_m=128, blk_n=128, device="cuda",
-                                 use_var_block_num=False, use_block_sizes=False):
+                                 use_var_block_num=False, use_block_sizes=False,
+                                 block_size_mode="full"):
     """Create block-sparse args with fixed topK (each Q block attends to topK random KV blocks).
 
     Args:
         use_var_block_num: If True, return q2k_block_nums tensor (all entries = topk)
                            instead of using fixed block_sparse_num.
-        use_block_sizes: If True, set block_sizes to blk_n (actual sizes, enables masking path).
+        use_block_sizes: If True, create block_sizes (actual sizes, enables masking path).
                          If False, pass None (skip block_sizes masking for faster kernel path).
+        block_size_mode: "full" fills block_sizes with blk_n. "random" samples
+                         each block size uniformly in [1, blk_n].
 
     Returns q2k_block_index, block_sparse_num, block_sizes, q2k_block_nums.
     """
@@ -649,10 +652,17 @@ def make_topk_block_sparse_args(batch_size, seqlen_q, seqlen_k, nheads, topk, bl
                 q2k_block_index[b, h, m] = perm.to(torch.int32)
 
     if use_block_sizes:
-        block_sizes = torch.full((num_kv_blocks,), blk_n, dtype=torch.int32, device=device)
+        if block_size_mode == "full":
+            block_sizes = torch.full((num_kv_blocks,), blk_n, dtype=torch.int32, device=device)
+        elif block_size_mode == "random":
+            block_sizes = torch.randint(
+                1, blk_n + 1, (num_kv_blocks,), dtype=torch.int32, device=device
+            )
+        else:
+            raise ValueError(f"unknown block_size_mode: {block_size_mode}")
         last_block_actual = seqlen_k - (num_kv_blocks - 1) * blk_n
         if last_block_actual < blk_n:
-            block_sizes[-1] = last_block_actual
+            block_sizes[-1] = min(block_sizes[-1].item(), last_block_actual)
     else:
         block_sizes = None
 

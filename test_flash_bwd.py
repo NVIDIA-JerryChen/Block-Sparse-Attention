@@ -272,7 +272,7 @@ def run_quick_tests():
 # ============== Benchmark ==============
 
 def _bench_bwd_one(dout, q, k, v, out, lse, q2k, bsn, bsize, q2k_block_nums=None,
-                    niters=10, impl="baseline", q_bucket_size_blocks=512):
+                    niters=10, impl="baseline", q_bucket_size_blocks=None):
     """Warmup + time a single bwd call. Returns median ms."""
     def _run_once():
         if impl == "baseline":
@@ -306,12 +306,21 @@ def run_benchmark_suite():
     device = "cuda"
     dtype = torch.bfloat16
     d = 128
+    benchmark_seed = int(os.environ.get("BSA_BWD_BENCH_SEED", "0"))
+    torch.manual_seed(benchmark_seed)
     bench_impls = [
         x.strip()
         for x in os.environ.get("BSA_BWD_BENCH_IMPL", "qbuck").split(",")
         if x.strip()
     ]
-    q_bucket_size_blocks = int(os.environ.get("BSA_Q_BUCKET_BLOCKS", "512"))
+    q_bucket_size_blocks_env = os.environ.get("BSA_Q_BUCKET_BLOCKS")
+    q_bucket_size_blocks = (
+        int(q_bucket_size_blocks_env) if q_bucket_size_blocks_env else None
+    )
+    use_block_sizes = os.environ.get("BSA_BWD_BENCH_BLOCK_SIZES", "1") != "0"
+    block_size_mode = os.environ.get("BSA_BWD_BENCH_BLOCK_SIZE_MODE", "full")
+    if not use_block_sizes:
+        block_size_mode = "none"
     # (bs, nheads, seqlen_q, seqlen_k, hdim)
     configs = [
         (1, 4, 116160, 118528, 128),
@@ -354,14 +363,26 @@ def run_benchmark_suite():
                 q2k, bsn, bsize, q2k_block_nums = make_topk_block_sparse_args(
                     bs, seqlen_q, seqlen_k, nheads, topk_even,
                     blk_m=BLK, blk_n=BLK, device=device,
+                    use_block_sizes=use_block_sizes,
+                    block_size_mode=block_size_mode,
                 )
-                label = f"bs={bs} h={nheads} sq={seqlen_q} sk={seqlen_k} d={hdim} topk={topk_even}"
+                block_sizes_label = (
+                    f"bsz={block_size_mode}" if use_block_sizes else "bsz=0"
+                )
+                label = (
+                    f"bs={bs} h={nheads} sq={seqlen_q} sk={seqlen_k} "
+                    f"d={hdim} topk={topk_even} {block_sizes_label}"
+                )
                 effective_sk = topk_even * BLK
 
             for impl in bench_impls:
                 impl_label = impl
                 if impl == "qbuck":
-                    impl_label = f"qbuck{q_bucket_size_blocks}"
+                    impl_label = (
+                        f"qbuck{q_bucket_size_blocks}"
+                        if q_bucket_size_blocks is not None
+                        else "qbuckauto"
+                    )
                 print(f"  {label:<52} {impl_label:>10} ...", end="", flush=True)
                 med = _bench_bwd_one(
                     dout, q, k, v, out, lse, q2k, bsn, bsize,
