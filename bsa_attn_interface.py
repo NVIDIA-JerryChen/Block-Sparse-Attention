@@ -468,7 +468,6 @@ def bsa_attn_bwd(
 
     if (
         BSA_BWD_AUTO_QBUCKET
-        and block_sizes is None
         and num_q_blocks >= 3000
     ):
         return bsa_attn_bwd_qbucket(

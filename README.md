@@ -234,7 +234,7 @@ It has the same tensor contract as `bsa_attn_bwd`, but builds a GPU-side Q-range
 
 This path is intended for long sequences with random-ish topK sparsity where the baseline KV-major backward suffers from poor `dQ_acc` locality. The tradeoff is extra task construction, K/V reloads, and fp32 partial `dK/dV` accumulation.
 
-For full-block long-sequence cases (`block_sizes=None`, `num_q_blocks >= 3000`), `bsa_attn_bwd` automatically dispatches to this qbucket path by default. Set `BSA_BWD_AUTO_QBUCKET=0` to force the KV-major path, or `BSA_BWD_AUTO_Q_BUCKET_BLOCKS=<n>` to tune the automatic bucket size.
+For long-sequence cases (`num_q_blocks >= 3000`), `bsa_attn_bwd` automatically dispatches to this qbucket path by default, both with `block_sizes=None` and with explicit `block_sizes`. Set `BSA_BWD_AUTO_QBUCKET=0` to force the KV-major path, or `BSA_BWD_AUTO_Q_BUCKET_BLOCKS=<n>` to tune the automatic bucket size.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
