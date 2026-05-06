@@ -1,13 +1,16 @@
 """BSA SM100 Backward Kernel — Test / Benchmark
 
 Usage:
-    python test_flash_bwd.py              # quick correctness tests
-    python test_flash_bwd.py benchmark    # simple dense-bwd benchmark
+    python tests/test_flash_bwd.py              # quick correctness tests
+    python tests/test_flash_bwd.py benchmark    # simple dense-bwd benchmark
 """
 
 import os
 import sys
 import math
+
+# Keep direct script execution (`python tests/test_flash_bwd.py`) working.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 import torch

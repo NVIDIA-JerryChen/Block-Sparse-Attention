@@ -16,8 +16,8 @@
 SHELL := /bin/bash
 PYTHON := python
 PYTEST := python -m pytest
-TEST_FILE := test_flash_fwd.py
-BWD_TEST_FILE := test_flash_bwd.py
+TEST_FILE := tests/test_flash_fwd.py
+BWD_TEST_FILE := tests/test_flash_bwd.py
 FA_DIR := /home/scratch.cjerry_sw/next-dsa/flash-attention
 FA_TEST := flash_attn/cute/test_flash_fwd_sm100.py
 

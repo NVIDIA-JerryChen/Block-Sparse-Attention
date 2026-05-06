@@ -25,6 +25,7 @@
 namespace flash {
 
 static constexpr uint32_t kMBarTicks = 1;
+static constexpr int kPipelineKVStages = 3;
 
 // ============================================================================
 // Raw PTX barrier helpers (kept: used by MMA for p_lastsplit wait and Q-ready)
@@ -71,10 +72,10 @@ __device__ __forceinline__ void mbar_arrive_and_wait(uint32_t addr, int phase) {
 // ============================================================================
 
 using PipelineKV = cutlass::PipelineTmaUmmaAsync<
-    /*Stages=*/3,
+    /*Stages=*/kPipelineKVStages,
     /*ClusterShape=*/cute::Shape<cute::_1, cute::_1, cute::_1>,
     /*AtomThrShape_MNK=*/cute::Shape<cute::_1, cute::_1, cute::_1>>;
-using PipelineKVState = cutlass::PipelineState<3>;
+using PipelineKVState = cutlass::PipelineState<kPipelineKVStages>;
 
 // ============================================================================
 // Intra-CTA pipelines (SM100 types)

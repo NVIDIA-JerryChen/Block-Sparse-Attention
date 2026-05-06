@@ -34,13 +34,16 @@ struct CollectiveEpilogueFwd {
             cute::Step<cute::_1, cute::_2>{}), cute::Shape<cute::_1, cute::_1>{}));
     static constexpr int kOBytes = kRows * kOutputCols * sizeof(ElementA);
 
-    // ---- TMA type aliases (5D BSHD) ----
-    using ShapeO5 = cute::Shape<cute::Int<kRows>, cute::Int<kOutputCols>, int, int, int>;
-    using StrideO5 = cute::Stride<int, cute::_1, int, int, int64_t>;
+    // ---- TMA type aliases (4D BHSD) ----
+    // 4D shape keeps seqlen as a single mode with runtime value = actual seqlen_q.
+    // TMA store OOB drop handles the last partial tile (rows past seqlen_q are
+    // silently dropped), so `out` can be allocated at actual seqlen_q without pad.
+    using ShapeO4 = cute::Shape<int, cute::Int<kOutputCols>, int, int>;
+    using StrideO4 = cute::Stride<int, cute::_1, int, int64_t>;
 
     using TMA_O = decltype(cute::make_tma_copy(cute::SM90_TMA_STORE{},
             cute::make_tensor(cute::make_gmem_ptr(static_cast<ElementA*>(nullptr)),
-                                                cute::make_layout(ShapeO5{}, StrideO5{})),
+                                                cute::make_layout(ShapeO4{}, StrideO4{})),
             SmemLayoutO{}));
 
     // ---- TensorStorage ----
@@ -53,21 +56,21 @@ struct CollectiveEpilogueFwd {
     };
 
     // ---- Static TMA construction (called from run_bsa_fwd) ----
+    // 4D TMA store: (seqlen_q, kOutputCols, H, B) with actual seqlen_q in mode 0.
     static TMA_O make_tma_store_O(bsa_fwd_params const& p) {
         using namespace cute;
-        // 5D TMA store to BSHD: (kRows, kOutputCols, H, num_m_blocks, B)
-        auto shape_o  = make_shape(Int<kRows>{}, Int<kOutputCols>{}, p.h, p.num_m_blocks, p.b);
+        auto shape_o  = make_shape(p.seqlen_q, Int<kOutputCols>{}, p.h, p.b);
         auto stride_o = make_stride(int(p.o_row_stride), _1{}, int(p.o_head_stride),
-                                    kRows * int(p.o_row_stride), p.o_batch_stride);
+                                    p.o_batch_stride);
         return make_tma_copy(SM90_TMA_STORE{},
                 make_tensor(make_gmem_ptr(static_cast<ElementA*>(p.o_ptr)),
                             make_layout(shape_o, stride_o)),
                 SmemLayoutO{});
     }
 
-    static ShapeO5 make_shape_O(bsa_fwd_params const& p) {
+    static ShapeO4 make_shape_O(bsa_fwd_params const& p) {
         using namespace cute;
-        return make_shape(Int<kRows>{}, Int<kOutputCols>{}, p.h, p.num_m_blocks, p.b);
+        return make_shape(p.seqlen_q, Int<kOutputCols>{}, p.h, p.b);
     }
 
     // ===========================================================================
@@ -101,8 +104,13 @@ struct CollectiveEpilogueFwd {
             auto thr_tma_o = params.tma_store_O.get_slice(Int<0>{});
             auto sO = make_tensor(make_smem_ptr(el.sO.begin()), SmemLayoutO{});
             Tensor gO_full = params.tma_store_O.get_tma_tensor(params.shape_O);
-            // 5D indexing: (_, _, head, row_tile, batch)
-            Tensor gO_tile = gO_full(_, _, head, row_tile, batch);
+            // 4D indexing: gO_full shape (seqlen_q, kOutputCols, H, B).
+            // Slice (head, batch), then local_tile at row_tile — last partial tile
+            // (rows past seqlen_q) is OOB-dropped by TMA store.
+            Tensor gO_hb = gO_full(_, _, head, batch);
+            Tensor gO_tile = cute::local_tile(gO_hb,
+                    cute::Shape<cute::Int<kRows>, cute::Int<kOutputCols>>{},
+                    cute::make_coord(row_tile, cute::_0{}));
             cute::copy(params.tma_store_O, thr_tma_o.partition_S(sO), thr_tma_o.partition_D(gO_tile));
             tma_store_arrive();
             tma_store_wait<0>();

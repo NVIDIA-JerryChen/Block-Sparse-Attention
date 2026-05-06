@@ -1,4 +1,3 @@
-import os
 import shutil
 from pathlib import Path
 from setuptools import setup
@@ -37,7 +36,7 @@ nvcc_flags = [
     "--ptxas-options=-v",
     "-gencode=arch=compute_100a,code=sm_100a",
     "-gencode=arch=compute_103a,code=sm_103a",
-] + [f"-D{d}" for d in os.environ.get("BSA_EXTRA_DEFINES", "").split(",") if d]
+]
 
 setup(
     name="bsa_fwd_blk64_ext",

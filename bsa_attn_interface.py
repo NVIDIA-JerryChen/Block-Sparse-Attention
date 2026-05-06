@@ -82,22 +82,22 @@ def bsa_attn_fwd_blk64(
     block_sizes: torch.Tensor,
     q2k_block_nums: torch.Tensor,
     softmax_scale: Optional[float] = None,
-    layout: str = "bshd",
+    layout: str = "bhsd",
     use_clc: bool = False,
 ):
     """BSA forward attention (blk64 backend, bf16 only, D=128).
 
-    The underlying C++ kernel expects BHSD tensors (zero-copy path).
-    When layout="bshd" the user's BSHD inputs are permuted to BHSD here;
-    when layout="bhsd" the inputs are forwarded without any data movement.
+    The blk64 kernel consumes BHSD tensors directly. The default layout is
+    therefore "bhsd" for the customer zero-copy path. BSHD callers are still
+    supported by an explicit layout="bshd" conversion at the wrapper boundary.
 
     Args:
-        q, k, v: (B, S, H, D) if layout="bshd" or (B, H, S, D) if layout="bhsd"
+        q, k, v: (B, H, S, D) if layout="bhsd" or (B, S, H, D) if layout="bshd"
         q2k_block_index: (B, H, Q_tiles, max_kv) int32
         block_sizes: (num_kv_blocks,) int32
         q2k_block_nums: (B, H, Q_tiles) int32
         softmax_scale: default 1/sqrt(D)
-        layout: "bshd" or "bhsd"
+        layout: "bhsd" (default, zero-copy) or "bshd" (converted to BHSD).
         use_clc: enable the SM100 CLC persistent scheduler path. Default False
             uses the SingleTileScheduler fallback (one tile per CTA).
     """
@@ -105,41 +105,30 @@ def bsa_attn_fwd_blk64(
     assert q.is_cuda and k.is_cuda and v.is_cuda
     assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
 
-    # Normalize to BHSD for the kernel. BSHD inputs are permuted to BHSD here.
     if layout == "bshd":
-        q = q.permute(0, 2, 1, 3).contiguous()
-        k = k.permute(0, 2, 1, 3).contiguous()
-        v = v.permute(0, 2, 1, 3).contiguous()
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
+    else:
+        assert layout == "bhsd", f"layout must be 'bhsd' or 'bshd', got {layout!r}"
 
-    # q/k/v are now BHSD: (B, H, S, D).
     assert q.size(3) == 128, "blk64 requires D=128"
+    assert q.stride(3) == 1 and k.stride(3) == 1 and v.stride(3) == 1, \
+        "head_dim (axis 3) must be stride-1 / innermost"
+
     seqlen_q = q.size(2)
-    seqlen_k = k.size(2)
 
     if softmax_scale is None:
         softmax_scale = q.size(3) ** -0.5
 
-    # Pad seqlen (dim 2) to multiples of 64 if needed. For 4D BHSD tensors the
-    # pad tuple counts from the last dim: (0,0, 0,pad) -> pad only dim 2 (seq).
-    if seqlen_q % 64 != 0:
-        pad_q = 64 - seqlen_q % 64
-        q = torch.nn.functional.pad(q, (0, 0, 0, pad_q))
-    if seqlen_k % 64 != 0:
-        pad_k = 64 - seqlen_k % 64
-        k = torch.nn.functional.pad(k, (0, 0, 0, pad_k))
-        v = torch.nn.functional.pad(v, (0, 0, 0, pad_k))
-
+    # No F.pad: seqlen_q rounding is handled by the kernel's row bounds checks
+    # and output TMA descriptor; seqlen_k masking is controlled by block_sizes.
     out, lse = torch.ops.bsa_blk64.fwd(
         q, k, v, q2k_block_index, 0, block_sizes, softmax_scale, q2k_block_nums, use_clc)
 
-    # Kernel returns out as BHSD (B, H, S_q_rounded, D). Trim seqlen (dim 2).
-    if out.size(2) != seqlen_q:
-        out = out[:, :, :seqlen_q]
-    if lse.size(2) != seqlen_q:
-        lse = lse[:, :, :seqlen_q]
-
+    assert out.size(2) == seqlen_q and lse.size(2) == seqlen_q
     if layout == "bshd":
-        out = out.permute(0, 2, 1, 3).contiguous()
+        out = out.transpose(1, 2).contiguous()
     return out, lse
 
 

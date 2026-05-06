@@ -1,16 +1,16 @@
 """BSA SM100 Forward Kernel — Test / Benchmark / Profile
 
 Usage:
-    python test_flash_fwd.py              # quick correctness test
-    python test_flash_fwd.py benchmark    # performance benchmark
-    python test_flash_fwd.py profile      # single fwd for ncu
+    python tests/test_flash_fwd.py              # quick correctness test
+    python tests/test_flash_fwd.py benchmark    # performance benchmark
+    python tests/test_flash_fwd.py profile      # single fwd for ncu
 """
 
 import os
 import sys
 import math
 
-# Add project root to path for imports (bsa_attn_interface, utils/)
+# Keep direct script execution (`python tests/test_flash_fwd.py`) working.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
@@ -23,7 +23,7 @@ _BLK_SIZES = [int(x) for x in _BSA_BLK.split(",")]
 from utils.testing import attention_ref
 from utils.bench_utils import flops
 from utils.benchmark import benchmark_forward
-from bsa_attn_interface import bsa_attn_fwd
+from bsa_attn_interface import bsa_attn_fwd, bsa_attn_fwd_blk64
 
 # Optional: blk64 C++ AOT kernel (install via `make setup BLK=64`)
 try:
@@ -215,10 +215,16 @@ def pack_gqa_attn_bias(attn_bias_kv, nheads, qhead_per_kvhead, seqlen_q):
 # ============== Correctness helpers ==============
 
 def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloat16,
-                  use_variable_block_nums=False, blk_m=128, blk_n=128):
+                  use_variable_block_nums=False, use_block_sizes=True,
+                  blk_m=128, blk_n=128, use_clc=False):
     """Run a single correctness test with random block-sparse pattern.
 
     blk_m/blk_n: block sizes. blk_n=64 routes to blk64 C++ AOT kernel.
+    use_block_sizes=False exercises the HasBlockSizes=false kernel path
+    (block_sizes passed as None / empty tensor; all KV tokens treated as valid).
+    Requires seqlen_k % blk_n == 0 so every KV block is fully populated.
+    use_clc: for blk64 only, toggle the CLC persistent scheduler path
+    (ignored when blk_n=128; blk128 has its own scheduling knob).
     """
     device = "cuda"
     torch.manual_seed(0)
@@ -258,6 +264,19 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
             bs, seqlen_q_q2k, seqlen_k, nheads_q2k, blk_m=blk_m, blk_n=blk_n, device=device,
         )
 
+    # HasBlockSizes=false path: kernel receives None/empty block_sizes,
+    # reference must assume every KV block is fully populated (blk_n tokens).
+    if use_block_sizes:
+        block_sizes_kernel = block_sizes
+    else:
+        assert seqlen_k % blk_n == 0, (
+            f"use_block_sizes=False requires seqlen_k % blk_n == 0 "
+            f"(got seqlen_k={seqlen_k}, blk_n={blk_n})"
+        )
+        num_kv_blocks = seqlen_k // blk_n
+        block_sizes = torch.full((num_kv_blocks,), blk_n, dtype=torch.int32, device=device)
+        block_sizes_kernel = None
+
     attn_bias_kv = block_sparse_to_attn_bias(
         q2k_block_index, block_sparse_num, block_sizes, seqlen_q_q2k, seqlen_k,
         blk_m=blk_m, blk_n=blk_n, q2k_block_nums=q2k_block_nums,
@@ -283,10 +302,22 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
     fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
     rtol = 2
 
-    out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num,
-                             block_sizes=block_sizes, q2k_block_nums=q2k_block_nums,
-                             softmax_scale=1.0 / math.sqrt(d),
-                             return_lse=True, blk_n=blk_n)
+    if is_blk64:
+        softmax_scale = 1.0 / math.sqrt(d)
+        bn_arg = q2k_block_nums if use_variable_block_nums else torch.Tensor()
+        bs_arg = block_sizes_kernel if block_sizes_kernel is not None else torch.Tensor()
+        # blk64 kernel consumes BHSD natively; convert from BSHD test tensors
+        # at the boundary and convert the BHSD output back to BSHD for reference.
+        q_bhsd = q.transpose(1, 2).contiguous()
+        k_bhsd = k.transpose(1, 2).contiguous()
+        v_bhsd = v.transpose(1, 2).contiguous()
+        out_bhsd, lse = torch.ops.bsa_blk64.fwd(
+            q_bhsd, k_bhsd, v_bhsd, q2k_block_index, block_sparse_num,
+            bs_arg, softmax_scale, bn_arg, use_clc)
+        out = out_bhsd.transpose(1, 2).contiguous()
+    else:
+        out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes_kernel,
+                                 q2k_block_nums=q2k_block_nums, return_lse=True)
     out = torch.nan_to_num(out, nan=0.0)
 
     kernel_diff = (out - out_ref).abs().max().item()
@@ -305,6 +336,7 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
 
     blk_str = f" blk={blk_n}" if blk_n != 128 else ""
     mode_str = "var_bsn" if use_variable_block_nums else f"sparse_num={block_sparse_num}"
+    mode_str += " no_bs" if not use_block_sizes else ""
     tag = "PASS" if passed else "FAIL"
     print(
         f"  {tag} bs={bs} sq={seqlen_q} sk={seqlen_k} h={nheads}/{nheads_kv} d={d} "
@@ -321,6 +353,7 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
 @pytest.mark.parametrize("mha_type", ["mha", "gqa", "mqa"])
 @pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("use_variable_block_nums", [False, True])
+@pytest.mark.parametrize("use_clc", [False, True])
 @pytest.mark.parametrize("blk_n", _BLK_SIZES)
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -336,14 +369,39 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
         (4096, 4096),
     ],
 )
-def test_flash_fwd_sm100(seqlen_q, seqlen_k, d, mha_type, dtype, use_variable_block_nums, blk_n):
+def test_flash_fwd_sm100(seqlen_q, seqlen_k, d, mha_type, dtype, use_variable_block_nums, use_clc, blk_n):
+    # use_clc only affects blk64; skip the duplicate blk128 case.
+    if blk_n != 64 and use_clc:
+        pytest.skip("use_clc only affects blk64")
     batch_size = 4 if seqlen_k <= 2048 else 2
     nheads = 6
     nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
     blk_m = 64 if blk_n == 64 else 128
     _test_single(batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype,
                   use_variable_block_nums=use_variable_block_nums,
-                  blk_m=blk_m, blk_n=blk_n)
+                  blk_m=blk_m, blk_n=blk_n, use_clc=use_clc)
+
+
+# HasBlockSizes=false coverage (independent from main matrix; seqlen_k % blk_n == 0 required).
+# 2 × 2 × 3 = 12 testcases per blk, covering both (no_bs, no_vbn) and (no_bs, has_vbn).
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("use_variable_block_nums", [False, True])
+@pytest.mark.parametrize("use_clc", [False, True])
+@pytest.mark.parametrize("blk_n", _BLK_SIZES)
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [(128, 512), (256, 1024), (1024, 1024)],
+)
+def test_flash_fwd_sm100_no_block_sizes(seqlen_q, seqlen_k, dtype, use_variable_block_nums, use_clc, blk_n):
+    if blk_n != 64 and use_clc:
+        pytest.skip("use_clc only affects blk64")
+    batch_size = 2
+    nheads = 4
+    blk_m = 64 if blk_n == 64 else 128
+    _test_single(batch_size, seqlen_q, seqlen_k, nheads, nheads, 128, dtype,
+                  use_variable_block_nums=use_variable_block_nums,
+                  use_block_sizes=False,
+                  blk_m=blk_m, blk_n=blk_n, use_clc=use_clc)
 
 
 # ============== Quick test (make tt) ==============
@@ -376,8 +434,9 @@ def run_quick_tests():
             (1, 1024, 1024, 4, 4, 128),
             (1, 2048, 2048, 4, 4, 128),
         ]
-        for bs, sq, sk, hq, hk, d in configs_64:
-            _test_single(bs, sq, sk, hq, hk, d, blk_m=64, blk_n=64)
+        for use_clc in (False, True):
+            for bs, sq, sk, hq, hk, d in configs_64:
+                _test_single(bs, sq, sk, hq, hk, d, blk_m=64, blk_n=64, use_clc=use_clc)
 
     if 128 in _BLK_SIZES:
         print("-" * 70)
@@ -405,22 +464,56 @@ def run_quick_tests():
             (1, 256, 1024, 4, 4, 128),
             (4, 1024, 1024, 4, 4, 128),
         ]
-        for bs, sq, sk, hq, hk, d in var_configs_64:
-            _test_single(bs, sq, sk, hq, hk, d, use_variable_block_nums=True,
-                          blk_m=64, blk_n=64)
+        for use_clc in (False, True):
+            for bs, sq, sk, hq, hk, d in var_configs_64:
+                _test_single(bs, sq, sk, hq, hk, d, use_variable_block_nums=True,
+                              blk_m=64, blk_n=64, use_clc=use_clc)
+
+    # block_sizes=None path (HasBlockSizes=false): requires seqlen_k % blk_n == 0
+    if 128 in _BLK_SIZES:
+        print("-" * 70)
+        print("No-block_sizes tests (blk128)")
+        no_bs_configs_128 = [
+            (1, 128, 512, 4, 4, 128),                                 # fixed bsn
+            (1, 256, 1024, 4, 4, 128),                                # fixed bsn
+            (1, 128, 512, 4, 4, 128, True),                           # var bsn
+            (1, 256, 1024, 4, 4, 128, True),                          # var bsn
+        ]
+        for cfg in no_bs_configs_128:
+            bs, sq, sk, hq, hk, d = cfg[:6]
+            use_var = cfg[6] if len(cfg) > 6 else False
+            _test_single(bs, sq, sk, hq, hk, d, use_variable_block_nums=use_var,
+                          use_block_sizes=False)
 
     if HAS_BLK64 and 64 in _BLK_SIZES:
         print("-" * 70)
-        print("BHSD format test (blk64)")
-        _test_bhsd_format()
+        print("No-block_sizes tests (blk64)")
+        no_bs_configs_64 = [
+            (1, 128, 512, 4, 4, 128),                                 # fixed bsn, no-bs, no-vbn
+            (1, 256, 1024, 4, 4, 128),                                # fixed bsn, no-bs, no-vbn
+            (1, 1024, 1024, 4, 4, 128),                               # fixed bsn, no-bs, no-vbn
+            (1, 128, 512, 4, 4, 128, True),                           # var bsn,   no-bs, has-vbn
+            (1, 256, 1024, 4, 4, 128, True),                          # var bsn,   no-bs, has-vbn
+            (4, 1024, 1024, 4, 4, 128, True),                         # var bsn,   no-bs, has-vbn
+        ]
+        for use_clc in (False, True):
+            for cfg in no_bs_configs_64:
+                bs, sq, sk, hq, hk, d = cfg[:6]
+                use_var = cfg[6] if len(cfg) > 6 else False
+                _test_single(bs, sq, sk, hq, hk, d, use_variable_block_nums=use_var,
+                              use_block_sizes=False, blk_m=64, blk_n=64, use_clc=use_clc)
+
+        print("-" * 70)
+        print("Interface layout test (blk64)")
+        _test_blk64_interface_layouts()
 
     print("=" * 70)
     print("All quick tests passed.")
 
 
-def _test_bhsd_format():
-    """Verify BHSD and BSHD produce identical results via bsa_attn_fwd."""
-    bs, h, sq, sk, d = 1, 4, 256, 1024, 128
+def _test_blk64_interface_layouts():
+    """Verify default BHSD and explicit BSHD wrapper paths are layout-equivalent."""
+    bs, h, sq, sk, d = 1, 4, 256, 512, 128
     blk = 64
     nq = sq // blk
     nkv = sk // blk
@@ -428,57 +521,64 @@ def _test_bhsd_format():
     dtype = torch.bfloat16
 
     torch.manual_seed(42)
-    q_bshd = torch.randn(bs, sq, h, d, device=device, dtype=dtype)
-    k_bshd = torch.randn(bs, sk, h, d, device=device, dtype=dtype)
-    v_bshd = torch.randn(bs, sk, h, d, device=device, dtype=dtype)
+    q_bhsd = torch.randn(bs, h, sq, d, device=device, dtype=dtype)
+    k_bhsd = torch.randn(bs, h, sk, d, device=device, dtype=dtype)
+    v_bhsd = torch.randn(bs, h, sk, d, device=device, dtype=dtype)
 
-    q_bhsd = q_bshd.permute(0, 2, 1, 3).contiguous()
-    k_bhsd = k_bshd.permute(0, 2, 1, 3).contiguous()
-    v_bhsd = v_bshd.permute(0, 2, 1, 3).contiguous()
+    q_bshd = q_bhsd.transpose(1, 2).contiguous()
+    k_bshd = k_bhsd.transpose(1, 2).contiguous()
+    v_bshd = v_bhsd.transpose(1, 2).contiguous()
 
-    bi = torch.arange(nkv, device=device, dtype=torch.int32) \
-        .unsqueeze(0).unsqueeze(0).unsqueeze(0) \
-        .expand(bs, h, nq, nkv).contiguous()
-    bn = torch.full((bs, h, nq), nkv, device=device, dtype=torch.int32)
-    bsz = torch.full((nkv,), blk, device=device, dtype=torch.int32)
+    q2k_block_index = torch.arange(nkv, device=device, dtype=torch.int32) \
+        .view(1, 1, 1, nkv).expand(bs, h, nq, nkv).contiguous()
+    q2k_block_nums = torch.full((bs, h, nq), nkv, device=device, dtype=torch.int32)
+    block_sizes = torch.full((nkv,), blk, device=device, dtype=torch.int32)
 
-    out_bshd, lse_bshd = bsa_attn_fwd(
-        q_bshd, k_bshd, v_bshd, bi, nkv,
-        block_sizes=bsz, q2k_block_nums=bn,
-        qkv_format="bshd", blk_n=64)
+    out_bhsd, lse_bhsd = bsa_attn_fwd_blk64(
+        q_bhsd, k_bhsd, v_bhsd, q2k_block_index, block_sizes, q2k_block_nums)
+    out_bshd, lse_bshd = bsa_attn_fwd_blk64(
+        q_bshd, k_bshd, v_bshd, q2k_block_index, block_sizes, q2k_block_nums,
+        layout="bshd")
 
-    out_bhsd, lse_bhsd = bsa_attn_fwd(
-        q_bhsd, k_bhsd, v_bhsd, bi, nkv,
-        block_sizes=bsz, q2k_block_nums=bn,
-        qkv_format="bhsd", blk_n=64)
-
-    # BHSD output should match BSHD output after permute
-    assert torch.equal(out_bhsd, out_bshd.permute(0, 2, 1, 3)), \
-        f"BHSD output mismatch: max diff = {(out_bhsd - out_bshd.permute(0,2,1,3)).abs().max().item()}"
+    assert torch.equal(out_bhsd.transpose(1, 2).contiguous(), out_bshd), \
+        f"BSHD output mismatch: max diff = {(out_bhsd.transpose(1, 2).contiguous() - out_bshd).abs().max().item()}"
     assert torch.equal(lse_bhsd, lse_bshd), "LSE mismatch"
-    print("  PASS BHSD format consistency test")
+    print("  PASS default BHSD and explicit BSHD wrapper paths match")
 
 
 # ============== Kernel dispatch helper ==============
 
 def _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n,
-                 q2k_block_nums=None, softmax_scale=None):
-    """Dispatch to blk64 or blk128 kernel via unified bsa_attn_fwd interface."""
-    out, lse = bsa_attn_fwd(
-        q, k, v, q2k_block_index, block_sparse_num,
-        block_sizes=block_sizes, q2k_block_nums=q2k_block_nums,
-        softmax_scale=softmax_scale, return_lse=True, blk_n=blk_n)
-    return out
+                 q2k_block_nums=None, softmax_scale=None, use_clc=False):
+    """Dispatch to blk64 or blk128 kernel based on blk_n.
+
+    q/k/v are BHSD (batch, heads, seq, dim) for blk64 and BSHD
+    (batch, seq, heads, dim) for blk128. This keeps blk64 benchmarks aligned
+    with the customer zero-copy layout instead of timing host-side transposes.
+    use_clc: blk64-only toggle for the CLC persistent scheduler; ignored for blk128.
+    """
+    if blk_n == 64:
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+        bn_arg = q2k_block_nums if q2k_block_nums is not None else torch.Tensor()
+        bs_arg = block_sizes if block_sizes is not None else torch.Tensor()
+        out_bhsd, _ = torch.ops.bsa_blk64.fwd(
+            q, k, v, q2k_block_index, block_sparse_num,
+            bs_arg, softmax_scale, bn_arg, use_clc)
+        return out_bhsd
+    else:
+        return bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes,
+                             q2k_block_nums=q2k_block_nums)[0]
 
 
 # ============== Benchmark (make bb) ==============
 
 def _benchmark_one(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n,
-                   q2k_block_nums=None, niters=10):
+                   q2k_block_nums=None, niters=10, use_clc=False):
     """Warmup + benchmark a single kernel config. Returns median time in ms."""
     for _ in range(2):
         _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n,
-                     q2k_block_nums=q2k_block_nums)
+                     q2k_block_nums=q2k_block_nums, use_clc=use_clc)
     torch.cuda.synchronize()
 
     evts = [
@@ -488,7 +588,7 @@ def _benchmark_one(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_
     for s, e in evts:
         s.record()
         _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n,
-                     q2k_block_nums=q2k_block_nums)
+                     q2k_block_nums=q2k_block_nums, use_clc=use_clc)
         e.record()
     torch.cuda.synchronize()
     times = sorted([s.elapsed_time(e) for s, e in evts])
@@ -498,9 +598,9 @@ def _benchmark_one(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_
 def run_benchmark_suite():
     # (bs, nheads, seqlen, hdim)
     configs = [
-        # (1, 40, 4096, 128),
-        # (1, 40, 8192, 128),
-        # (1, 40, 16384, 128),
+        (1, 40, 4096, 128),
+        (1, 40, 8192, 128),
+        (1, 40, 16384, 128),
         (1, 1,  102400, 128),
     ]
 
@@ -513,14 +613,24 @@ def run_benchmark_suite():
             print(f"[blk{blk_n}] skipped (not built)")
             continue
 
-        print(f"\n{'Config (blk=' + str(blk_n) + ')':<48} {'ms':>8} {'TFLOPS':>8}")
-        print("-" * 68)
+        use_clc_settings = [False, True] if blk_n == 64 else [False]
+        if blk_n == 64:
+            header = f"{'clc off TFLOPS':>14} {'clc on TFLOPS':>14}"
+        else:
+            header = f"{'TFLOPS':>14}"
+        print(f"\n{'Config (blk=' + str(blk_n) + ')':<48} {header}")
+        print("-" * (48 + len(header) + 2))
 
         for bs, nheads, seqlen, hdim in configs:
             dtype = torch.bfloat16
-            q = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
-            k = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
-            v = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
+            if blk_n == 64:
+                q = torch.randn(bs, nheads, seqlen, hdim, device="cuda", dtype=dtype)
+                k = torch.randn(bs, nheads, seqlen, hdim, device="cuda", dtype=dtype)
+                v = torch.randn(bs, nheads, seqlen, hdim, device="cuda", dtype=dtype)
+            else:
+                q = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
+                k = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
+                v = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
 
             num_kv_blocks = (seqlen + blk_n - 1) // blk_n
 
@@ -544,25 +654,30 @@ def run_benchmark_suite():
                     label = f"bs={bs} h={nheads} sq={seqlen} d={hdim} topk={topk_even}"
                     effective_sk = topk_even * blk_n
 
-                print(f"  {label:<46} ...", end="", flush=True)
-                med = _benchmark_one(q, k, v, q2k_block_index, bsn, bsizes, blk_n,
-                                     q2k_block_nums=q2k_block_nums)
                 f = flops(bs, nheads, seqlen, effective_sk, hdim, hdim)
-                tflops = f / (med * 1e-3) / 1e12
-                print(f"\r  {label:<46} {med:>8.3f} {tflops:>8.1f}")
+                print(f"  {label:<46}", end="", flush=True)
+                for use_clc in use_clc_settings:
+                    med = _benchmark_one(q, k, v, q2k_block_index, bsn, bsizes, blk_n,
+                                         q2k_block_nums=q2k_block_nums, use_clc=use_clc)
+                    tflops = f / (med * 1e-3) / 1e12
+                    print(f" {tflops:>14.1f}", end="", flush=True)
+                print()
 
 
 # ============== Profile (make profile) ==============
 
 def make_topk_block_sparse_args(batch_size, seqlen_q, seqlen_k, nheads, topk, blk_m=128, blk_n=128, device="cuda",
-                                 use_var_block_num=False, use_block_sizes=False):
+                                 use_var_block_num=False, use_block_sizes=False,
+                                 block_size_mode="full"):
     """Create block-sparse args with fixed topK (each Q block attends to topK random KV blocks).
 
     Args:
         use_var_block_num: If True, return q2k_block_nums tensor (all entries = topk)
                            instead of using fixed block_sparse_num.
-        use_block_sizes: If True, set block_sizes to blk_n (actual sizes, enables masking path).
+        use_block_sizes: If True, create block_sizes (actual sizes, enables masking path).
                          If False, pass None (skip block_sizes masking for faster kernel path).
+        block_size_mode: "full" fills block_sizes with blk_n. "random" samples
+                         each block size uniformly in [1, blk_n].
 
     Returns q2k_block_index, block_sparse_num, block_sizes, q2k_block_nums.
     """
@@ -581,10 +696,17 @@ def make_topk_block_sparse_args(batch_size, seqlen_q, seqlen_k, nheads, topk, bl
                 q2k_block_index[b, h, m] = perm.to(torch.int32)
 
     if use_block_sizes:
-        block_sizes = torch.full((num_kv_blocks,), blk_n, dtype=torch.int32, device=device)
+        if block_size_mode == "full":
+            block_sizes = torch.full((num_kv_blocks,), blk_n, dtype=torch.int32, device=device)
+        elif block_size_mode == "random":
+            block_sizes = torch.randint(
+                1, blk_n + 1, (num_kv_blocks,), dtype=torch.int32, device=device
+            )
+        else:
+            raise ValueError(f"unknown block_size_mode: {block_size_mode}")
         last_block_actual = seqlen_k - (num_kv_blocks - 1) * blk_n
         if last_block_actual < blk_n:
-            block_sizes[-1] = last_block_actual
+            block_sizes[-1] = min(block_sizes[-1].item(), last_block_actual)
     else:
         block_sizes = None
 
@@ -612,9 +734,14 @@ def run_profile():
             print(f"[blk{blk_n}] skipped (not built)")
             continue
 
-        q = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
-        k = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
-        v = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
+        if blk_n == 64:
+            q = torch.randn(bs, nheads, seqlen, hdim, device="cuda", dtype=dtype)
+            k = torch.randn(bs, nheads, seqlen, hdim, device="cuda", dtype=dtype)
+            v = torch.randn(bs, nheads, seqlen, hdim, device="cuda", dtype=dtype)
+        else:
+            q = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
+            k = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
+            v = torch.randn(bs, seqlen, nheads, hdim, device="cuda", dtype=dtype)
         q2k_block_index, block_sparse_num, block_sizes, q2k_block_nums = make_topk_block_sparse_args(
             bs, seqlen, seqlen, nheads, topk, blk_m=blk_m, blk_n=blk_n, device="cuda",
             use_var_block_num=use_var_block_num, use_block_sizes=use_block_sizes,

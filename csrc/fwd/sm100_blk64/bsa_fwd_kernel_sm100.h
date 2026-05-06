@@ -5,6 +5,8 @@
 // 4 WG (512 threads) — 2 Softmax WGs + Correction WG + MMA/Load/Epi WG
 #pragma once
 
+#include <type_traits>
+
 #ifndef CUDA_CTA_RECONFIG_ACTIVATED
 #define CUDA_CTA_RECONFIG_ACTIVATED 1
 #endif
@@ -29,8 +31,6 @@ namespace flash {
 
 namespace cute = ::cute;
 
-#define CUTLASS_ARCH_MMA_SM100_SUPPORTED 1
-
 template<uint32_t N>
 __device__ __forceinline__ void warpgroup_reg_set() {
     if constexpr (N < 128) {
@@ -39,8 +39,6 @@ __device__ __forceinline__ void warpgroup_reg_set() {
         cutlass::arch::warpgroup_reg_alloc<N>();
     }
 }
-
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 
 template<typename CollectiveMainloop_, typename CollectiveEpilogue_,
          typename TileScheduler_, bool HasBlockSizes, bool HasVarBlockNums,
@@ -70,8 +68,8 @@ struct FusedAttnFwdSm100 {
     static constexpr int kCorrWarps = CollectiveMainloop::kCorrWarps;
 
     static constexpr int kRegsSoftmax = 184;
-    static constexpr int kRegsCorrection = 88;
-    static constexpr int kRegsOther = 56;
+    static constexpr int kRegsCorrection = 96;
+    static constexpr int kRegsOther = 48;
 
     // CLC persistent scheduler (used when UseClc=true). When UseClc=false the
     // SharedStorage members below still occupy ~96 B of SMEM but are unused;
@@ -79,6 +77,11 @@ struct FusedAttnFwdSm100 {
     static constexpr int kClcStages = 3;
     using ClcClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
     using ClcSched = ClcPersistentTileScheduler<ClcClusterShape, kClcStages>;
+
+    struct NullClcPipeline {
+        template <class... Args>
+        CUTLASS_DEVICE NullClcPipeline(Args&&...) {}
+    };
 
     enum NamedBarriers : int {
         SmStatsNotify = 0,
@@ -129,14 +132,14 @@ struct FusedAttnFwdSm100 {
         bsa_fwd_params fwd;
 
         typename CollectiveMainloop::TMA_Q tma_load_Q;
-        typename CollectiveMainloop::TMA_KV tma_load_K;
-        typename CollectiveMainloop::TMA_KV tma_load_V;
+        typename CollectiveMainloop::TMA_K tma_load_K;
+        typename CollectiveMainloop::TMA_V tma_load_V;
         typename CollectiveEpilogue::TMA_O tma_store_O;
 
         typename CollectiveMainloop::ShapeQ5 shape_Q;
         typename CollectiveMainloop::ShapeKV6 shape_K;
-        typename CollectiveMainloop::ShapeKV6 shape_V;
-        typename CollectiveEpilogue::ShapeO5 shape_O;
+        typename CollectiveMainloop::ShapeV shape_V;
+        typename CollectiveEpilogue::ShapeO4 shape_O;
 
         // CLC-only runtime fields (unused when UseClc=false; kept always to
         // avoid specializing Params on a template parameter).
@@ -169,9 +172,20 @@ struct FusedAttnFwdSm100 {
         return params.fwd.block_indices_ptr + tile_idx * params.fwd.block_indices_stride;
     }
 
-    CUTLASS_DEVICE static int compute_lse_tile_offset(
-            Params const& params, int batch, int head, int m_block) {
-        return (batch * params.fwd.h + head) * params.fwd.num_m_blocks + m_block;
+    // LSE tile pointer: base + (batch*h + head)*seqlen_q + m_block*kRows.
+    // lse_valid_rows: how many rows in this tile are within actual seqlen_q
+    // (per-row bounds check in the correction warp so LSE can be sized at
+    // seqlen_q, not num_m_blocks*kRows).
+    CUTLASS_DEVICE static void compute_lse_tile_ptr(
+            Params const& params, int batch, int head, int m_block,
+            float*& ptr_LSE_tile, int& lse_valid_rows) {
+        float* ptr_LSE_base = static_cast<float*>(params.fwd.softmax_lse_ptr);
+        ptr_LSE_tile = (ptr_LSE_base != nullptr)
+            ? ptr_LSE_base + (batch * params.fwd.h + head) * int64_t(params.fwd.seqlen_q)
+                           + m_block * CollectiveMainloop::kRows
+            : nullptr;
+        lse_valid_rows = params.fwd.seqlen_q - m_block * CollectiveMainloop::kRows;
+        if (lse_valid_rows < 0) lse_valid_rows = 0;
     }
 
     // ---- operator(): pipeline init, warp dispatch ----
@@ -239,33 +253,27 @@ struct FusedAttnFwdSm100 {
         PipelineOEpi    pipeline_o_epi(shared_storage.pipelines.o_epi, oepi_params, cute::false_type{});
         PipelinePLastSplit pipeline_p_lastsplit(shared_storage.pipelines.p_lastsplit, pls_params, cute::false_type{});
 
-        // CLC pipeline (always constructed; barrier init is gated inside the
-        // ctor on warp_idx == initializing_warp, so the cost when UseClc=false
-        // is just a handful of dead mbarrier inits at kernel start). The
-        // pipeline handle is used only inside the UseClc=true branch below.
-        //
-        // NOTE: initializing_warp = 15 (not 0). The other blk64 pipelines all
-        // use warp 0 for their init_barriers; putting CLC on a different warp
-        // lets the init run in parallel and — more importantly — avoids piling
-        // multiple cluster-scope `fence_barrier_init` calls onto a single warp
-        // (which empirically correlated with cluster_arrive_relaxed launch
-        // failures on B200).
         typename ClcSched::Pipeline::Params clc_params;
-        clc_params.transaction_bytes = 16;   // CLCResponse is a fixed 16B payload
-        clc_params.producer_arv_count = 1;   // elect_one_sync: single arrive per query
-        clc_params.consumer_arv_count =
-                kThreads * static_cast<uint32_t>(cute::size<0>(typename ClcSched::ClusterShape{}))
-                         * static_cast<uint32_t>(cute::size<1>(typename ClcSched::ClusterShape{}))
-                         * static_cast<uint32_t>(cute::size<2>(typename ClcSched::ClusterShape{}));
-        clc_params.producer_blockid = 0;     // leader CTA rank within cluster
-        clc_params.initializing_warp = 15;   // disjoint from warp 0 used by other pipelines
-        // Role = ProducerConsumer so both pipeline_check_is_producer and
-        // pipeline_check_is_consumer pass (they're active in non-NDEBUG builds).
-        // For 1x1 cluster every CTA is its own leader, so every CTA's warp 15
-        // acts as producer + consumer, and all other warps act as consumers
-        // (the role guards only gate debug asserts, not runtime behavior).
-        clc_params.role = ClcSched::Pipeline::ThreadCategory::ProducerConsumer;
-        typename ClcSched::Pipeline clc_pipeline(
+        if constexpr (kUseClc) {
+            // NOTE: initializing_warp = 15 (not 0). The other blk64 pipelines
+            // initialize on warps 0-6; keeping CLC on a separate warp avoids
+            // piling multiple cluster-scope `fence_barrier_init` calls onto a
+            // single warp.
+            clc_params.transaction_bytes = 16;   // CLCResponse is a fixed 16B payload
+            clc_params.producer_arv_count = 1;   // elect_one_sync: single arrive per query
+            clc_params.consumer_arv_count =
+                    kThreads * static_cast<uint32_t>(cute::size<0>(typename ClcSched::ClusterShape{}))
+                             * static_cast<uint32_t>(cute::size<1>(typename ClcSched::ClusterShape{}))
+                             * static_cast<uint32_t>(cute::size<2>(typename ClcSched::ClusterShape{}));
+            clc_params.producer_blockid = 0;     // leader CTA rank within cluster
+            clc_params.initializing_warp = 15;   // disjoint from common pipeline init
+            // Role = ProducerConsumer so both pipeline_check_is_producer and
+            // pipeline_check_is_consumer pass (active in non-NDEBUG builds).
+            clc_params.role = ClcSched::Pipeline::ThreadCategory::ProducerConsumer;
+        }
+        using MaybeClcPipeline = std::conditional_t<
+                kUseClc, typename ClcSched::Pipeline, NullClcPipeline>;
+        MaybeClcPipeline clc_pipeline(
                 shared_storage.pipelines.clc_pipe, clc_params,
                 typename ClcSched::ClusterShape{});
 
@@ -367,9 +375,9 @@ struct FusedAttnFwdSm100 {
         CollectiveEpilogue epilogue;
 
         if (warp_idx >= 15) {
-            // Warp 15: Idle
+            return;
         }
-        else if (warp_idx == kMmaWarp) {
+        if (warp_idx == kMmaWarp) {
             tmem_alloc.allocate(TmemAllocator::Sm100TmemCapacityColumns,
                                                     &shared_storage.tmem_base_ptr);
             tmem_alloc.release_allocation_lock();
@@ -402,9 +410,10 @@ struct FusedAttnFwdSm100 {
                     params.fwd, work.batch, work.head, work.m_block);
             int raw_bc = CollectiveMainloop::template get_tile_raw_block_count<HasVarBlockNums>(
                     params.fwd, work.batch, work.head, work.m_block);
-            load_state = mainloop.load(params, pipeline_kv, shared_storage,
-                                        work.head, work.m_block, work.batch, params.fwd.num_m_blocks, tile_nkv,
-                                        raw_bc, load_state);
+            load_state = mainloop.load(
+                    params, pipeline_kv, shared_storage,
+                    work.head, work.m_block, work.batch, params.fwd.num_m_blocks, tile_nkv,
+                    raw_bc, load_state);
         }
         else if (warp_idx >= 8) {
             cutlass::arch::warpgroup_reg_dealloc<kRegsCorrection>();
@@ -415,13 +424,15 @@ struct FusedAttnFwdSm100 {
 
             int tile_nkv = CollectiveMainloop::template get_tile_num_kv_blocks<HasVarBlockNums>(
                     params.fwd, work.batch, work.head, work.m_block);
-            int lse_tile_offset = compute_lse_tile_offset(params, work.batch, work.head, work.m_block);
+            float* ptr_LSE_tile; int lse_valid_rows;
+            compute_lse_tile_ptr(params, work.batch, work.head, work.m_block,
+                                 ptr_LSE_tile, lse_valid_rows);
             corr_state = mainloop.template correction<SharedStorage, NamedBarriers>(
                     params.fwd.scale_softmax_log2,
                     pipeline_s_p_o, pipeline_sm_stats, pipeline_o_acc, pipeline_o_epi,
                     shared_storage,
                     tmem_base, tile_nkv, corr_state,
-                    static_cast<float*>(params.fwd.softmax_lse_ptr), lse_tile_offset);
+                    ptr_LSE_tile, lse_valid_rows);
             pipeline_o_epi.producer_acquire(corr_state.o_epi_state);
         }
         else if (warp_idx >= 4) {
@@ -568,13 +579,15 @@ struct FusedAttnFwdSm100 {
             while (work.is_valid_tile) {
                 int tile_nkv = CollectiveMainloop::template get_tile_num_kv_blocks<HasVarBlockNums>(
                         params.fwd, work.batch, work.head, work.m_block);
-                int lse_tile_offset = compute_lse_tile_offset(params, work.batch, work.head, work.m_block);
+                float* ptr_LSE_tile; int lse_valid_rows;
+                compute_lse_tile_ptr(params, work.batch, work.head, work.m_block,
+                                     ptr_LSE_tile, lse_valid_rows);
                 corr_state = mainloop.template correction<SharedStorage, NamedBarriers>(
                         params.fwd.scale_softmax_log2,
                         pipeline_s_p_o, pipeline_sm_stats, pipeline_o_acc, pipeline_o_epi,
                         shared_storage,
                         tmem_base, tile_nkv, corr_state,
-                        static_cast<float*>(params.fwd.softmax_lse_ptr), lse_tile_offset);
+                        ptr_LSE_tile, lse_valid_rows);
                 work = ClcSched::consumer_advance(clc_pipeline, clc_consumer_state, clc_response_ptr);
             }
             pipeline_o_epi.producer_acquire(corr_state.o_epi_state);
@@ -644,5 +657,4 @@ using FusedAttnKernel = FusedAttnFwdSm100<CollectiveMainloopFwd, CollectiveEpilo
                                           SingleTileScheduler, HasBlockSizes, HasVarBlockNums,
                                           UseClc>;
 
-#endif
 } // namespace flash

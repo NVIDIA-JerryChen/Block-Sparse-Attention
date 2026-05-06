@@ -3,6 +3,10 @@
   ******************************************************************************/
 // C++ API for BSA fused attention forward kernel (blk=64)
 // FA Hopper pattern: set_params_fprop() + run_bsa_fwd()
+//
+// Layout convention: BHSD = (batch, num_heads, seqlen, head_dim) with head_dim
+// stride-1 (innermost). The C++ API must not introduce host-side transposes:
+// Q/K/V are consumed in the caller-provided natural BHSD layout.
 
 #include <cmath>
 #include <tuple>
@@ -19,6 +23,7 @@ template<int kHeadDim, bool HasBlockSizes, bool HasVarBlockNums, bool UseClc>
 void run_bsa_fwd(bsa_fwd_params const&, cudaStream_t);
 
 // FA Hopper pattern: populate bsa_fwd_params from torch tensors.
+// BHSD-only: stride(1) is the head stride, stride(2) is the seqlen stride.
 void set_params_fprop(bsa_fwd_params &params,
                       int b, int seqlen_q, int seqlen_k, int h, int h_k, int d,
                       const torch::Tensor &q, const torch::Tensor &k, const torch::Tensor &v,
@@ -28,17 +33,17 @@ void set_params_fprop(bsa_fwd_params &params,
                       const torch::Tensor &block_sizes,
                       int const* q2k_block_nums_ptr,
                       int uniform_block_sparse_num, int num_m_blocks,
-                      int seqlen_q_rounded, int seqlen_k_rounded) {
+                      int seqlen_k_rounded) {
     params.q_ptr = q.data_ptr();
     params.k_ptr = k.data_ptr();
     params.v_ptr = v.data_ptr();
     params.o_ptr = out.data_ptr();
     params.softmax_lse_ptr = lse.data_ptr();
 
-    // BHSD layout: dim 0=batch, dim 1=head, dim 2=row (seq), dim 3=head_dim (stride=1).
-    params.q_batch_stride = q.stride(0); params.q_head_stride = q.stride(1); params.q_row_stride = q.stride(2);
-    params.k_batch_stride = k.stride(0); params.k_head_stride = k.stride(1); params.k_row_stride = k.stride(2);
-    params.v_batch_stride = v.stride(0); params.v_head_stride = v.stride(1); params.v_row_stride = v.stride(2);
+    // BHSD: axis 0=batch, 1=head, 2=seq, 3=dim (stride 1).
+    params.q_batch_stride = q.stride(0);   params.q_head_stride = q.stride(1);   params.q_row_stride = q.stride(2);
+    params.k_batch_stride = k.stride(0);   params.k_head_stride = k.stride(1);   params.k_row_stride = k.stride(2);
+    params.v_batch_stride = v.stride(0);   params.v_head_stride = v.stride(1);   params.v_row_stride = v.stride(2);
     params.o_batch_stride = out.stride(0); params.o_head_stride = out.stride(1); params.o_row_stride = out.stride(2);
 
     params.block_indices_ptr = block_indices.data_ptr<int>();
@@ -48,7 +53,6 @@ void set_params_fprop(bsa_fwd_params &params,
 
     params.b = b; params.seqlen_q = seqlen_q; params.seqlen_k = seqlen_k; params.d = d;
     params.h = h; params.h_k = h_k;
-    params.seqlen_q_rounded = seqlen_q_rounded;
     params.seqlen_k_rounded = seqlen_k_rounded;
     params.num_m_blocks = num_m_blocks;
     params.block_indices_stride = block_indices_stride;
@@ -57,7 +61,7 @@ void set_params_fprop(bsa_fwd_params &params,
     params.scale_softmax_log2 = float(scale_softmax * M_LOG2E);
 }
 
-// Entry point: extract dims, populate params, allocate output, launch.
+// Entry point: BHSD-only, zero-copy for Q/K/V.
 std::tuple<torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_impl(
         torch::Tensor q, torch::Tensor k, torch::Tensor v,
         torch::Tensor q2k_block_index, int64_t block_sparse_num,
@@ -65,78 +69,103 @@ std::tuple<torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_impl(
         torch::Tensor q2k_block_nums,
         bool use_clc)
 {
-    // BHSD tensor convention: (batch, num_heads, seqlen, head_dim)
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "q/k/v must be CUDA");
     TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "q/k/v must be 4D");
     TORCH_CHECK(q.size(3) == 128, "requires D=128");
-    TORCH_CHECK(q.size(0) == k.size(0) && q.size(0) == v.size(0),
-                "q/k/v batch size mismatch");
-    TORCH_CHECK(q.size(1) == k.size(1) && q.size(1) == v.size(1),
-                "blk64 requires MHA: q/k/v must share num_heads (size(1))");
-    TORCH_CHECK(k.size(2) == v.size(2), "k/v seqlen mismatch");
-    TORCH_CHECK(v.size(3) == q.size(3), "v head_dim mismatch");
     TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
                 "q/k/v must be BHSD-contiguous");
-    TORCH_CHECK(q2k_block_index.is_contiguous(), "q2k_block_index must be contiguous");
+
+    // BHSD: (batch, num_heads, seqlen, head_dim)
+    const int b = q.size(0);
+    const int h = q.size(1);
+    const int seqlen_q = q.size(2);
+    const int d = q.size(3);
+    const int h_k = k.size(1);
+    const int seqlen_k = k.size(2);
+
+    TORCH_CHECK(q.size(0) == k.size(0) && q.size(0) == v.size(0),
+                "q/k/v batch size mismatch");
+    TORCH_CHECK(h == k.size(1) && h == v.size(1),
+                "blk64 requires MHA: q/k/v must share num_heads (size(1))");
+    TORCH_CHECK(seqlen_k == v.size(2), "k/v seqlen mismatch");
 
     const bool has_var_block_nums = q2k_block_nums.defined() && q2k_block_nums.numel() > 0;
-    if (has_var_block_nums) {
-        TORCH_CHECK(q2k_block_nums.is_contiguous(), "q2k_block_nums must be contiguous");
-    }
-
-    const int b = q.size(0), h = q.size(1), seqlen_q = q.size(2), d = q.size(3);
-    const int seqlen_k = k.size(2);
-    const int h_k = k.size(1);
 
     constexpr int kRows = 64, kSparseBlockSize = 64;
     constexpr int kOutputCols = 128;
-    const int seqlen_q_rounded = ((seqlen_q + kRows - 1) / kRows) * kRows;
     const int seqlen_k_rounded = ((seqlen_k + kSparseBlockSize - 1) / kSparseBlockSize) * kSparseBlockSize;
-    const int num_m_blocks = seqlen_q_rounded / kRows;
+    const int num_m_blocks = (seqlen_q + kRows - 1) / kRows;
 
-    // V: sub-tile transpose (swap token↔dim within each 64×64 block).
-    // Required because PV dual GEMM reduces over K direction (= tokens),
-    // and K-major SMEM layout makes dim 1 contiguous.
-    // BHSD input layout: (b, h_k, total_sparse_blocks, kSparseBlockSize, kDimHalves, kDimHalf)
-    //   axes:            [ 0,   1,         2,                 3,              4,          5   ]
-    // Swap axis 3 (tokens) <-> axis 5 (dim_half) within each 64x64 sub-tile.
-    constexpr int kDimHalf = 64;    // kDualK / 2
-    constexpr int kDimHalves = 2;
-    int total_sparse_blocks = seqlen_k_rounded / kSparseBlockSize;
-    torch::Tensor v_contig = v.view({b, h_k, total_sparse_blocks, kSparseBlockSize, kDimHalves, kDimHalf})
-                              .permute({0, 1, 2, 5, 4, 3})
-                              .reshape({b, h_k, seqlen_k_rounded, d})
-                              .contiguous();
-
-    // ======== Output (BHSD, torch::empty) ========
-    auto out = torch::empty({b, h, seqlen_q_rounded, kOutputCols}, q.options());
-    auto lse = torch::empty({b, h, seqlen_q_rounded},
+    // ======== Output (BHSD) ========
+    // out: actual seqlen_q. O TMA descriptor is 4D with seq as a single mode
+    //   (globalDim[seq] = seqlen_q), so the last partial tile's OOB rows are
+    //   silently dropped by TMA store — no host pad / allocation rounding needed.
+    // lse: actual seqlen_q; kernel has a row bounds-check around the thread-level
+    //   store (matches blk128 pattern).
+    auto out = torch::empty({b, h, seqlen_q, kOutputCols}, q.options());
+    auto lse = torch::empty({b, h, seqlen_q},
                             torch::dtype(torch::kFloat32).device(q.device()));
 
-    // ======== Block indices (use input pointer directly; layout (b,h,m,n) ========
-    // contiguous gives flat (b*h*m, n) layout the kernel expects).
+    // ======== Block indices ========
+    // Expect (B, H, num_m_blocks, max_kv) int32 contiguous. Kernel indexes linearly as
+    //   idx = ((b*H + h) * num_m_blocks + m_block) * max_kv + sub
+    // which matches the contiguous flat offset, so no reshape/copy needed.
+    TORCH_CHECK(q2k_block_index.dim() == 4,
+                "q2k_block_index must be 4D (B, H, num_m_blocks, max_kv)");
+    TORCH_CHECK(q2k_block_index.size(0) == b && q2k_block_index.size(1) == h
+                && q2k_block_index.size(2) == num_m_blocks,
+                "q2k_block_index shape must be (B, H, num_m_blocks, max_kv)");
+    TORCH_CHECK(q2k_block_index.is_contiguous(), "q2k_block_index must be contiguous");
+    TORCH_CHECK(q2k_block_index.scalar_type() == torch::kInt32,
+                "q2k_block_index must be int32");
     int block_indices_stride = static_cast<int>(q2k_block_index.size(3));
 
-    // q2k_block_nums: pass pointer directly when present; nullptr otherwise so the
-    // HasVarBlockNums=false compile-time branch reads uniform_block_sparse_num.
-    int const* q2k_block_nums_ptr = has_var_block_nums
-                                    ? q2k_block_nums.data_ptr<int>()
-                                    : nullptr;
+    // ======== Block sizes (optional) ========
+    // When defined and non-empty, expect (num_kv_blocks,) int32 contiguous; kernel
+    // indexes ptr_block_sizes[sparse_block_idx] directly. When empty/undefined,
+    // HasBlockSizes=false compile-time branch is used and the kernel assumes
+    // every sparse block is full (= kSparseBlockSize tokens).
+    const bool has_block_sizes = block_sizes.defined() && block_sizes.numel() > 0;
+    if (has_block_sizes) {
+        const int num_kv_blocks = seqlen_k_rounded / kSparseBlockSize;
+        TORCH_CHECK(block_sizes.dim() == 1,
+                    "block_sizes must be 1D (num_kv_blocks,)");
+        TORCH_CHECK(block_sizes.size(0) == num_kv_blocks,
+                    "block_sizes size must equal num_kv_blocks = "
+                    "ceil(seqlen_k / kSparseBlockSize)");
+        TORCH_CHECK(block_sizes.is_contiguous(), "block_sizes must be contiguous");
+        TORCH_CHECK(block_sizes.scalar_type() == torch::kInt32,
+                    "block_sizes must be int32");
+    }
+
+    // q2k_block_nums: optional — when empty, kernel uses uniform_block_sparse_num scalar
+    // (HasVarBlockNums=false compile-time branch). When present, expect (B, H, num_m_blocks).
+    int const* q2k_block_nums_ptr = nullptr;
+    if (has_var_block_nums) {
+        TORCH_CHECK(q2k_block_nums.dim() == 3,
+                    "q2k_block_nums must be 3D (B, H, num_m_blocks)");
+        TORCH_CHECK(q2k_block_nums.size(0) == b && q2k_block_nums.size(1) == h
+                    && q2k_block_nums.size(2) == num_m_blocks,
+                    "q2k_block_nums shape must be (B, H, num_m_blocks)");
+        TORCH_CHECK(q2k_block_nums.is_contiguous(), "q2k_block_nums must be contiguous");
+        TORCH_CHECK(q2k_block_nums.scalar_type() == torch::kInt32,
+                    "q2k_block_nums must be int32");
+        q2k_block_nums_ptr = q2k_block_nums.data_ptr<int>();
+    }
 
     // ======== Populate params (FA Hopper set_params_fprop pattern) ========
     bsa_fwd_params params{};
     set_params_fprop(params,
                      b, seqlen_q, seqlen_k, h, h_k, d,
-                     q, k, v_contig,
+                     q, k, v,
                      out, lse,
                      softmax_scale,
                      q2k_block_index, block_indices_stride,
                      block_sizes, q2k_block_nums_ptr,
                      static_cast<int>(block_sparse_num), num_m_blocks,
-                     seqlen_q_rounded, seqlen_k_rounded);
+                     seqlen_k_rounded);
 
     auto stream = c10::cuda::getCurrentCUDAStream(q.device().index()).stream();
-    const bool has_block_sizes = (params.block_sizes_ptr != nullptr);
     BOOL_SWITCH(has_block_sizes, HAS_BLOCK_SIZES, [&] {
         BOOL_SWITCH(has_var_block_nums, HAS_VAR_BLOCK_NUMS, [&] {
             BOOL_SWITCH(use_clc, USE_CLC, [&] {
@@ -145,7 +174,7 @@ std::tuple<torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_impl(
         });
     });
 
-    // ======== Return BHSD output directly (Python handles slicing) ========
+    // ======== Return BHSD output directly ========
     return std::make_tuple(out, lse);
 }
 
@@ -168,6 +197,7 @@ TORCH_LIBRARY(bsa_blk64, m) {
           "Tensor q2k_block_nums, bool use_clc) -> (Tensor, Tensor)");
 }
 // Note: schema uses "int" (maps to int64_t) and "float" (maps to double) in C++.
+// Tensors must be BHSD: (batch, num_heads, seqlen, head_dim).
 
 TORCH_LIBRARY_IMPL(bsa_blk64, CUDA, m) {
     m.impl("fwd", &flash::bsa_fused_fwd_blk64_impl);
