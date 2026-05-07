@@ -248,9 +248,21 @@ class BlockSparseAttnBackward:
                 2, 4
             )
         )
-        O = cute.make_tensor(O.iterator, Q.layout)
+        O = cute.make_tensor(
+            O.iterator,
+            cute.group_modes(
+                cute.select(O.layout, mode=[2, 3, 1, 0]),
+                2, 4
+            )
+        )
 
-        dQ = cute.make_tensor(dQ.iterator, Q.layout)
+        dQ = cute.make_tensor(
+            dQ.iterator,
+            cute.group_modes(
+                cute.select(dQ.layout, mode=[2, 3, 1, 0]),
+                2, 4
+            )
+        )
         dK = cute.make_tensor(
             dK.iterator,
             cute.group_modes(
@@ -266,7 +278,13 @@ class BlockSparseAttnBackward:
                 2, 4
             )
         )
-        dO = cute.make_tensor(dO.iterator, O.layout)
+        dO = cute.make_tensor(
+            dO.iterator,
+            cute.group_modes(
+                cute.select(dO.layout, mode=[2, 3, 1, 0]),
+                2, 4
+            )
+        )
 
         # (b, h, s) -> (s, (h, b))
         LSE = cute.make_tensor(
@@ -919,9 +937,9 @@ class BlockSparseAttnBackward:
         sLSE = storage.sLSE.get_tensor(LSE_smem_layout)
         sSum_OdO = storage.sSum_OdO.get_tensor(sum_OdO_smem_layout)
 
-        tmem_holding_buf = storage.tmem_holding_buf.ptr
+        tmem_holding_buf = storage.tmem_holding_buf
         tmem = utils.TmemAllocator(
-            tmem_holding_buf,
+            storage.tmem_holding_buf,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
         )
