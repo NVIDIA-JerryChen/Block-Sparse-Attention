@@ -798,6 +798,38 @@ _bsa_attn_fwd_blk64_kv_bucketed.compile_cache = get_jit_cache(
 )
 
 
+def choose_blk64_use_clc(
+    q: torch.Tensor,
+    block_sparse_num: int,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    layout: str = "bhsd",
+) -> bool:
+    """Select the measured-fastest blk64 scheduler for the common wrapper path.
+
+    The low-level ``torch.ops.bsa_blk64.fwd(..., use_clc)`` API treats
+    ``use_clc`` as an explicit scheduler request. This helper is for interface
+    defaults: callers can pass ``use_clc=True`` or ``False`` to force a path, or
+    leave it as ``None`` to use this shape-based policy.
+    """
+    if q2k_block_nums is not None and q2k_block_nums.numel() > 0:
+        return True
+
+    if layout == "bshd":
+        batch, seqlen_q, h, _ = q.shape
+    else:
+        assert layout == "bhsd", f"layout must be 'bhsd' or 'bshd', got {layout!r}"
+        batch, h, seqlen_q, _ = q.shape
+
+    if h == 1:
+        return False
+
+    num_m_blocks = (seqlen_q + 63) // 64
+    total_tiles = batch * h * num_m_blocks
+    enough_tiles = num_m_blocks >= 128 and total_tiles >= 512
+    light_tile = block_sparse_num <= (64 if h == 2 else 128)
+    return enough_tiles and light_tile
+
+
 def bsa_attn_fwd_blk64(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -807,7 +839,7 @@ def bsa_attn_fwd_blk64(
     q2k_block_nums: torch.Tensor,
     softmax_scale: Optional[float] = None,
     layout: str = "bhsd",
-    use_clc: bool = False,
+    use_clc: Optional[bool] = None,
     kv_splits: int | str = 1,
     block_sparse_num: Optional[int] = None,
 ):
@@ -827,8 +859,9 @@ def bsa_attn_fwd_blk64(
         q2k_block_nums: (B, H, Q_tiles) int32
         softmax_scale: default 1/sqrt(D)
         layout: "bhsd" (default, zero-copy) or "bshd" (converted to BHSD).
-        use_clc: enable the SM100 CLC persistent scheduler path. Default False
-            uses the SingleTileScheduler fallback (one tile per CTA).
+        use_clc: True forces the SM100 CLC persistent scheduler path, False
+            forces the SingleTileScheduler path, and None (default) uses the
+            interface's shape-based auto policy.
         kv_splits: number of KV buckets per Q block on SM100. kv_splits=1 keeps
             the legacy single-kernel fwd path; kv_splits>1 uses pre-schedule,
             partial attention, and combine. Pass "auto" to choose splits from
@@ -953,6 +986,20 @@ def bsa_attn_fwd_blk64(
         if q2k_block_nums is None or q2k_block_nums.numel() == 0
         else 0
     )
+    if use_clc is None:
+        block_nums_for_policy = (
+            q2k_block_nums
+            if q2k_block_nums is not None and q2k_block_nums.numel() > 0
+            else None
+        )
+        policy_block_sparse_num = (
+            fixed_block_sparse_num
+            if fixed_block_sparse_num > 0
+            else q2k_block_index.shape[-1]
+        )
+        use_clc = choose_blk64_use_clc(
+            q, policy_block_sparse_num, block_nums_for_policy, layout="bhsd"
+        )
     if auto_kv_splits:
         kv_splits_i = _sm100_blk64_auto_kv_splits(
             q, q2k_block_index, fixed_block_sparse_num
