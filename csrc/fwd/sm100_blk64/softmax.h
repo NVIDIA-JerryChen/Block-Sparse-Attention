@@ -32,6 +32,19 @@ static __device__ __forceinline__ void ffma2(float& a, float& b, float c, float 
       : "+f"(a), "+f"(b) : "f"(c), "f"(d));
 }
 
+// Packed f32x2 FMA with a packed addend: (a,b) = (a,b) * (c,c) + (d0,d1)
+static __device__ __forceinline__ void ffma2(float& a, float& b, float c, float d0, float d1) {
+    asm("{\n\t"
+      ".reg .b64 la, lc, ld;\n\t"
+      "mov.b64 la, {%0, %1};\n\t"
+      "mov.b64 lc, {%2, %2};\n\t"
+      "mov.b64 ld, {%3, %4};\n\t"
+      "fma.rn.f32x2 la, la, lc, ld;\n\t"
+      "mov.b64 {%0, %1}, la;\n\t"
+      "}\n"
+      : "+f"(a), "+f"(b) : "f"(c), "f"(d0), "f"(d1));
+}
+
 // Packed f32x2 MUL: (a,b) = (a,b) * (c,c)
 static __device__ __forceinline__ void fmul2(float& a, float& b, float c) {
     asm("{\n\t"

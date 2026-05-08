@@ -113,18 +113,30 @@ struct CollectiveMainloopFwd {
     static constexpr int kQBytes = kRows * kQkK * sizeof(ElementA);
     static constexpr int kKVBytes = kDualCols * kDualK * sizeof(ElementB);
     static constexpr int kSubTileBytes = kSparseBlockSize * kDimHalf * sizeof(ElementB);  // 8KB per TMA
-
     // ---- Compact (64,64) K-major SMEM layout for K sparse TMA ----
     using SmemLayoutSubTile = decltype(cute::coalesce(cute::tile_to_shape(
             cute::UMMA::Layout_K_SW128_Atom<ElementB>{},
             cute::Shape<cute::Int<kSparseBlockSize>, cute::Int<kDimHalf>>{},
             cute::Step<cute::_1, cute::_2>{}), cute::Shape<cute::_1, cute::_1>{}));
+    using SmemLayoutKWide = decltype(cute::composition(
+            SmemLayoutSubTile{}.layout_a(),
+            SmemLayoutSubTile{}.offset(),
+            cute::make_layout(
+                    cute::Shape<cute::Int<kSparseBlockSize>, cute::Int<kDimHalf>, cute::Int<kDimHalves>>{},
+                    cute::Stride<cute::Int<kDimHalf>, cute::_1, cute::Int<kKHalfStride>>{})));
     // ---- MN-major SMEM sub-tile for V per-sparse-block TMA ----
     // TMA-friendly mode builds the full V layout by tiling this standalone
-    // sub-tile, so each V copy atom covers the full 64x64 box instead of
-    // degenerating into many 64x1 TMA atoms.
+    // sub-tile, so each V copy atom covers full 64x64 boxes. The wide layout
+    // groups both dim halves for a sparse token block into one TMA, matching
+    // K's 64x64x2 load shape while preserving the full SmemLayoutVDual offsets.
     using SmemLayoutVSubTile = SmemLayoutVStandaloneSubTile;
-    using SmemLayoutVTma = SmemLayoutVSubTile;
+    using SmemLayoutVWide = decltype(cute::composition(
+            SmemLayoutVSubTile{}.layout_a(),
+            SmemLayoutVSubTile{}.offset(),
+            cute::make_layout(
+                    cute::Shape<cute::Int<kVDimPart>, cute::Int<kSparseBlockSize>, cute::Int<kVDimParts>>{},
+                    cute::Stride<cute::_1, cute::Int<kVDimPart>,
+                                 cute::Int<kVDimPart * kSparseBlockSize>>{})));
 
     // ---- TMA types ----
     // Interface is BHSD (batch, num_heads, seqlen, head_dim). All seqlen/head/batch
@@ -158,14 +170,14 @@ struct CollectiveMainloopFwd {
     using TMA_K = decltype(cute::make_tma_copy(cute::SM90_TMA_LOAD{},
             cute::make_tensor(cute::make_gmem_ptr(static_cast<ElementB const*>(nullptr)),
                                                 cute::make_layout(ShapeKV6{}, StrideKV6{})),
-            SmemLayoutSubTile{}));
-    // V: per-sparse-block (128_dim, 64_tok) sub-tile into MN-major SMEM.
-    // SmemLayoutVSubTile is a composition of the full SmemLayoutVDual so its strides
-    // match full's — avoiding the atom offset mismatch for mode 1.
+            SmemLayoutKWide{}));
+    // V: per-sparse-block (64_dim_part, 64_tok, 2_dim_parts) into MN-major SMEM.
+    // SmemLayoutVWide keeps one TMA per sparse block while producing the same
+    // offsets consumed by SmemLayoutVDual in the PV MMA.
     using TMA_V = decltype(cute::make_tma_copy(cute::SM90_TMA_LOAD{},
             cute::make_tensor(cute::make_gmem_ptr(static_cast<ElementB const*>(nullptr)),
                               cute::make_layout(ShapeV{}, StrideV{})),
-            SmemLayoutVTma{}));
+            SmemLayoutVWide{}));
 
     // ---- TensorStorage ----
     struct TensorStorage {
@@ -211,7 +223,7 @@ struct CollectiveMainloopFwd {
         return make_tma_copy(SM90_TMA_LOAD{},
                 make_tensor(make_gmem_ptr(static_cast<ElementB const*>(p.k_ptr)),
                             make_layout(shape_k, stride_k)),
-                SmemLayoutSubTile{});
+                SmemLayoutKWide{});
     }
 
     static ShapeKV6 make_shape_K(bsa_fwd_params const& p) {
@@ -222,8 +234,8 @@ struct CollectiveMainloopFwd {
                           total_sparse_blocks, p.b);
     }
 
-    // V loads natural V (BHSD): dim contig (stride 1), per-sparse-sub-block box
-    // (dim_part, 64_tok). Writes into MN-major SmemLayoutVSubTile.
+    // V loads natural V (BHSD): dim contig (stride 1), per-sparse-sub-block
+    // (dim_part, 64_tok, dim_parts). Writes into MN-major SmemLayoutVWide.
     static TMA_V make_tma_load_V(bsa_fwd_params const& p) {
         using namespace cute;
         int const total_k_blocks = (p.seqlen_k_rounded + kSparseBlockSize - 1) / kSparseBlockSize;
@@ -238,7 +250,7 @@ struct CollectiveMainloopFwd {
         return make_tma_copy(SM90_TMA_LOAD{},
                 make_tensor(make_gmem_ptr(static_cast<ElementB const*>(p.v_ptr)),
                             make_layout(shape_v, stride_v)),
-                SmemLayoutVTma{});
+                SmemLayoutVWide{});
     }
 
     static ShapeV make_shape_V(bsa_fwd_params const& p) {
@@ -304,17 +316,21 @@ struct CollectiveMainloopFwd {
     }
 
     // Resolve sparse block index: indirect via block_indices or direct (dense)
+    CUTLASS_DEVICE static int get_sparse_lookup_pos(int logical_idx, int raw_block_count) {
+        return (logical_idx < raw_block_count) ? logical_idx
+             : max(raw_block_count - 1, 0);
+    }
+
     // Phantom block clamping: if logical_idx >= raw_block_count,
-    // clamp to last valid index (phantom loads same data, masked in softmax).
+    // load any valid index; softmax masks phantom blocks via block_size=0.
     CUTLASS_DEVICE static int get_sparse_idx(
             int kv_block_idx, int sub, int raw_block_count,
             int const* tile_block_indices) {
         int logical_idx = kv_block_idx * kSparseBlocksPerKV + sub;
-        int clamped = (logical_idx < raw_block_count) ? logical_idx
-                    : max(raw_block_count - 1, 0);
+        int lookup_pos = get_sparse_lookup_pos(logical_idx, raw_block_count);
         return (tile_block_indices != nullptr)
-            ? tile_block_indices[clamped]
-            : clamped;
+            ? tile_block_indices[lookup_pos]
+            : lookup_pos;
     }
 
     CUTLASS_DEVICE static int get_interleaved_k_slot(int sub) {
@@ -345,9 +361,10 @@ struct CollectiveMainloopFwd {
                 thr_tma.partition_D(s_tile));
     }
 
-    // Load K: 8 TMAs per KV block (4 sparse blocks × 2 dim halves)
-    // Each TMA loads (64, 64) bf16 = 8KB. 8 × 8KB = 64KB per stage.
-    // SMEM offset for sub-block i, dim-half h: K: i*kKSubStride+h*kKHalfStride
+    // Load K: 4 TMAs per KV block (4 sparse blocks × both dim halves).
+    // Each TMA loads (64, 64, 2) bf16 = 16KB. 4 × 16KB = 64KB per stage.
+    // SMEM offset for sub-block i: K: i*kKSubStride, with the dim-half
+    // separation carried by SmemLayoutKWide so the result matches SmemLayoutBDual.
     template<typename ThrTmaK, typename GKFull, typename MainloopStorage,
              typename TmaBarrier>
     CUTLASS_DEVICE static void issue_K_tmas(
@@ -363,15 +380,12 @@ struct CollectiveMainloopFwd {
         for (int sub = 0; sub < kSparseBlocksPerKV; ++sub) {
             int sparse_idx = get_sparse_idx(kv_block_idx, sub, raw_block_count, tile_block_indices);
             int slot = get_interleaved_k_slot(sub);
-            CUTLASS_PRAGMA_UNROLL
-            for (int h = 0; h < kDimHalves; ++h) {
-                int smem_offset = stage_base + slot * kKSubStride + h * kKHalfStride;
-                auto sK_sub = make_tensor(make_smem_ptr(
-                        ml.smem_kv.begin() + smem_offset), SmemLayoutSubTile{});
-                cute::copy(params.tma_load_K.with(tma_mbar, 0, tma_kv_cache_hint()),
-                        thr_tma_k.partition_S(gK_full(_, _, h, head, sparse_idx, batch)),
-                        thr_tma_k.partition_D(sK_sub));
-            }
+            int smem_offset = stage_base + slot * kKSubStride;
+            auto sK_sub = make_tensor(make_smem_ptr(
+                    ml.smem_kv.begin() + smem_offset), SmemLayoutKWide{});
+            cute::copy(params.tma_load_K.with(tma_mbar, 0, tma_kv_cache_hint()),
+                    thr_tma_k.partition_S(gK_full(_, _, _, head, sparse_idx, batch)),
+                    thr_tma_k.partition_D(sK_sub));
         }
     }
 
@@ -407,25 +421,21 @@ struct CollectiveMainloopFwd {
             int head, int batch, int raw_block_count,
             int const* tile_block_indices) {
         using namespace cute;
-        CUTLASS_PRAGMA_UNROLL
         for (int sub = 0; sub < kSparseBlocksPerKV; ++sub) {
             int sparse_idx = get_sparse_idx(kv_block_idx, sub, raw_block_count, tile_block_indices);
-            CUTLASS_PRAGMA_UNROLL
-            for (int h = 0; h < kVDimParts; ++h) {
-                int smem_offset = get_v_smem_offset(stage_base, sub, h);
-                auto sV_sub = make_tensor(make_smem_ptr(
-                        ml.smem_kv.begin() + smem_offset), SmemLayoutVTma{});
-                auto& tma_mbar = reinterpret_cast<uint64_t&>(*tma_bar);
-                issue_one_v_tma(params.tma_load_V, tma_mbar, thr_tma_v,
-                        gV_full(_, _, h, head, sparse_idx, batch), sV_sub);
-            }
+            int smem_offset = get_v_smem_offset(stage_base, sub, 0);
+            auto sV_sub = make_tensor(make_smem_ptr(
+                    ml.smem_kv.begin() + smem_offset), SmemLayoutVWide{});
+            auto& tma_mbar = reinterpret_cast<uint64_t&>(*tma_bar);
+            issue_one_v_tma(params.tma_load_V, tma_mbar, thr_tma_v,
+                    gV_full(_, _, _, head, sparse_idx, batch), sV_sub);
         }
     }
 
-    // Load V: 4*kVDimParts TMAs per KV block.
+    // Load V: 4 TMAs per KV block (4 sparse blocks x both dim parts).
     // In TMA-friendly mode, SmemLayoutVDual is a blocked product of standalone
-    // sub-tiles, so explicit offset + SmemLayoutVTma is both PV-compatible and
-    // lets CuTe issue one full-box TMA atom per V sub-tile.
+    // sub-tiles. The wide TMA starts at dim_part 0 and carries the dim_part
+    // separation in SmemLayoutVWide, so the PV consumer still sees SmemLayoutVDual.
     // Sub-tile coords in full:
     //   full (256,128): x = kVDimParts*(sub_i % 2)+dim_part, y = sub_i/2.
     template<typename ThrTmaV, typename GVFull, typename MainloopStorage>
@@ -1013,12 +1023,20 @@ struct CollectiveMainloopFwd {
             int logical_lo = kv_block * kSparseBlocksPerKV + warp_col;
             int logical_hi = kv_block * kSparseBlocksPerKV + warp_col + 2;
             if constexpr (HasBlockSizes) {
-                int clamped_lo = (logical_lo < raw_block_count) ? logical_lo : max(raw_block_count - 1, 0);
-                int clamped_hi = (logical_hi < raw_block_count) ? logical_hi : max(raw_block_count - 1, 0);
-                int bi_lo = tile_block_indices[clamped_lo];
-                int bi_hi = tile_block_indices[clamped_hi];
-                bs_lo = (logical_lo < raw_block_count) ? ptr_block_sizes[bi_lo] : 0;
-                bs_hi = (logical_hi < raw_block_count) ? ptr_block_sizes[bi_hi] : 0;
+                int lookup_lo = get_sparse_lookup_pos(logical_lo, raw_block_count);
+                int lookup_hi = get_sparse_lookup_pos(logical_hi, raw_block_count);
+                if (logical_lo < raw_block_count) {
+                    int bi_lo = tile_block_indices[lookup_lo];
+                    bs_lo = ptr_block_sizes[bi_lo];
+                } else {
+                    bs_lo = 0;
+                }
+                if (logical_hi < raw_block_count) {
+                    int bi_hi = tile_block_indices[lookup_hi];
+                    bs_hi = ptr_block_sizes[bi_hi];
+                } else {
+                    bs_hi = 0;
+                }
             } else {
                 bs_lo = (logical_lo < raw_block_count) ? kSparseBlockSize : 0;
                 bs_hi = (logical_hi < raw_block_count) ? kSparseBlockSize : 0;
@@ -1127,10 +1145,9 @@ struct CollectiveMainloopFwd {
             CUTLASS_PRAGMA_UNROLL
             for (int j = 0; j < kChunk; j += 2) {
                 float scaled_o0 = tOrO0(j), scaled_o1 = tOrO0(j + 1);
-                fmul2(scaled_o0, scaled_o1, my_scale0);
                 float partner_o0 = tOrO1(j), partner_o1 = tOrO1(j + 1);
                 fmul2(partner_o0, partner_o1, my_scale1);
-                fadd2(scaled_o0, scaled_o1, partner_o0, partner_o1);
+                ffma2(scaled_o0, scaled_o1, my_scale0, partner_o0, partner_o1);
                 tOrO_combined(j) = scaled_o0;
                 tOrO_combined(j + 1) = scaled_o1;
             }

@@ -74,6 +74,38 @@ torch2cute_dtype_map = {
 }
 
 
+def choose_blk64_use_clc(
+    q: torch.Tensor,
+    block_sparse_num: int,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    layout: str = "bhsd",
+) -> bool:
+    """Select the measured-fastest blk64 scheduler for the common wrapper path.
+
+    The low-level ``torch.ops.bsa_blk64.fwd(..., use_clc)`` API treats
+    ``use_clc`` as an explicit scheduler request. This helper is for interface
+    defaults: callers can pass ``use_clc=True`` or ``False`` to force a path, or
+    leave it as ``None`` to use this shape-based policy.
+    """
+    if q2k_block_nums is not None:
+        return True
+
+    if layout == "bshd":
+        batch, seqlen_q, h, _ = q.shape
+    else:
+        assert layout == "bhsd", f"layout must be 'bhsd' or 'bshd', got {layout!r}"
+        batch, h, seqlen_q, _ = q.shape
+
+    if h == 1:
+        return False
+
+    num_m_blocks = (seqlen_q + 63) // 64
+    total_tiles = batch * h * num_m_blocks
+    enough_tiles = num_m_blocks >= 128 and total_tiles >= 512
+    light_tile = block_sparse_num <= (64 if h == 2 else 128)
+    return enough_tiles and light_tile
+
+
 def bsa_attn_fwd_blk64(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -83,7 +115,7 @@ def bsa_attn_fwd_blk64(
     q2k_block_nums: torch.Tensor,
     softmax_scale: Optional[float] = None,
     layout: str = "bhsd",
-    use_clc: bool = False,
+    use_clc: Optional[bool] = None,
 ):
     """BSA forward attention (blk64 backend, bf16 only, D=128).
 
@@ -98,8 +130,9 @@ def bsa_attn_fwd_blk64(
         q2k_block_nums: (B, H, Q_tiles) int32
         softmax_scale: default 1/sqrt(D)
         layout: "bhsd" (default, zero-copy) or "bshd" (converted to BHSD).
-        use_clc: enable the SM100 CLC persistent scheduler path. Default False
-            uses the SingleTileScheduler fallback (one tile per CTA).
+        use_clc: True forces the SM100 CLC persistent scheduler path, False
+            forces the SingleTileScheduler path, and None (default) uses the
+            interface's shape-based auto policy.
     """
     assert q.dtype == torch.bfloat16, "blk64 requires bf16"
     assert q.is_cuda and k.is_cuda and v.is_cuda
@@ -120,6 +153,8 @@ def bsa_attn_fwd_blk64(
 
     if softmax_scale is None:
         softmax_scale = q.size(3) ** -0.5
+    if use_clc is None:
+        use_clc = choose_blk64_use_clc(q, 0, q2k_block_nums, layout="bhsd")
 
     # No F.pad: seqlen_q rounding is handled by the kernel's row bounds checks
     # and output TMA descriptor; seqlen_k masking is controlled by block_sizes.
