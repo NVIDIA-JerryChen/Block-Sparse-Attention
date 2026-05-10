@@ -471,7 +471,7 @@ struct CollectiveMainloopFwd {
             // Block indices for this (batch, head, row_tile)
             int const* tile_block_indices = nullptr;
             if (params.fwd.block_indices_ptr != nullptr) {
-                int tile_idx_flat = (batch * params.fwd.h + head) * num_row_tiles + row_tile;
+                int64_t tile_idx_flat = (int64_t(batch) * params.fwd.h + head) * num_row_tiles + row_tile;
                 tile_block_indices = params.fwd.block_indices_ptr + tile_idx_flat * params.fwd.block_indices_stride;
             }
 

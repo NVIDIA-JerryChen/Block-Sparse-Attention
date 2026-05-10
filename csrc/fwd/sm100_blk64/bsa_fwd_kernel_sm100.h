@@ -168,7 +168,7 @@ struct FusedAttnFwdSm100 {
     CUTLASS_DEVICE static int const* compute_tile_bi(
             Params const& params, int batch, int head, int m_block) {
         if (params.fwd.block_indices_ptr == nullptr) return nullptr;
-        int tile_idx = (batch * params.fwd.h + head) * params.fwd.num_m_blocks + m_block;
+        int64_t tile_idx = (int64_t(batch) * params.fwd.h + head) * params.fwd.num_m_blocks + m_block;
         return params.fwd.block_indices_ptr + tile_idx * params.fwd.block_indices_stride;
     }
 
