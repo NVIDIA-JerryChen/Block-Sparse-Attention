@@ -19,10 +19,12 @@ class BlockSparseAttnBackwardQRangeBucketed:
         sparse_block_size: int,
         has_block_sizes: bool = True,
         full_kv_blocks: bool = False,
+        use_csr_schedule: bool = False,
     ):
         self.sparse_block_size = sparse_block_size
         self.has_block_sizes = has_block_sizes
         self.full_kv_blocks = full_kv_blocks
+        self.use_csr_schedule = use_csr_schedule
 
         self.QK_mma_tiler = (128,64,128)
         self.fake_QK_mma_tiler = (64,64,128)
@@ -221,9 +223,11 @@ class BlockSparseAttnBackwardQRangeBucketed:
         )
         return grid
 
-    @staticmethod
-    def _compute_bwd_grid(problem_shape, task_offsets: cute.Tensor):
+    def _compute_bwd_grid(self, problem_shape, task_offsets: cute.Tensor):
         H, B = problem_shape[3][0], problem_shape[3][1]
+        if cutlass.const_expr(self.use_csr_schedule):
+            work_capacity_per_bh = cute.size(task_offsets.shape[0])
+            return (work_capacity_per_bh, H, B)
         tasks_per_group = cute.size(task_offsets.shape[0]) - 1
         num_q_groups = cute.size(task_offsets.shape[1])
         return (tasks_per_group * num_q_groups, H, B)
@@ -304,22 +308,34 @@ class BlockSparseAttnBackwardQRangeBucketed:
             )
         )
 
-        # (b, h, q_group, task + 1) -> (task + 1, q_group, (h, b))
-        task_offsets = cute.make_tensor(
-            task_offsets.iterator,
-            cute.group_modes(
-                cute.select(task_offsets.layout, mode=[3, 2, 1, 0]),
-                2, 4
+        if cutlass.const_expr(self.use_csr_schedule):
+            # CSR schedule: [b, h, work, field] -> (work, field, (h, b)).
+            # field layout: (kv_block, q_indices_start, q_count, reserved).
+            task_offsets = cute.make_tensor(
+                task_offsets.iterator,
+                cute.group_modes(
+                    cute.select(task_offsets.layout, mode=[2, 3, 1, 0]),
+                    2, 4
+                )
             )
-        )
-        # (b, h, edge) -> (edge, (h, b))
-        task_q_indices = cute.make_tensor(
-            task_q_indices.iterator,
-            cute.group_modes(
-                cute.select(task_q_indices.layout, mode=[2, 1, 0]),
-                1, 3
+            # task_q_indices is total-packed CSR: [total_edges].
+        else:
+            # (b, h, q_group, task + 1) -> (task + 1, q_group, (h, b))
+            task_offsets = cute.make_tensor(
+                task_offsets.iterator,
+                cute.group_modes(
+                    cute.select(task_offsets.layout, mode=[3, 2, 1, 0]),
+                    2, 4
+                )
             )
-        )
+            # (b, h, edge) -> (edge, (h, b))
+            task_q_indices = cute.make_tensor(
+                task_q_indices.iterator,
+                cute.group_modes(
+                    cute.select(task_q_indices.layout, mode=[2, 1, 0]),
+                    1, 3
+                )
+            )
         self.Q_major_mode = utils.LayoutEnum.from_tensor(Q).mma_major_mode()
         self.dQ_major_mode = utils.LayoutEnum.from_tensor(dQ).mma_major_mode()
         self.K_major_mode = utils.LayoutEnum.from_tensor(K).mma_major_mode()
@@ -951,7 +967,7 @@ class BlockSparseAttnBackwardQRangeBucketed:
         sLSE = storage.sLSE.get_tensor(LSE_smem_layout)
         sSum_OdO = storage.sSum_OdO.get_tensor(sum_OdO_smem_layout)
 
-        tmem_holding_buf = storage.tmem_holding_buf.ptr
+        tmem_holding_buf = storage.tmem_holding_buf
         tmem = utils.TmemAllocator(
             tmem_holding_buf,
             barrier_for_retrieve=self.tmem_alloc_barrier,
@@ -984,14 +1000,19 @@ class BlockSparseAttnBackwardQRangeBucketed:
         tdQrdS = dSK_tiled_mma.make_fragment_A(sdS)
         tdQrKT = dSK_tiled_mma.make_fragment_B(sKT)
 
-        tasks_per_group = cute.size(task_offsets.shape[0]) - 1
-        q_group = bidx // tasks_per_group
-        task_idx = bidx - q_group * tasks_per_group
+        if cutlass.const_expr(self.use_csr_schedule):
+            kv_block_idx = task_offsets[bidx, Int32(0), (bidy, bidz)]
+            task_start = task_offsets[bidx, Int32(1), (bidy, bidz)]
+            iter_count = task_offsets[bidx, Int32(2), (bidy, bidz)]
+        else:
+            tasks_per_group = cute.size(task_offsets.shape[0]) - 1
+            q_group = bidx // tasks_per_group
+            task_idx = bidx - q_group * tasks_per_group
 
-        kv_block_idx = task_idx
-        task_start = task_offsets[task_idx, q_group, (bidy, bidz)]
-        task_end = task_offsets[task_idx + 1, q_group, (bidy, bidz)]
-        iter_count = task_end - task_start
+            kv_block_idx = task_idx
+            task_start = task_offsets[task_idx, q_group, (bidy, bidz)]
+            task_end = task_offsets[task_idx + 1, q_group, (bidy, bidz)]
+            iter_count = task_end - task_start
         iter_index = Int32(0)
         load_iter_count = iter_count
         mma_iter_count = cute.ceil_div(iter_count, 2)
@@ -1254,6 +1275,18 @@ class BlockSparseAttnBackwardQRangeBucketed:
                     dV_bhs[None, idx_d].store(dV_acc_frg.to(self.element_dtype))
 
     @cute.jit
+    def _load_task_q_block(
+        self,
+        task_q_indices: cute.Tensor,
+        task_start: Int32,
+        iter_index: Int32,
+        hb_coord: tuple,
+    ) -> Int32:
+        if cutlass.const_expr(self.use_csr_schedule):
+            return task_q_indices[task_start + iter_index]
+        return task_q_indices[task_start + iter_index, hb_coord]
+
+    @cute.jit
     def load(
         self,
         Q_in: cute.Tensor,
@@ -1397,11 +1430,15 @@ class BlockSparseAttnBackwardQRangeBucketed:
             cute.group_modes(tdPgV, 0, 3)
         )
 
-        q_block_idx_0 = task_q_indices[task_start + iter_index, (blk_coord_h, blk_coord_b)]
+        q_block_idx_0 = self._load_task_q_block(
+            task_q_indices, task_start, iter_index, (blk_coord_h, blk_coord_b)
+        )
         iter_index += 1
         q_block_idx_1 = seqlen_q // self.sparse_block_size # out of box, tma can fill zeros automatically
         if iter_index < total_iter_count:
-            q_block_idx_1 = task_q_indices[task_start + iter_index, (blk_coord_h, blk_coord_b)]
+            q_block_idx_1 = self._load_task_q_block(
+                task_q_indices, task_start, iter_index, (blk_coord_h, blk_coord_b)
+            )
         q_block_0_full = (q_block_idx_0 + 1) * self.sparse_block_size <= seqlen_q
         
         load_mma_Q_pipeline.producer_acquire(load_mma_Q_producer_state)
@@ -1655,11 +1692,15 @@ class BlockSparseAttnBackwardQRangeBucketed:
             with cute.arch.elect_one():
                 cute.arch.mbarrier_expect_tx(tma_barrier, self.tma_copy_Q_bytes)
 
-            q_block_idx_0 = task_q_indices[task_start + iter_index, (blk_coord_h, blk_coord_b)]
+            q_block_idx_0 = self._load_task_q_block(
+                task_q_indices, task_start, iter_index, (blk_coord_h, blk_coord_b)
+            )
             iter_index += 1
             q_block_idx_1 = seqlen_q // self.sparse_block_size # out of box, tma can fill zeros automatically
             if iter_index < total_iter_count:
-                q_block_idx_1 = task_q_indices[task_start + iter_index, (blk_coord_h, blk_coord_b)]
+                q_block_idx_1 = self._load_task_q_block(
+                    task_q_indices, task_start, iter_index, (blk_coord_h, blk_coord_b)
+                )
             q_block_0_full = (q_block_idx_0 + 1) * self.sparse_block_size <= seqlen_q
             
             # Load Q0
@@ -2405,11 +2446,15 @@ class BlockSparseAttnBackwardQRangeBucketed:
             
             mma_reduce_dQ_pipeline.consumer_wait(mma_reduce_dQ_consumer_state)
 
-            q_block_idx_0 = task_q_indices[task_start + iter_index, (blk_coord_h, blk_coord_b)]
+            q_block_idx_0 = self._load_task_q_block(
+                task_q_indices, task_start, iter_index, (blk_coord_h, blk_coord_b)
+            )
             iter_index += 1
             q_block_idx_1 = Q // self.sparse_block_size
             if iter_index < total_iter_count:
-                q_block_idx_1 = task_q_indices[task_start + iter_index, (blk_coord_h, blk_coord_b)]
+                q_block_idx_1 = self._load_task_q_block(
+                    task_q_indices, task_start, iter_index, (blk_coord_h, blk_coord_b)
+                )
 
             tTR_rdQ = cute.make_rmem_tensor(tTR_cdQ.shape, self.acc_dtype)
 
@@ -2654,7 +2699,7 @@ class BlockSparseAttnBackwardQRangeBucketed:
                         if preds[v, m, n, k]:
                             ptr = tCg.iterator + cute.crd2idx(coord, tCg.layout)
                             cute.arch.atomic_add(
-                                ptr,
+                                ptr.llvm_ptr,
                                 tCr[coord],
                                 sem="relaxed",
                                 scope="gpu",
@@ -2689,7 +2734,7 @@ class BlockSparseAttnBackwardQRangeBucketed:
                         coord = ((0, v), m, n, k)
                         ptr = tCg.iterator + cute.crd2idx(coord, tCg.layout)
                         cute.arch.atomic_add(
-                            ptr,
+                            ptr.llvm_ptr,
                             tCr[coord],
                             sem="relaxed",
                             scope="gpu",

@@ -15,9 +15,15 @@ from typing import Tuple, Type
 import math
 
 class BlockSparseAttnBackward:
-    def __init__(self, sparse_block_size: int, has_block_sizes: bool = True):
+    def __init__(
+        self,
+        sparse_block_size: int,
+        has_block_sizes: bool = True,
+        use_csr_metadata: bool = False,
+    ):
         self.sparse_block_size = sparse_block_size
         self.has_block_sizes = has_block_sizes
+        self.use_csr_metadata = use_csr_metadata
 
         self.QK_mma_tiler = (128,64,128)
         self.fake_QK_mma_tiler = (64,64,128)
@@ -277,22 +283,33 @@ class BlockSparseAttnBackward:
             )
         )
 
-        # [b, h, num_kv_blocks, num_q_blocks] -> (num_kv_blocks, num_q_blocks, (h, b))
-        k2q_index = cute.make_tensor(
-            k2q_index.iterator,
-            cute.group_modes(
-                cute.select(k2q_index.layout, mode=[2, 3, 1, 0]),
-                2, 4
+        if cutlass.const_expr(self.use_csr_metadata):
+            # q_indices is total-packed: [total_edges].
+            # row_ptr: [b, h, num_kv_blocks + 1] -> (num_kv_blocks + 1, (h, b))
+            k2q_num = cute.make_tensor(
+                k2q_num.iterator,
+                cute.group_modes(
+                    cute.select(k2q_num.layout, mode=[2, 1, 0]),
+                    1, 3
+                )
             )
-        )
-        # (b, h, num_kv_blocks) -> (num_kv_blocks, (h, b))
-        k2q_num = cute.make_tensor(
-            k2q_num.iterator,
-            cute.group_modes(
-                cute.select(k2q_num.layout, mode=[2, 1, 0]),
-                1, 3
+        else:
+            # [b, h, num_kv_blocks, num_q_blocks] -> (num_kv_blocks, num_q_blocks, (h, b))
+            k2q_index = cute.make_tensor(
+                k2q_index.iterator,
+                cute.group_modes(
+                    cute.select(k2q_index.layout, mode=[2, 3, 1, 0]),
+                    2, 4
+                )
             )
-        )
+            # (b, h, num_kv_blocks) -> (num_kv_blocks, (h, b))
+            k2q_num = cute.make_tensor(
+                k2q_num.iterator,
+                cute.group_modes(
+                    cute.select(k2q_num.layout, mode=[2, 1, 0]),
+                    1, 3
+                )
+            )
         self.Q_major_mode = utils.LayoutEnum.from_tensor(Q).mma_major_mode()
         self.dQ_major_mode = utils.LayoutEnum.from_tensor(dQ).mma_major_mode()
         self.K_major_mode = utils.LayoutEnum.from_tensor(K).mma_major_mode()
@@ -919,7 +936,7 @@ class BlockSparseAttnBackward:
         sLSE = storage.sLSE.get_tensor(LSE_smem_layout)
         sSum_OdO = storage.sSum_OdO.get_tensor(sum_OdO_smem_layout)
 
-        tmem_holding_buf = storage.tmem_holding_buf.ptr
+        tmem_holding_buf = storage.tmem_holding_buf
         tmem = utils.TmemAllocator(
             tmem_holding_buf,
             barrier_for_retrieve=self.tmem_alloc_barrier,
@@ -952,7 +969,12 @@ class BlockSparseAttnBackward:
         tdQrdS = dSK_tiled_mma.make_fragment_A(sdS)
         tdQrKT = dSK_tiled_mma.make_fragment_B(sKT)
 
-        iter_count = k2q_num[bidx, (bidy, bidz)]
+        index_base = Int32(0)
+        if cutlass.const_expr(self.use_csr_metadata):
+            index_base = k2q_num[bidx, (bidy, bidz)]
+            iter_count = k2q_num[bidx + 1, (bidy, bidz)] - index_base
+        else:
+            iter_count = k2q_num[bidx, (bidy, bidz)]
         iter_index = Int32(0)
         load_iter_count = iter_count
         mma_iter_count = cute.ceil_div(iter_count, 2)
@@ -985,6 +1007,7 @@ class BlockSparseAttnBackward:
                     problem_shape,
                     load_iter_count,
                     iter_index,
+                    index_base,
                     (load_mma_Q_pipeline, load_compute_LSE_pipeline, load_mma_dO_pipeline, load_compute_sum_OdO_pipeline)
                 )
             elif warp_idx == self.mma_warp_id:
@@ -1130,6 +1153,7 @@ class BlockSparseAttnBackward:
                     dQ_acc,
                     sdQ,
                     reduce_iter_count,
+                    index_base,
                     (mma_reduce_dQ_pipeline, reduce_tma_store_pipeline),
                 )
             else:
@@ -1174,6 +1198,19 @@ class BlockSparseAttnBackward:
                     dQ_bhs[None, idx_d].store(dQ_acc_frg.to(self.element_dtype))
 
     @cute.jit
+    def _load_k2q_q_block(
+        self,
+        k2q_index: cute.Tensor,
+        kv_block_idx: Int32,
+        iter_index: Int32,
+        hb_coord: tuple,
+        index_base: Int32,
+    ) -> Int32:
+        if cutlass.const_expr(self.use_csr_metadata):
+            return k2q_index[index_base + iter_index]
+        return k2q_index[kv_block_idx, iter_index, hb_coord]
+
+    @cute.jit
     def load(
         self,
         Q_in: cute.Tensor,
@@ -1198,6 +1235,7 @@ class BlockSparseAttnBackward:
         problem_shape: Tuple[Int32, Int32, Int32, Tuple[Int32, Int32]],
         iter_count: Int32,
         iter_index: Int32,
+        index_base: Int32,
         pipeline_args: tuple,
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -1315,11 +1353,15 @@ class BlockSparseAttnBackward:
             cute.group_modes(tdPgV, 0, 3)
         )
 
-        q_block_idx_0 = k2q_index[blk_coord_k, iter_index, (blk_coord_h, blk_coord_b)]
+        q_block_idx_0 = self._load_k2q_q_block(
+            k2q_index, blk_coord_k, iter_index, (blk_coord_h, blk_coord_b), index_base
+        )
         iter_index += 1
         q_block_idx_1 = seqlen_q // self.sparse_block_size # out of box, tma can fill zeros automatically
         if iter_index < total_iter_count:
-            q_block_idx_1 = k2q_index[blk_coord_k, iter_index, (blk_coord_h, blk_coord_b)]
+            q_block_idx_1 = self._load_k2q_q_block(
+                k2q_index, blk_coord_k, iter_index, (blk_coord_h, blk_coord_b), index_base
+            )
         
         load_mma_Q_pipeline.producer_acquire(load_mma_Q_producer_state)
         tma_barrier = load_mma_Q_pipeline.producer_get_barrier(
@@ -1552,11 +1594,15 @@ class BlockSparseAttnBackward:
             with cute.arch.elect_one():
                 cute.arch.mbarrier_expect_tx(tma_barrier, self.tma_copy_Q_bytes)
 
-            q_block_idx_0 = k2q_index[blk_coord_k, iter_index, (blk_coord_h, blk_coord_b)]
+            q_block_idx_0 = self._load_k2q_q_block(
+                k2q_index, blk_coord_k, iter_index, (blk_coord_h, blk_coord_b), index_base
+            )
             iter_index += 1
             q_block_idx_1 = seqlen_q // self.sparse_block_size # out of box, tma can fill zeros automatically
             if iter_index < total_iter_count:
-                q_block_idx_1 = k2q_index[blk_coord_k, iter_index, (blk_coord_h, blk_coord_b)]
+                q_block_idx_1 = self._load_k2q_q_block(
+                    k2q_index, blk_coord_k, iter_index, (blk_coord_h, blk_coord_b), index_base
+                )
             
             # Load Q0
             cute.copy(
@@ -2229,6 +2275,7 @@ class BlockSparseAttnBackward:
         mdQ_acc: cute.Tensor,
         sdQ: cute.Tensor,
         iter_count: Int32,
+        index_base: Int32,
         pipeline_args: tuple,
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -2276,11 +2323,15 @@ class BlockSparseAttnBackward:
             
             mma_reduce_dQ_pipeline.consumer_wait(mma_reduce_dQ_consumer_state)
 
-            q_block_idx_0 = k2q_index[blk_coord_k, iter_index, (blk_coord_h, blk_coord_b)]
+            q_block_idx_0 = self._load_k2q_q_block(
+                k2q_index, blk_coord_k, iter_index, (blk_coord_h, blk_coord_b), index_base
+            )
             iter_index += 1
             q_block_idx_1 = Q // self.sparse_block_size
             if iter_index < total_iter_count:
-                q_block_idx_1 = k2q_index[blk_coord_k, iter_index, (blk_coord_h, blk_coord_b)]
+                q_block_idx_1 = self._load_k2q_q_block(
+                    k2q_index, blk_coord_k, iter_index, (blk_coord_h, blk_coord_b), index_base
+                )
 
             tTR_rdQ = cute.make_rmem_tensor(tTR_cdQ.shape, self.acc_dtype)
 

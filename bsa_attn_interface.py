@@ -37,6 +37,18 @@ BSA_BWD_SPARSE_BLOCK_SIZE = 64
 BSA_BWD_HEAD_DIM = 128
 BSA_BWD_AUTO_QBUCKET = os.environ.get("BSA_BWD_AUTO_QBUCKET", "1") == "1"
 BSA_BWD_AUTO_Q_BUCKET_BLOCKS = int(os.environ.get("BSA_BWD_AUTO_Q_BUCKET_BLOCKS", "1024"))
+BSA_BWD_USE_CSR = os.environ.get("BSA_BWD_USE_CSR", "0") == "1"
+BSA_BWD_CSR_LAYOUT_VERSION = 2
+BSA_BWD_CSR_SCHEDULE_TARGET_Q_BLOCKS = int(
+    os.environ.get("BSA_BWD_CSR_SCHEDULE_TARGET_Q_BLOCKS", "256")
+)
+BSA_BWD_CSR_SCHEDULE_MODE = os.environ.get("BSA_BWD_CSR_SCHEDULE_MODE", "qrange")
+BSA_BWD_CSR_QRANGE_BLOCKS_ENV = os.environ.get("BSA_BWD_CSR_QRANGE_BLOCKS")
+BSA_BWD_CSR_QRANGE_BLOCKS = (
+    int(BSA_BWD_CSR_QRANGE_BLOCKS_ENV)
+    if BSA_BWD_CSR_QRANGE_BLOCKS_ENV
+    else None
+)
 
 _bsa_clc_enabled: bool = os.environ.get("BSA_CLC", "1") == "1"
 
@@ -365,6 +377,35 @@ def convert_q2k_to_k2q(
     )
 
 
+def convert_q2k_to_k2q_csr(
+    q2k_block_index: torch.Tensor,
+    block_sparse_num: int,
+    num_kv_blocks: int,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    return_schedule: bool = False,
+    schedule_target_q_blocks: int = 256,
+    schedule_mode: str = "qrange",
+    schedule_q_bucket_size_blocks: Optional[int] = None,
+) -> Tuple[torch.Tensor, ...]:
+    """Build CSR k2q metadata for the blk64 bwd CSR path.
+
+    Returns:
+        k2q_row_ptr: ``(batch, num_heads, num_kv_blocks + 1)`` int32.
+        k2q_q_indices: ``(total_edges,)`` int32.
+        If ``return_schedule=True``, also returns per-(batch, head) schedule
+        metadata ``(B, H, work_capacity, 4)`` and work counts ``(B, H)``.
+    """
+    from utils.block_sparse_csr import convert_q2k_to_k2q_csr as _build_csr
+    return _build_csr(
+        q2k_block_index, block_sparse_num, num_kv_blocks,
+        q2k_block_nums=q2k_block_nums,
+        return_schedule=return_schedule,
+        schedule_target_q_blocks=schedule_target_q_blocks,
+        schedule_mode=schedule_mode,
+        schedule_q_bucket_size_blocks=schedule_q_bucket_size_blocks,
+    )
+
+
 def bsa_attn_bwd(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -380,6 +421,12 @@ def bsa_attn_bwd(
     dq: Optional[torch.Tensor] = None,
     dk: Optional[torch.Tensor] = None,
     dv: Optional[torch.Tensor] = None,
+    use_k2q_csr: Optional[bool] = None,
+    k2q_row_ptr: Optional[torch.Tensor] = None,
+    k2q_q_indices: Optional[torch.Tensor] = None,
+    prebuilt_k2q_block_index: Optional[torch.Tensor] = None,
+    prebuilt_k2q_block_nums: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Backward pass for BSA block-sparse attention (SM100 blk64 only).
 
@@ -404,6 +451,10 @@ def bsa_attn_bwd(
         softmax_scale: Softmax scale (default: 1/sqrt(head_dim)).
         dq, dk, dv: Optional pre-allocated output buffers matching the shapes of
             q/k/v. When None, fresh zero-initialized tensors are allocated.
+        workspace: Optional pre-allocated uint8 workspace matching
+            ``BlockSparseAttnBackward._get_workspace_size``. When provided, it is
+            zeroed before launch and reused to avoid allocator noise in benchmark
+            loops.
 
     Returns:
         (dq, dk, dv): Gradients w.r.t. q, k, v in the same ``BHSD`` layout as
@@ -455,9 +506,21 @@ def bsa_attn_bwd(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
+    use_csr_metadata = BSA_BWD_USE_CSR if use_k2q_csr is None else bool(use_k2q_csr)
+    has_prebuilt_dense_k2q = (
+        prebuilt_k2q_block_index is not None or prebuilt_k2q_block_nums is not None
+    )
+    if k2q_row_ptr is not None or k2q_q_indices is not None:
+        assert k2q_row_ptr is not None and k2q_q_indices is not None, (
+            "k2q_row_ptr and k2q_q_indices must be provided together"
+        )
+        use_csr_metadata = True
+
     if (
         BSA_BWD_AUTO_QBUCKET
         and num_q_blocks >= 3000
+        and not use_csr_metadata
+        and not has_prebuilt_dense_k2q
     ):
         return bsa_attn_bwd_qbucket(
             dout,
@@ -477,9 +540,45 @@ def bsa_attn_bwd(
             q_bucket_size_blocks=BSA_BWD_AUTO_Q_BUCKET_BLOCKS,
         )
 
-    k2q_block_index, k2q_block_nums = convert_q2k_to_k2q(
-        q2k_block_index, block_sparse_num, num_kv_blocks, q2k_block_nums=q2k_block_nums,
-    )
+    if use_csr_metadata:
+        if k2q_row_ptr is None or k2q_q_indices is None:
+            k2q_row_ptr, k2q_q_indices = convert_q2k_to_k2q_csr(
+                q2k_block_index,
+                block_sparse_num,
+                num_kv_blocks,
+                q2k_block_nums=q2k_block_nums,
+            )
+        assert k2q_row_ptr.dtype == torch.int32
+        assert k2q_q_indices.dtype == torch.int32
+        assert k2q_row_ptr.shape[:2] == (batch_size, num_heads)
+        assert k2q_row_ptr.shape[2] == num_kv_blocks + 1
+        assert k2q_q_indices.ndim == 1, (
+            "k2q_q_indices must use total-packed CSR layout [total_edges]; "
+            "rank-3 per-BH CSR metadata is no longer supported"
+        )
+        assert k2q_row_ptr.device == q.device and k2q_q_indices.device == q.device
+        k2q_block_index = k2q_q_indices.contiguous()
+        k2q_block_nums = k2q_row_ptr.contiguous()
+    else:
+        if prebuilt_k2q_block_index is not None or prebuilt_k2q_block_nums is not None:
+            assert prebuilt_k2q_block_index is not None and prebuilt_k2q_block_nums is not None, (
+                "prebuilt_k2q_block_index and prebuilt_k2q_block_nums must be provided together"
+            )
+            assert prebuilt_k2q_block_index.dtype == torch.int32
+            assert prebuilt_k2q_block_nums.dtype == torch.int32
+            assert prebuilt_k2q_block_index.shape == (
+                batch_size,
+                num_heads,
+                num_kv_blocks,
+                num_q_blocks,
+            )
+            assert prebuilt_k2q_block_nums.shape == (batch_size, num_heads, num_kv_blocks)
+            k2q_block_index = prebuilt_k2q_block_index.contiguous()
+            k2q_block_nums = prebuilt_k2q_block_nums.contiguous()
+        else:
+            k2q_block_index, k2q_block_nums = convert_q2k_to_k2q(
+                q2k_block_index, block_sparse_num, num_kv_blocks, q2k_block_nums=q2k_block_nums,
+            )
 
     has_block_sizes = block_sizes is not None
     if not has_block_sizes:
@@ -514,7 +613,16 @@ def bsa_attn_bwd(
         q=seqlen_q, d=head_dim, h=num_heads, b=batch_size,
         acc_dtype=Float32,
     )
-    workspace = torch.zeros(workspace_shape, dtype=torch.uint8, device=q.device)
+    if workspace is None:
+        workspace = torch.zeros(workspace_shape, dtype=torch.uint8, device=q.device)
+    else:
+        assert workspace.dtype == torch.uint8
+        assert workspace.device == q.device
+        assert tuple(workspace.shape) == tuple(workspace_shape), (
+            f"workspace shape {tuple(workspace.shape)} does not match expected "
+            f"{tuple(workspace_shape)}"
+        )
+        workspace.zero_()
 
     problem_shape = (seqlen_q, seqlen_k, head_dim, (num_heads, batch_size))
 
@@ -531,6 +639,8 @@ def bsa_attn_bwd(
         sparse_block_size,
         arch,
         has_block_sizes,
+        use_csr_metadata,
+        BSA_BWD_CSR_LAYOUT_VERSION if use_csr_metadata else 0,
         fa_logging.get_fa_log_level(),
     )
 
@@ -553,7 +663,7 @@ def bsa_attn_bwd(
         dK_t = convert_to_cute_tensor(dk)
         dV_t = convert_to_cute_tensor(dv)
         LSE_t = to_cute_tensor(lse, leading_dim=2)
-        k2q_idx_t = to_cute_tensor(k2q_block_index, leading_dim=3)
+        k2q_idx_t = to_cute_tensor(k2q_block_index, leading_dim=0 if use_csr_metadata else 3)
         k2q_num_t = to_cute_tensor(k2q_block_nums, leading_dim=2)
         var_bs_t = to_cute_tensor(variable_block_sizes, leading_dim=1)
         ws_t = to_cute_tensor(workspace, fully_dynamic=True)
@@ -561,6 +671,7 @@ def bsa_attn_bwd(
         bwd_kernel = BlockSparseAttnBackward(
             sparse_block_size=sparse_block_size,
             has_block_sizes=has_block_sizes,
+            use_csr_metadata=use_csr_metadata,
         )
 
         bsa_attn_bwd.compile_cache[compile_key] = cute.compile(
@@ -609,6 +720,243 @@ def bsa_attn_bwd(
 
 
 bsa_attn_bwd.compile_cache = get_jit_cache("bsa_bwd")
+
+
+def bsa_attn_bwd_csr_scheduled(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    block_sparse_num: int,
+    block_sizes: Optional[torch.Tensor] = None,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    dq: Optional[torch.Tensor] = None,
+    dk: Optional[torch.Tensor] = None,
+    dv: Optional[torch.Tensor] = None,
+    k2q_row_ptr: Optional[torch.Tensor] = None,
+    k2q_q_indices: Optional[torch.Tensor] = None,
+    k2q_schedule_metadata: Optional[torch.Tensor] = None,
+    k2q_schedule_work_counts: Optional[torch.Tensor] = None,
+    schedule_target_q_blocks: Optional[int] = None,
+    schedule_mode: Optional[str] = None,
+    schedule_q_bucket_size_blocks: Optional[int] = None,
+    workspace: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """CSR scheduled backward path.
+
+    The CSR builder emits both total-packed CSR metadata and per-(B,H) flat
+    schedule chunks. The kernel reuses the qbucket accumulator flow so split
+    CSR rows can safely contribute to dK/dV through fp32 workspace accumulation.
+    """
+    q, k, v, out, dout = [maybe_contiguous(t) for t in (q, k, v, out, dout)]
+    lse = maybe_contiguous(lse)
+
+    assert q.dtype == torch.bfloat16, "CSR scheduled bwd only supports bfloat16"
+    assert q.dtype == k.dtype == v.dtype == out.dtype == dout.dtype
+    assert lse.dtype == torch.float32
+    if not is_fake_mode():
+        assert all(t.is_cuda for t in (q, k, v, out, dout, lse))
+
+    batch_size, num_heads, seqlen_q, head_dim = q.shape
+    num_heads_kv, seqlen_k = k.shape[1], k.shape[2]
+    assert head_dim == BSA_BWD_HEAD_DIM
+    assert num_heads == num_heads_kv, "CSR scheduled bwd does not support GQA/MQA"
+    assert k.shape == v.shape == (batch_size, num_heads, seqlen_k, head_dim)
+    assert out.shape == (batch_size, num_heads, seqlen_q, head_dim)
+    assert dout.shape == out.shape
+    assert lse.shape == (batch_size, num_heads, seqlen_q)
+
+    arch = _get_device_arch()
+    assert arch // 10 in [10, 11], "BSA CSR scheduled bwd only supports SM100/SM110"
+
+    sparse_block_size = BSA_BWD_SPARSE_BLOCK_SIZE
+    num_q_blocks = (seqlen_q + sparse_block_size - 1) // sparse_block_size
+    num_kv_blocks = (seqlen_k + sparse_block_size - 1) // sparse_block_size
+    if schedule_target_q_blocks is None:
+        schedule_target_q_blocks = BSA_BWD_CSR_SCHEDULE_TARGET_Q_BLOCKS
+    if schedule_mode is None:
+        schedule_mode = BSA_BWD_CSR_SCHEDULE_MODE
+    if schedule_q_bucket_size_blocks is None:
+        schedule_q_bucket_size_blocks = BSA_BWD_CSR_QRANGE_BLOCKS
+
+    assert q2k_block_index.dtype == torch.int32
+    assert q2k_block_index.shape[:3] == (batch_size, num_heads, num_q_blocks)
+    if q2k_block_nums is not None:
+        q2k_block_nums = maybe_contiguous(q2k_block_nums)
+        assert q2k_block_nums.dtype == torch.int32
+        assert q2k_block_nums.shape == (batch_size, num_heads, num_q_blocks)
+
+    if (
+        k2q_row_ptr is None
+        or k2q_q_indices is None
+        or k2q_schedule_metadata is None
+        or k2q_schedule_work_counts is None
+    ):
+        (
+            k2q_row_ptr,
+            k2q_q_indices,
+            k2q_schedule_metadata,
+            k2q_schedule_work_counts,
+        ) = convert_q2k_to_k2q_csr(
+            q2k_block_index,
+            block_sparse_num,
+            num_kv_blocks,
+            q2k_block_nums=q2k_block_nums,
+            return_schedule=True,
+            schedule_target_q_blocks=schedule_target_q_blocks,
+            schedule_mode=schedule_mode,
+            schedule_q_bucket_size_blocks=schedule_q_bucket_size_blocks,
+        )
+
+    assert k2q_row_ptr.dtype == torch.int32
+    assert k2q_q_indices.dtype == torch.int32 and k2q_q_indices.ndim == 1
+    assert k2q_schedule_metadata.dtype == torch.int32
+    assert k2q_schedule_metadata.shape[:2] == (batch_size, num_heads)
+    assert k2q_schedule_metadata.shape[3] == 4
+    assert k2q_schedule_work_counts.dtype == torch.int32
+    assert k2q_schedule_work_counts.shape == (batch_size, num_heads)
+
+    has_block_sizes = block_sizes is not None
+    if not has_block_sizes:
+        variable_block_sizes = torch.empty((1, 1), dtype=torch.int32, device=q.device)
+    else:
+        assert block_sizes.dtype == torch.int32
+        if block_sizes.ndim == 1:
+            assert block_sizes.shape == (num_kv_blocks,)
+            variable_block_sizes = block_sizes.unsqueeze(0).expand(batch_size, -1).contiguous()
+        else:
+            assert block_sizes.shape == (batch_size, num_kv_blocks)
+            variable_block_sizes = block_sizes.contiguous()
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    if dq is None:
+        dq = torch.empty_like(q)
+    if dk is None:
+        dk = torch.empty_like(k)
+    if dv is None:
+        dv = torch.empty_like(v)
+
+    workspace_shape = BlockSparseAttnBackwardQRangeBucketed._get_workspace_size(
+        q=seqlen_q,
+        k=seqlen_k,
+        d=head_dim,
+        h=num_heads,
+        b=batch_size,
+        acc_dtype=Float32,
+    )
+    if workspace is None:
+        workspace = torch.zeros(workspace_shape, dtype=torch.uint8, device=q.device)
+    else:
+        assert workspace.dtype == torch.uint8
+        assert workspace.device == q.device
+        assert tuple(workspace.shape) == tuple(workspace_shape)
+        workspace.zero_()
+
+    problem_shape = (seqlen_q, seqlen_k, head_dim, (num_heads, batch_size))
+    current_stream = (
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        if is_fake_mode()
+        else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    )
+
+    full_kv_blocks = seqlen_k % sparse_block_size == 0 and head_dim == BSA_BWD_HEAD_DIM
+    compile_key = (
+        q.dtype,
+        head_dim,
+        num_heads,
+        sparse_block_size,
+        arch,
+        has_block_sizes,
+        full_kv_blocks,
+        "csr_schedule_v1",
+        schedule_mode,
+        int(schedule_q_bucket_size_blocks or 0),
+        fa_logging.get_fa_log_level(),
+    )
+
+    def convert_to_cute_tensor(t: torch.Tensor, enable_tvm_ffi: bool = True) -> cute.Tensor:
+        return (
+            from_dlpack(t.detach(), assumed_align=16, enable_tvm_ffi=enable_tvm_ffi)
+            .mark_layout_dynamic()
+            .mark_compact_shape_dynamic(
+                mode=3, stride_order=t.dim_order(), divisibility=128
+            )
+        )
+
+    if compile_key not in bsa_attn_bwd_csr_scheduled.compile_cache:
+        dO_t = convert_to_cute_tensor(dout)
+        O_t = convert_to_cute_tensor(out)
+        Q_t = convert_to_cute_tensor(q)
+        K_t = convert_to_cute_tensor(k)
+        V_t = convert_to_cute_tensor(v)
+        dQ_t = convert_to_cute_tensor(dq)
+        dK_t = convert_to_cute_tensor(dk)
+        dV_t = convert_to_cute_tensor(dv)
+        LSE_t = to_cute_tensor(lse, leading_dim=2)
+        schedule_t = to_cute_tensor(k2q_schedule_metadata, leading_dim=3)
+        q_indices_t = to_cute_tensor(k2q_q_indices, leading_dim=0)
+        var_bs_t = to_cute_tensor(variable_block_sizes, leading_dim=1)
+        ws_t = to_cute_tensor(workspace, fully_dynamic=True)
+
+        bwd_kernel = BlockSparseAttnBackwardQRangeBucketed(
+            sparse_block_size=sparse_block_size,
+            has_block_sizes=has_block_sizes,
+            full_kv_blocks=full_kv_blocks,
+            use_csr_schedule=True,
+        )
+
+        bsa_attn_bwd_csr_scheduled.compile_cache[compile_key] = cute.compile(
+            bwd_kernel,
+            problem_shape,
+            dO_t,
+            O_t,
+            Q_t,
+            K_t,
+            V_t,
+            LSE_t,
+            dQ_t,
+            dK_t,
+            dV_t,
+            schedule_t,
+            q_indices_t,
+            var_bs_t,
+            ws_t,
+            softmax_scale,
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+
+    if not is_fake_mode():
+        with torch.cuda.nvtx.range("bsa_attn_bwd_csr_scheduled_kernel"):
+            bsa_attn_bwd_csr_scheduled.compile_cache[compile_key](
+                problem_shape,
+                dout,
+                out,
+                q,
+                k,
+                v,
+                lse,
+                dq,
+                dk,
+                dv,
+                k2q_schedule_metadata,
+                k2q_q_indices,
+                variable_block_sizes,
+                workspace,
+                softmax_scale,
+                current_stream,
+            )
+
+    return dq, dk, dv
+
+
+bsa_attn_bwd_csr_scheduled.compile_cache = get_jit_cache("bsa_bwd_csr_scheduled")
 
 
 @triton.jit
