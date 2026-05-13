@@ -96,10 +96,14 @@ def choose_blk64_use_clc(
         assert layout == "bhsd", f"layout must be 'bhsd' or 'bshd', got {layout!r}"
         batch, h, seqlen_q, _ = q.shape
 
+    num_m_blocks = (seqlen_q + 63) // 64
+    large_long_topk = num_m_blocks >= 8192 and block_sparse_num >= 512
+    if large_long_topk:
+        return True
+
     if h == 1:
         return False
 
-    num_m_blocks = (seqlen_q + 63) // 64
     total_tiles = batch * h * num_m_blocks
     enough_tiles = num_m_blocks >= 128 and total_tiles >= 512
     light_tile = block_sparse_num <= (64 if h == 2 else 128)
