@@ -32,7 +32,7 @@ void set_params_fprop(bsa_fwd_params &params,
                       const torch::Tensor &block_indices, int block_indices_stride,
                       const torch::Tensor &block_sizes,
                       int const* q2k_block_nums_ptr,
-                      int uniform_block_sparse_num, int num_m_blocks,
+                      int uniform_max_topk, int num_m_blocks,
                       int seqlen_k_rounded) {
     params.q_ptr = q.data_ptr();
     params.k_ptr = k.data_ptr();
@@ -56,7 +56,7 @@ void set_params_fprop(bsa_fwd_params &params,
     params.seqlen_k_rounded = seqlen_k_rounded;
     params.num_m_blocks = num_m_blocks;
     params.block_indices_stride = block_indices_stride;
-    params.uniform_block_sparse_num = uniform_block_sparse_num;
+    params.uniform_max_topk = uniform_max_topk;
     params.scale_softmax = scale_softmax;
     params.scale_softmax_log2 = float(scale_softmax * M_LOG2E);
 }
@@ -64,7 +64,7 @@ void set_params_fprop(bsa_fwd_params &params,
 // Entry point: BHSD-only, zero-copy for Q/K/V.
 std::tuple<torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_impl(
         torch::Tensor q, torch::Tensor k, torch::Tensor v,
-        torch::Tensor q2k_block_index, int64_t block_sparse_num,
+        torch::Tensor q2k_block_index, int64_t max_topk,
         torch::Tensor block_sizes, double softmax_scale,
         torch::Tensor q2k_block_nums,
         bool use_clc)
@@ -107,14 +107,14 @@ std::tuple<torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_impl(
                             torch::dtype(torch::kFloat32).device(q.device()));
 
     // ======== Block indices ========
-    // Expect (B, H, num_m_blocks, max_kv) int32 contiguous. Kernel indexes linearly as
-    //   idx = ((b*H + h) * num_m_blocks + m_block) * max_kv + sub
+    // Expect (B, H, num_m_blocks, max_topk) int32 contiguous. Kernel indexes linearly as
+    //   idx = ((b*H + h) * num_m_blocks + m_block) * max_topk + sub
     // which matches the contiguous flat offset, so no reshape/copy needed.
     TORCH_CHECK(q2k_block_index.dim() == 4,
-                "q2k_block_index must be 4D (B, H, num_m_blocks, max_kv)");
+                "q2k_block_index must be 4D (B, H, num_m_blocks, max_topk)");
     TORCH_CHECK(q2k_block_index.size(0) == b && q2k_block_index.size(1) == h
                 && q2k_block_index.size(2) == num_m_blocks,
-                "q2k_block_index shape must be (B, H, num_m_blocks, max_kv)");
+                "q2k_block_index shape must be (B, H, num_m_blocks, max_topk)");
     TORCH_CHECK(q2k_block_index.is_contiguous(), "q2k_block_index must be contiguous");
     TORCH_CHECK(q2k_block_index.scalar_type() == torch::kInt32,
                 "q2k_block_index must be int32");
@@ -138,7 +138,7 @@ std::tuple<torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_impl(
                     "block_sizes must be int32");
     }
 
-    // q2k_block_nums: optional — when empty, kernel uses uniform_block_sparse_num scalar
+    // q2k_block_nums: optional — when empty, kernel uses uniform_max_topk scalar
     // (HasVarBlockNums=false compile-time branch). When present, expect (B, H, num_m_blocks).
     int const* q2k_block_nums_ptr = nullptr;
     if (has_var_block_nums) {
@@ -162,7 +162,7 @@ std::tuple<torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_impl(
                      softmax_scale,
                      q2k_block_index, block_indices_stride,
                      block_sizes, q2k_block_nums_ptr,
-                     static_cast<int>(block_sparse_num), num_m_blocks,
+                     static_cast<int>(max_topk), num_m_blocks,
                      seqlen_k_rounded);
 
     auto stream = c10::cuda::getCurrentCUDAStream(q.device().index()).stream();
@@ -193,7 +193,7 @@ PyObject* PyInit_bsa_fwd_blk64_ext(void) {
 
 TORCH_LIBRARY(bsa_blk64, m) {
     m.def("fwd(Tensor q, Tensor k, Tensor v, Tensor q2k_block_index, "
-          "int block_sparse_num, Tensor block_sizes, float scale, "
+          "int max_topk, Tensor block_sizes, float scale, "
           "Tensor q2k_block_nums, bool use_clc) -> (Tensor, Tensor)");
 }
 // Note: schema uses "int" (maps to int64_t) and "float" (maps to double) in C++.

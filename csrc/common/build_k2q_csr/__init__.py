@@ -39,7 +39,7 @@ def run_build_k2q_csr(
     bh_offsets: torch.Tensor,
     row_ptr: torch.Tensor,
     q_indices: torch.Tensor,
-    block_sparse_num: int,
+    max_topk: int,
     num_kv_blocks: int,
     total_edges: int,
     has_variable_nums: bool,
@@ -47,17 +47,18 @@ def run_build_k2q_csr(
     """Fill ``row_ptr`` and ``q_indices`` in place.
 
     Args:
-      q2k: int32 CUDA tensor with shape [B, H, Q_blocks, max_kv].
+      q2k: int32 CUDA tensor with shape [B, H, Q_blocks, max_topk].
       q2k_nums: int32 CUDA tensor with shape [B, H, Q_blocks] when
         ``has_variable_nums`` is true; otherwise any CUDA int32 tensor.
       bh_offsets: int32 CUDA tensor with shape [B * H + 1] when
         ``has_variable_nums`` is true; otherwise an empty CUDA int32 tensor.
       row_ptr: int32 CUDA tensor with shape [B, H, num_kv_blocks + 1].
       q_indices: int32 CUDA tensor with shape [total_edges].
-      block_sparse_num: runtime fixed topK for the fixed-count path.
+      max_topk: fixed topK, or q2k storage capacity / maximum topK when
+        ``has_variable_nums`` is true.
       num_kv_blocks: number of blk64 KV blocks.
       total_edges: packed q_indices element count.
-      has_variable_nums: whether ``q2k_nums`` overrides ``block_sparse_num``.
+      has_variable_nums: whether ``q2k_nums`` provides per-row valid counts.
     """
     _load_ext().run_build_k2q_csr(
         q2k,
@@ -72,8 +73,7 @@ def run_build_k2q_csr(
         False,
         0,
         0,
-        0,
-        int(block_sparse_num),
+        int(max_topk),
         int(num_kv_blocks),
         int(total_edges),
         bool(has_variable_nums),
@@ -90,10 +90,9 @@ def run_build_k2q_csr_with_schedule(
     schedule_work_counts: torch.Tensor,
     target_q_per_cta: int,
     schedule_capacity_per_bh: int,
-    schedule_mode: int,
     qrange_num_q_groups: int,
     qrange_q_bucket_size_blocks: int,
-    block_sparse_num: int,
+    max_topk: int,
     num_kv_blocks: int,
     total_edges: int,
     has_variable_nums: bool,
@@ -110,10 +109,9 @@ def run_build_k2q_csr_with_schedule(
         int(target_q_per_cta),
         int(schedule_capacity_per_bh),
         True,
-        int(schedule_mode),
         int(qrange_num_q_groups),
         int(qrange_q_bucket_size_blocks),
-        int(block_sparse_num),
+        int(max_topk),
         int(num_kv_blocks),
         int(total_edges),
         bool(has_variable_nums),

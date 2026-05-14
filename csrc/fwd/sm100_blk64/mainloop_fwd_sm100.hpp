@@ -254,7 +254,7 @@ struct CollectiveMainloopFwd {
     // then divide by kSparseBlocksPerKV to get even kv_iters.
     // raw_count: actual sparse blocks (for index clamping and phantom detection).
     // HasVarBlockNums=true  → per-tile raw count from q2k_block_nums_ptr[tile_flat]
-    // HasVarBlockNums=false → uniform raw count from fwd.uniform_block_sparse_num (kernel-param scalar)
+    // HasVarBlockNums=false → uniform raw count from fwd.uniform_max_topk (kernel-param scalar)
     template<bool HasVarBlockNums>
     CUTLASS_DEVICE static int get_tile_num_kv_blocks(
             bsa_fwd_params const& fwd, int batch, int head, int row_tile) {
@@ -263,7 +263,7 @@ struct CollectiveMainloopFwd {
             int tile_flat = (batch * fwd.h + head) * fwd.num_m_blocks + row_tile;
             raw_count = fwd.q2k_block_nums_ptr[tile_flat];
         } else {
-            raw_count = fwd.uniform_block_sparse_num;
+            raw_count = fwd.uniform_max_topk;
         }
         if (raw_count <= 0) return 0;  // empty tile
         // Round up to multiple of 8 (kSparseBlocksPerKV * 2), then /4 → even kv_iters
@@ -280,7 +280,7 @@ struct CollectiveMainloopFwd {
             int tile_flat = (batch * fwd.h + head) * fwd.num_m_blocks + row_tile;
             return fwd.q2k_block_nums_ptr[tile_flat];
         } else {
-            return fwd.uniform_block_sparse_num;
+            return fwd.uniform_max_topk;
         }
     }
 

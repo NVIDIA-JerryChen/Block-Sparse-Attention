@@ -43,7 +43,7 @@ struct bsa_fwd_params {
 
     // Sparse config.
     int block_indices_stride;
-    int uniform_block_sparse_num;  // per-tile raw block count when HasVarBlockNums=false
+    int uniform_max_topk;  // per-tile raw block count when HasVarBlockNums=false
 
     // The scaling factors for the kernel.
     float scale_softmax;

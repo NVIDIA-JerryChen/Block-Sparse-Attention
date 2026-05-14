@@ -242,9 +242,9 @@ class FlashAttentionForwardSm100:
         mO: cute.Tensor,  # (b, s_q, h, dv)
         mLSE: Optional[cute.Tensor],
         softmax_scale: Float32,
-        mBlockIndex: cute.Tensor,  # (batch, heads, num_q_blocks, max_kv_blocks), int32
+        mBlockIndex: cute.Tensor,  # (batch, heads, num_q_blocks, max_topk), int32
         mBlockSizes: cute.Tensor,  # (num_kv_blocks,), int32
-        block_sparse_num: Int32,   # runtime scalar, even, >= 2
+        max_topk: Int32,   # runtime scalar, even, >= 2
         mBlockNums: Optional[cute.Tensor],  # (batch, heads, num_q_blocks), int32 or None
         stream: cuda.CUstream,
     ):
@@ -561,7 +561,7 @@ class FlashAttentionForwardSm100:
             num_splits,
             mBlockIndex,
             mBlockSizes,
-            block_sparse_num,
+            max_topk,
             mBlockNums,
         ).launch(
             grid=grid_dim,
@@ -598,7 +598,7 @@ class FlashAttentionForwardSm100:
         num_splits: Int32,
         mBlockIndex: cute.Tensor,
         mBlockSizes: cute.Tensor,
-        block_sparse_num: Int32,
+        max_topk: Int32,
         mBlockNums: Optional[cute.Tensor],
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
@@ -878,7 +878,7 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 tile_scheduler,
                 mBlockIndex,
-                block_sparse_num,
+                max_topk,
                 mBlockNums,
             )
 
@@ -910,7 +910,7 @@ class FlashAttentionForwardSm100:
                 num_splits,
                 SeqlenInfoCls,
                 tile_scheduler,
-                block_sparse_num,
+                max_topk,
                 mBlockNums,
             )
             # Dealloc the tensor memory buffer
@@ -964,7 +964,7 @@ class FlashAttentionForwardSm100:
                 tile_scheduler=tile_scheduler,
                 mBlockIndex=mBlockIndex,
                 mBlockSizes=mBlockSizes,
-                block_sparse_num=block_sparse_num,
+                max_topk=max_topk,
                 mBlockNums=mBlockNums,
             )
 
@@ -1009,7 +1009,7 @@ class FlashAttentionForwardSm100:
                 num_splits,
                 SeqlenInfoCls,
                 tile_scheduler,
-                block_sparse_num,
+                max_topk,
                 mBlockNums,
             )
             tmem_alloc_barrier.arrive()
@@ -1080,7 +1080,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
         mBlockIndex: cute.Tensor,
-        block_sparse_num: Int32,
+        max_topk: Int32,
         mBlockNums: Optional[cute.Tensor],
     ):
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
@@ -1159,7 +1159,7 @@ class FlashAttentionForwardSm100:
                 n_block = partial(block_info.get_n_block_idx, mBlockIndex, batch_idx, head_idx, m_block, max_i=cutlass.max(raw_block_count - 1, Int32(0)))
             else:
                 process_tile = True
-                block_iter_count = block_sparse_num
+                block_iter_count = max_topk
                 n_block = partial(block_info.get_n_block_idx, mBlockIndex, batch_idx, head_idx, m_block)
 
             if process_tile:
@@ -1224,7 +1224,7 @@ class FlashAttentionForwardSm100:
         num_splits: Int32,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
-        block_sparse_num: Int32,
+        max_topk: Int32,
         mBlockNums: Optional[cute.Tensor],
     ):
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
@@ -1295,7 +1295,7 @@ class FlashAttentionForwardSm100:
                 block_iter_count = (raw_block_count + 1) & ~1
             else:
                 process_tile = True
-                block_iter_count = block_sparse_num
+                block_iter_count = max_topk
 
             if process_tile and is_leader_cta:
                 # ================================================================
@@ -1451,7 +1451,7 @@ class FlashAttentionForwardSm100:
         tile_scheduler: TileSchedulerProtocol,
         mBlockIndex: cute.Tensor,
         mBlockSizes: cute.Tensor,
-        block_sparse_num: Int32,
+        max_topk: Int32,
         mBlockNums: Optional[cute.Tensor],
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
@@ -1519,7 +1519,7 @@ class FlashAttentionForwardSm100:
                 has_work = raw_block_count > Int32(0) if const_expr(self.allow_empty_block_nums) else True
                 n_block = partial(block_info.get_n_block_idx, mBlockIndex, batch_idx, head_idx, m_block, max_i=cutlass.max(raw_block_count - 1, Int32(0)))
             else:
-                raw_block_count = block_sparse_num
+                raw_block_count = max_topk
                 has_work = True
                 n_block = partial(block_info.get_n_block_idx, mBlockIndex, batch_idx, head_idx, m_block)
 
@@ -1560,7 +1560,7 @@ class FlashAttentionForwardSm100:
                 if const_expr(mBlockNums is not None):
                     block_iter_count = (raw_block_count + 1) & ~1
                 else:
-                    block_iter_count = block_sparse_num
+                    block_iter_count = max_topk
                 wg_count = block_iter_count // 2
                 # logical_first is the first logical index for this WG
                 logical_first = block_iter_count - 1 - stage
@@ -1733,7 +1733,7 @@ class FlashAttentionForwardSm100:
         num_splits: Int32,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
-        block_sparse_num: Int32,
+        max_topk: Int32,
         mBlockNums: Optional[cute.Tensor],
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
@@ -1799,7 +1799,7 @@ class FlashAttentionForwardSm100:
                 if const_expr(mBlockNums is not None):
                     block_iter_count = (mBlockNums[batch_idx, head_idx, m_block] + 1) & ~1
                 else:
-                    block_iter_count = block_sparse_num
+                    block_iter_count = max_topk
                 corr_pair_count = (block_iter_count - 2) // 2
                 # Paired rescale loop (same structure as q_stage=2)
                 for i in cutlass.range(corr_pair_count, unroll=1):

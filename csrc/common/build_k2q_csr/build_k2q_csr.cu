@@ -2,7 +2,7 @@
 //
 // The pipeline follows the MiniMax CSR builder structure but is specialized
 // for BSA's non-varlen block layout:
-//   q2k:      [B, H, Q_blocks, max_kv]
+//   q2k:      [B, H, Q_blocks, max_topk]
 //   row_ptr:  [B, H, KV_blocks + 1]
 //   q_idx:    [total_edges]
 //
@@ -26,9 +26,6 @@
 namespace {
 
 constexpr int kWarpSize = 32;
-constexpr int kScheduleModeNone = 0;
-constexpr int kScheduleModeRowChunk = 1;
-constexpr int kScheduleModeQRange = 2;
 
 __device__ __forceinline__ int atomic_inc_int16_packed(int* base_int32, int row) {
     int idx = row >> 1;
@@ -47,7 +44,7 @@ __device__ __forceinline__ int read_int16_packed(int const* base_int32, int row)
 __device__ __forceinline__ int valid_count_for_q(
     int const* __restrict__ q2k_nums,
     bool has_variable_nums,
-    int block_sparse_num,
+    int max_topk,
     int B,
     int H,
     int Q,
@@ -56,7 +53,7 @@ __device__ __forceinline__ int valid_count_for_q(
     int q)
 {
     if (!has_variable_nums) {
-        return block_sparse_num;
+        return max_topk;
     }
     return q2k_nums[((b * H + h) * Q) + q];
 }
@@ -72,7 +69,7 @@ __global__ void k2q_hist_kernel(
     int Q,
     int max_kv,
     int num_kv_blocks,
-    int block_sparse_num,
+    int max_topk,
     bool has_variable_nums,
     int q_per_cta,
     int q_per_warp)
@@ -102,7 +99,7 @@ __global__ void k2q_hist_kernel(
 
     for (int qi = q_start_warp; qi < q_end_warp; ++qi) {
         int n = valid_count_for_q(
-            q2k_nums, has_variable_nums, block_sparse_num, B, H, Q, b, h, qi);
+            q2k_nums, has_variable_nums, max_topk, B, H, Q, b, h, qi);
         n = min(n, max_kv);
         int const* q_base = q2k + (((b * H + h) * Q + qi) * max_kv);
         for (int slot_base = 0; slot_base < n; slot_base += kWarpSize) {
@@ -143,15 +140,11 @@ __global__ void k2q_row_prefix_kernel(
     int const* __restrict__ row_counts,
     int const* __restrict__ bh_offsets,
     int* __restrict__ row_ptr,
-    int* __restrict__ schedule_metadata,
-    int* __restrict__ schedule_work_counts,
     int B,
     int H,
     int num_kv_blocks,
     int fixed_edges_per_bh,
-    bool has_variable_nums,
-    int schedule_capacity_per_bh,
-    int target_q_per_cta)
+    bool has_variable_nums)
 {
     int b = blockIdx.x;
     int h = blockIdx.y;
@@ -190,24 +183,6 @@ __global__ void k2q_row_prefix_kernel(
         int row_count = counts[i];
         running += row_count;
         ptr[i + 1] = running;
-        if (schedule_metadata != nullptr && row_count > 0) {
-            int row_start = running - row_count;
-            int num_chunks = (row_count + target_q_per_cta - 1) / target_q_per_cta;
-            int base = atomicAdd(schedule_work_counts + bh, num_chunks);
-            for (int c = 0; c < num_chunks; ++c) {
-                int work_idx = base + c;
-                if (work_idx < schedule_capacity_per_bh) {
-                    int q_begin = c * target_q_per_cta;
-                    int q_count = min(target_q_per_cta, row_count - q_begin);
-                    int* meta = schedule_metadata +
-                        (((size_t)bh * schedule_capacity_per_bh + work_idx) * 4);
-                    meta[0] = i;
-                    meta[1] = row_start + q_begin;
-                    meta[2] = q_count;
-                    meta[3] = 0;
-                }
-            }
-        }
     }
 }
 
@@ -288,7 +263,7 @@ __global__ void k2q_scatter_kernel(
     int max_kv,
     int num_kv_blocks,
     int q_idx_capacity,
-    int block_sparse_num,
+    int max_topk,
     bool has_variable_nums,
     int q_per_cta,
     int q_per_warp)
@@ -321,7 +296,7 @@ __global__ void k2q_scatter_kernel(
 
     for (int qi = q_start_warp; qi < q_end_warp; ++qi) {
         int n = valid_count_for_q(
-            q2k_nums, has_variable_nums, block_sparse_num, B, H, Q, b, h, qi);
+            q2k_nums, has_variable_nums, max_topk, B, H, Q, b, h, qi);
         n = min(n, max_kv);
         int const* q_base = q2k + (((b * H + h) * Q + qi) * max_kv);
         for (int slot_base = 0; slot_base < n; slot_base += kWarpSize) {
@@ -340,7 +315,7 @@ __global__ void k2q_scatter_kernel(
     }
 }
 
-__global__ void k2q_qrange_schedule_kernel(
+__global__ void k2q_qrange_split_schedule_kernel(
     int const* __restrict__ row_ptr,
     int const* __restrict__ q_idx,
     int* __restrict__ schedule_metadata,
@@ -350,20 +325,18 @@ __global__ void k2q_qrange_schedule_kernel(
     int num_kv_blocks,
     int num_q_groups,
     int q_bucket_size_blocks,
-    int schedule_capacity_per_bh)
+    int schedule_capacity_per_bh,
+    int target_q_per_cta)
 {
     int work_idx = blockIdx.x * blockDim.x + threadIdx.x;
     int h = blockIdx.y;
     int b = blockIdx.z;
-    if (work_idx >= schedule_capacity_per_bh) {
+    int base_capacity = num_q_groups * num_kv_blocks;
+    if (work_idx >= base_capacity) {
         return;
     }
 
     int bh = b * H + h;
-    if (work_idx == 0) {
-        schedule_work_counts[bh] = schedule_capacity_per_bh;
-    }
-
     int q_group = work_idx / num_kv_blocks;
     int kv = work_idx - q_group * num_kv_blocks;
     int* meta = schedule_metadata + (((size_t)bh * schedule_capacity_per_bh + work_idx) * 4);
@@ -404,10 +377,44 @@ __global__ void k2q_qrange_schedule_kernel(
         }
     }
 
+    int q_count = lo - slice_start;
+    int first_count = min(target_q_per_cta, q_count);
     meta[0] = kv;
     meta[1] = slice_start;
-    meta[2] = lo - slice_start;
+    meta[2] = first_count;
     meta[3] = q_group;
+    if (q_count <= target_q_per_cta) {
+        return;
+    }
+
+    int num_chunks = (q_count + target_q_per_cta - 1) / target_q_per_cta;
+    int extra_base = atomicAdd(schedule_work_counts + bh, num_chunks - 1);
+    for (int c = 1; c < num_chunks; ++c) {
+        int out_idx = base_capacity + extra_base + (c - 1);
+        if (out_idx < schedule_capacity_per_bh) {
+            int q_begin = c * target_q_per_cta;
+            int count = min(target_q_per_cta, q_count - q_begin);
+            int* out = schedule_metadata + (((size_t)bh * schedule_capacity_per_bh + out_idx) * 4);
+            out[0] = kv;
+            out[1] = slice_start + q_begin;
+            out[2] = count;
+            out[3] = q_group;
+        }
+    }
+}
+
+__global__ void k2q_finalize_qrange_split_counts_kernel(
+    int* __restrict__ schedule_work_counts,
+    int B,
+    int H,
+    int base_capacity)
+{
+    int bh = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_bh = B * H;
+    if (bh >= total_bh) {
+        return;
+    }
+    schedule_work_counts[bh] += base_capacity;
 }
 
 template <int kWarps>
@@ -428,10 +435,9 @@ void launch_hist_scatter(
     int num_kv_blocks,
     int q_idx_capacity,
     int fixed_edges_per_bh,
-    int block_sparse_num,
+    int max_topk,
     bool has_variable_nums,
     bool emit_schedule,
-    int schedule_mode,
     int schedule_capacity_per_bh,
     int target_q_per_cta,
     int qrange_num_q_groups,
@@ -462,7 +468,7 @@ void launch_hist_scatter(
         Q,
         max_kv,
         num_kv_blocks,
-        block_sparse_num,
+        max_topk,
         has_variable_nums,
         q_per_cta,
         q_per_warp);
@@ -472,15 +478,11 @@ void launch_hist_scatter(
         row_counts.data_ptr<int>(),
         has_variable_nums ? bh_offsets.data_ptr<int>() : nullptr,
         row_ptr.data_ptr<int>(),
-        schedule_mode == kScheduleModeRowChunk ? schedule_metadata.data_ptr<int>() : nullptr,
-        schedule_mode == kScheduleModeRowChunk ? schedule_work_counts.data_ptr<int>() : nullptr,
         B,
         H,
         num_kv_blocks,
         fixed_edges_per_bh,
-        has_variable_nums,
-        schedule_capacity_per_bh,
-        target_q_per_cta);
+        has_variable_nums);
     AT_CUDA_CHECK(cudaGetLastError());
 
     constexpr int kPtRowsPerBlock = 8;
@@ -512,16 +514,17 @@ void launch_hist_scatter(
         max_kv,
         num_kv_blocks,
         q_idx_capacity,
-        block_sparse_num,
+        max_topk,
         has_variable_nums,
         q_per_cta,
         q_per_warp);
     AT_CUDA_CHECK(cudaGetLastError());
 
-    if (schedule_mode == kScheduleModeQRange) {
+    if (emit_schedule) {
         int threads = 256;
-        dim3 grid_sched((schedule_capacity_per_bh + threads - 1) / threads, H, B);
-        k2q_qrange_schedule_kernel<<<grid_sched, threads, 0, stream>>>(
+        int base_capacity = qrange_num_q_groups * num_kv_blocks;
+        dim3 grid_sched((base_capacity + threads - 1) / threads, H, B);
+        k2q_qrange_split_schedule_kernel<<<grid_sched, threads, 0, stream>>>(
             row_ptr.data_ptr<int>(),
             q_idx.data_ptr<int>(),
             schedule_metadata.data_ptr<int>(),
@@ -531,7 +534,16 @@ void launch_hist_scatter(
             num_kv_blocks,
             qrange_num_q_groups,
             qrange_q_bucket_size_blocks,
-            schedule_capacity_per_bh);
+            schedule_capacity_per_bh,
+            target_q_per_cta);
+        AT_CUDA_CHECK(cudaGetLastError());
+        int total_bh = B * H;
+        k2q_finalize_qrange_split_counts_kernel<<<
+            (total_bh + threads - 1) / threads, threads, 0, stream>>>(
+            schedule_work_counts.data_ptr<int>(),
+            B,
+            H,
+            base_capacity);
         AT_CUDA_CHECK(cudaGetLastError());
     }
 }
@@ -549,10 +561,9 @@ void run_build_k2q_csr(
     int64_t target_q_per_cta,
     int64_t schedule_capacity_per_bh,
     bool emit_schedule,
-    int64_t schedule_mode_arg,
     int64_t qrange_num_q_groups,
     int64_t qrange_q_bucket_size_blocks,
-    int64_t block_sparse_num,
+    int64_t max_topk,
     int64_t num_kv_blocks,
     int64_t total_edges,
     bool has_variable_nums)
@@ -560,7 +571,7 @@ void run_build_k2q_csr(
     CHECK_INPUT(q2k);
     CHECK_INPUT(row_ptr);
     CHECK_INPUT(q_idx);
-    TORCH_CHECK(q2k.dim() == 4, "q2k must have shape [B, H, Q, max_kv]");
+    TORCH_CHECK(q2k.dim() == 4, "q2k must have shape [B, H, Q, max_topk]");
     TORCH_CHECK(row_ptr.dim() == 3, "row_ptr must have shape [B, H, num_kv_blocks + 1]");
     TORCH_CHECK(q_idx.dim() == 1, "q_idx must have shape [total_edges]");
 
@@ -569,13 +580,12 @@ void run_build_k2q_csr(
     int Q = (int)q2k.size(2);
     int max_kv = (int)q2k.size(3);
     int Nkv = (int)num_kv_blocks;
-    int bsn = (int)block_sparse_num;
+    int fixed_topk = (int)max_topk;
     TORCH_CHECK(total_edges >= 0 && total_edges <= INT_MAX,
                 "total_edges must fit int32 CSR offsets");
     TORCH_CHECK(q_idx.size(0) == total_edges, "q_idx total_edges mismatch");
     int q_idx_capacity = (int)q_idx.size(0);
-    int schedule_mode = emit_schedule ? (int)schedule_mode_arg : kScheduleModeNone;
-    long long fixed_edges_per_bh_ll = (long long)Q * (long long)bsn;
+    long long fixed_edges_per_bh_ll = (long long)Q * (long long)fixed_topk;
     TORCH_CHECK(fixed_edges_per_bh_ll >= 0 && fixed_edges_per_bh_ll <= INT_MAX,
                 "fixed per-BH edge count must fit int32");
     int fixed_edges_per_bh = (int)fixed_edges_per_bh_ll;
@@ -588,11 +598,13 @@ void run_build_k2q_csr(
     if (emit_schedule) {
         CHECK_INPUT(schedule_metadata);
         CHECK_INPUT(schedule_work_counts);
-        TORCH_CHECK(schedule_mode == kScheduleModeRowChunk ||
-                    schedule_mode == kScheduleModeQRange,
-                    "schedule_mode must be 1(row_chunk) or 2(qrange) when emit_schedule=true");
         TORCH_CHECK(target_q_per_cta > 0, "target_q_per_cta must be positive");
         TORCH_CHECK(schedule_capacity_per_bh > 0, "schedule_capacity_per_bh must be positive");
+        TORCH_CHECK(qrange_num_q_groups > 0, "qrange_num_q_groups must be positive");
+        TORCH_CHECK(qrange_q_bucket_size_blocks > 0, "qrange_q_bucket_size_blocks must be positive");
+        TORCH_CHECK(
+            schedule_capacity_per_bh >= qrange_num_q_groups * (int64_t)Nkv,
+            "qrange-split capacity must cover base num_q_groups * num_kv_blocks");
         TORCH_CHECK(schedule_metadata.dim() == 4 &&
                     schedule_metadata.size(0) == B &&
                     schedule_metadata.size(1) == H &&
@@ -606,12 +618,6 @@ void run_build_k2q_csr(
         TORCH_CHECK(schedule_metadata.device() == q2k.device() &&
                     schedule_work_counts.device() == q2k.device(),
                     "schedule tensors must share q2k device");
-        if (schedule_mode == kScheduleModeQRange) {
-            TORCH_CHECK(qrange_num_q_groups > 0, "qrange_num_q_groups must be positive");
-            TORCH_CHECK(qrange_q_bucket_size_blocks > 0, "qrange_q_bucket_size_blocks must be positive");
-            TORCH_CHECK(schedule_capacity_per_bh == qrange_num_q_groups * (int64_t)Nkv,
-                        "qrange schedule capacity must equal num_q_groups * num_kv_blocks");
-        }
     }
     if (has_variable_nums) {
         CHECK_INPUT(q2k_nums);
@@ -624,7 +630,7 @@ void run_build_k2q_csr(
                     "bh_offsets must have shape [B * H + 1]");
         TORCH_CHECK(bh_offsets.device() == q2k.device(), "bh_offsets device mismatch");
     } else {
-        TORCH_CHECK(bsn >= 0 && bsn <= max_kv, "block_sparse_num out of range");
+        TORCH_CHECK(fixed_topk >= 0 && fixed_topk <= max_kv, "max_topk out of range");
         TORCH_CHECK(total_edges == (int64_t)B * H * fixed_edges_per_bh,
                     "fixed total_edges mismatch");
     }
@@ -634,7 +640,7 @@ void run_build_k2q_csr(
         row_ptr.data_ptr<int>(), 0, (size_t)B * H * (Nkv + 1) * sizeof(int), stream));
     AT_CUDA_CHECK(cudaMemsetAsync(
         q_idx.data_ptr<int>(), 0xFF, (size_t)q_idx_capacity * sizeof(int), stream));
-    if (emit_schedule && schedule_mode == kScheduleModeRowChunk) {
+    if (emit_schedule) {
         AT_CUDA_CHECK(cudaMemsetAsync(
             schedule_metadata.data_ptr<int>(), 0,
             (size_t)B * H * (int)schedule_capacity_per_bh * 4 * sizeof(int), stream));
@@ -670,7 +676,7 @@ void run_build_k2q_csr(
     // total_q. Use small q ranges per CTA to expose enough parallelism on B200.
     constexpr int kMinQPerCta = 1;
     int target_ctas_per_sm = 2;
-    long long q_work_per_bh = (long long)Q * (long long)(has_variable_nums ? max_kv : bsn);
+    long long q_work_per_bh = (long long)Q * (long long)(has_variable_nums ? max_kv : fixed_topk);
     if (q_work_per_bh < 1000000LL) {
         target_ctas_per_sm = 1;
     }
@@ -691,24 +697,24 @@ void run_build_k2q_csr(
         launch_hist_scatter<4>(
             q2k, q2k_nums, bh_offsets, row_ptr, q_idx,
             schedule_metadata, schedule_work_counts, row_counts, tile_counts,
-            B, H, Q, max_kv, Nkv, q_idx_capacity, fixed_edges_per_bh, bsn, has_variable_nums,
-            emit_schedule, schedule_mode, (int)schedule_capacity_per_bh, (int)target_q_per_cta,
+            B, H, Q, max_kv, Nkv, q_idx_capacity, fixed_edges_per_bh, fixed_topk, has_variable_nums,
+            emit_schedule, (int)schedule_capacity_per_bh, (int)target_q_per_cta,
             (int)qrange_num_q_groups, (int)qrange_q_bucket_size_blocks,
             G, q_per_cta, q_per_warp, stream);
     } else if (kWarps_pick == 2) {
         launch_hist_scatter<2>(
             q2k, q2k_nums, bh_offsets, row_ptr, q_idx,
             schedule_metadata, schedule_work_counts, row_counts, tile_counts,
-            B, H, Q, max_kv, Nkv, q_idx_capacity, fixed_edges_per_bh, bsn, has_variable_nums,
-            emit_schedule, schedule_mode, (int)schedule_capacity_per_bh, (int)target_q_per_cta,
+            B, H, Q, max_kv, Nkv, q_idx_capacity, fixed_edges_per_bh, fixed_topk, has_variable_nums,
+            emit_schedule, (int)schedule_capacity_per_bh, (int)target_q_per_cta,
             (int)qrange_num_q_groups, (int)qrange_q_bucket_size_blocks,
             G, q_per_cta, q_per_warp, stream);
     } else {
         launch_hist_scatter<1>(
             q2k, q2k_nums, bh_offsets, row_ptr, q_idx,
             schedule_metadata, schedule_work_counts, row_counts, tile_counts,
-            B, H, Q, max_kv, Nkv, q_idx_capacity, fixed_edges_per_bh, bsn, has_variable_nums,
-            emit_schedule, schedule_mode, (int)schedule_capacity_per_bh, (int)target_q_per_cta,
+            B, H, Q, max_kv, Nkv, q_idx_capacity, fixed_edges_per_bh, fixed_topk, has_variable_nums,
+            emit_schedule, (int)schedule_capacity_per_bh, (int)target_q_per_cta,
             (int)qrange_num_q_groups, (int)qrange_q_bucket_size_blocks,
             G, q_per_cta, q_per_warp, stream);
     }
@@ -729,10 +735,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("target_q_per_cta"),
         pybind11::arg("schedule_capacity_per_bh"),
         pybind11::arg("emit_schedule"),
-        pybind11::arg("schedule_mode"),
         pybind11::arg("qrange_num_q_groups"),
         pybind11::arg("qrange_q_bucket_size_blocks"),
-        pybind11::arg("block_sparse_num"),
+        pybind11::arg("max_topk"),
         pybind11::arg("num_kv_blocks"),
         pybind11::arg("total_edges"),
         pybind11::arg("has_variable_nums"));

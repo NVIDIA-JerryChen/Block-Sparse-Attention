@@ -45,7 +45,7 @@ make bb
 # Backward (blk64 only — bf16, MHA, hdim=128)
 make ttb                # quick correctness
 make vtb                # parametric pytest
-make bbb                # dense-bwd benchmark
+make bbb                # interface benchmark
 
 # ncu full / register-spill-smem analysis
 make bm-cli
@@ -54,22 +54,22 @@ make bm-cli
 ## Code Architecture
 
 ### Public API (`bsa_attn_interface.py`)
-- `bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes, ...)` — SM100 block-sparse forward attention (blk128 backend)
-- `bsa_attn_bwd(dout, q, k, v, out, lse, q2k_block_index, block_sparse_num, block_sizes=None, q2k_block_nums=None, softmax_scale=None, dq=None, dk=None, dv=None)` — SM100 block-sparse backward attention (blk64 backend, bf16/MHA/hdim=128). q/k/v/out/dout/dq/dk/dv are all in **BHSD** (`(batch, num_heads, seqlen, head_dim)`) layout — differs from `bsa_attn_fwd`'s BSHD. Returns `(dq, dk, dv)`. Reuses the `q2k_block_index` / `block_sparse_num` / `block_sizes` / `q2k_block_nums` from the forward call; the wrapper inverts `q2k → k2q` internally and allocates the fp32 workspace needed by the kernel
-- `convert_q2k_to_k2q(q2k_block_index, block_sparse_num, num_kv_blocks, q2k_block_nums=None)` — helper that inverts the forward's per-Q-block KV-attendee list into the per-KV-block Q-attendee list + per-KV-block count tensors the backward kernel consumes directly. Implemented via the two-stage Triton kernels in ``utils/block_sparse_index.py`` (scatter q→kv map, then pack set bits into a dense index tensor)
+- `bsa_attn_fwd(q, k, v, q2k_block_index, max_topk, block_sizes, ...)` — SM100 block-sparse forward attention (blk128 backend)
+- `bsa_attn_bwd(dout, q, k, v, out, lse, q2k_block_index, max_topk, block_sizes=None, q2k_block_nums=None, softmax_scale=None, dq=None, dk=None, dv=None, k2q_row_ptr=None, k2q_q_indices=None, k2q_schedule_metadata=None, k2q_schedule_work_counts=None, workspace=None)` — SM100 block-sparse backward attention (blk64 backend, bf16/MHA/hdim=128). q/k/v/out/dout/dq/dk/dv are all in **BHSD** (`(batch, num_heads, seqlen, head_dim)`) layout — differs from `bsa_attn_fwd`'s BSHD. Returns `(dq, dk, dv)`. Reuses the `q2k_block_index` / `max_topk` / `block_sizes` / `q2k_block_nums` from the forward call; the wrapper builds total-packed CSR k2q metadata plus fused qrange-split schedule and allocates the fp32 workspace needed by the kernel. Callers may pass all four prebuilt CSR/schedule tensors to benchmark conversion cost separately.
+- `convert_q2k_to_k2q_csr(q2k_block_index, max_topk, num_kv_blocks, q2k_block_nums=None, return_schedule=False)` — helper that inverts the forward's per-Q-block KV-attendee list into total-packed CSR k2q metadata. With `return_schedule=True`, it also returns the fixed qrange-split schedule used by `bsa_attn_bwd`.
 
 Tensor layout: `(batch, seqlen, num_heads, head_dim)`, last dim contiguous, 16-byte aligned.
 
 #### Block-Sparse Parameters (mandatory)
-- `q2k_block_index`: `(batch, num_heads, num_q_blocks, max_kv_blocks)` int32 — per Q-block list of KV block indices to attend to
-- `block_sparse_num`: int (runtime, even, >= 2 for blk128; >= 1 for blk64) — number of KV blocks each Q block attends to. Ignored when `q2k_block_nums` is provided
+- `q2k_block_index`: `(batch, num_heads, num_q_blocks, max_topk)` int32 — per Q-block list of KV block indices to attend to
+- `max_topk`: int (runtime, even, >= 2 for blk128; >= 1 for blk64) — fixed KV-block count per Q block, or q2k storage capacity / maximum topK when `q2k_block_nums` is provided
 - `block_sizes`: `(num_kv_blocks,)` int32 — actual token count per KV block (for masking padding positions within a tile)
 
 #### Variable Block-Sparse Parameters (optional)
-- `q2k_block_nums`: `(batch, num_heads, num_q_blocks)` int32 — per-Q-block number of KV blocks to attend to (each value >= 0 for blk128, >= 1 for blk64). When provided, `block_sparse_num` is ignored, and for each `(batch, head, m_block)` the first `q2k_block_nums[batch, head, m_block]` entries in `q2k_block_index` are valid. Odd values are handled internally by padding to even with a phantom block (fully masked, zero contribution)
+- `q2k_block_nums`: `(batch, num_heads, num_q_blocks)` int32 — per-Q-block number of KV blocks to attend to (each value >= 0 for blk128, >= 1 for blk64). When provided, for each `(batch, head, m_block)` the first `q2k_block_nums[batch, head, m_block]` entries in the `[... , max_topk]` q2k storage are valid. Odd values are handled internally by padding to even with a phantom block (fully masked, zero contribution)
 - `allow_empty_block_nums`: When True (default), `q2k_block_nums` may contain 0 (empty tiles produce O=0, LSE=-inf). When False, all values must be >= 1, enabling compile-time elimination of empty-tile branches for better performance (~2-3%)
 
-For dense (full) attention, construct `q2k_block_index = [0,1,...,N-1]` for all Q blocks, `block_sparse_num = N`, and `block_sizes = [tile_n]*N` (with last block adjusted for seqlen remainder). See `make_dense_block_sparse_args()` in `test_flash_fwd.py`.
+For dense (full) attention, construct `q2k_block_index = [0,1,...,N-1]` for all Q blocks, `max_topk = N`, and `block_sizes = [tile_n]*N` (with last block adjusted for seqlen remainder). See `make_dense_block_sparse_args()` in `test_bsa.py`.
 
 ### blk128 — CuTe DSL Forward Kernel (`csrc/fwd/sm100_blk128/`)
 - `flash_fwd_sm100.py` — `FlashAttentionForwardSm100`: Blackwell forward, qstage=1 only
@@ -88,12 +88,8 @@ For dense (full) attention, construct `q2k_block_index = [0,1,...,N-1]` for all 
 - `cute_dsl_utils.py` — Tensor alignment helpers, patched compile
 
 ### blk64 — CuTe DSL Backward Kernel (`csrc/bwd/sm100_blk64/`)
-- `flash_bwd_sm100.py` — `BlockSparseAttnBackward`: Blackwell backward, `sparse_block_size=64`, MHA + bf16 + `head_dim=128` only. Exposes a single `__call__(problem_shape, dO, O, Q, K, V, LSE, dQ, dK, dV, k2q_index, k2q_num, variable_block_sizes, workspace, scale_softmax, stream)` entry. `problem_shape` is `(seqlen_q, seqlen_k, head_dim, (num_heads, batch))`. All Q/K/V/O/dO/dQ/dK/dV tensors are passed in **(batch, num_heads, seqlen, head_dim)** layout (`bsa_attn_bwd` takes BHSD directly — callers holding the forward's BSHD layout must `.transpose(1, 2)` themselves). Indexing layout differs from the forward:
-  - `k2q_index`: `(batch, num_heads, num_kv_blocks, num_q_blocks)` int32 — per-KV-block list of attending Q-block indices (the inverse of `q2k_block_index`)
-  - `k2q_num`: `(batch, num_heads, num_kv_blocks)` int32 — per-KV-block count of attending Q blocks
-  - `variable_block_sizes`: `(batch, num_kv_blocks)` int32 — per-batch, per-KV-block valid token count (the wrapper expands a shared `(num_kv_blocks,)` `block_sizes` to this layout)
-  - `workspace`: `(Q_pad, batch, num_heads, (D_pad+2)*4)` uint8 zero-initialized scratch space. The wrapper computes the shape (`_get_workspace_size`) and handles allocation
-- Kernel pipeline: one CTA per (kv_block, head, batch) triple. Launches three sub-kernels back-to-back: `sum_OdO` (rowwise `sum(O ⊙ dO)` + `scaled_LSE = -log2(e)*LSE`), `bwd` (main loop producing dS/dK/dV tiles and accumulating dQ into the fp32 workspace via TMA reduce), and `convert` (casts fp32 dQ_acc to bf16 dQ, scaled by softmax_scale). The main `bwd` loop loads two Q-blocks per iteration (`q_block_idx_0`, `q_block_idx_1`); odd `k2q_num` values are padded with `seqlen_q // sparse_block_size` so the out-of-range TMA load fills zeros
+- `flash_bwd_sm100.py` — `BlockSparseAttnBackward`: Blackwell backward, `sparse_block_size=64`, MHA + bf16 + `head_dim=128` only. Exposes a single CSR scheduled entry consuming total-packed `k2q_q_indices` plus schedule metadata `[B, H, work, 4]` with fields `(kv_block, q_indices_start, q_count, q_group)`. All Q/K/V/O/dO/dQ/dK/dV tensors are passed in **(batch, num_heads, seqlen, head_dim)** layout (`bsa_attn_bwd` takes BHSD directly — callers holding the forward's BSHD layout must `.transpose(1, 2)` themselves).
+- Kernel pipeline: `sum_OdO`, scheduled `bwd`, and `convert`. The main `bwd` loop runs qrange-split work items generated by `csrc/common/build_k2q_csr`, using total-packed CSR storage to avoid dense k2q metadata.
 - `sm_100a` target only. MMA tilers are hardcoded at `(*, 64, 128)`, i.e. head_dim must be 128
 
 ### blk64 — C++ AOT Forward Kernel (`csrc/fwd/sm100_blk64/`)
@@ -114,12 +110,11 @@ For dense (full) attention, construct `q2k_block_index = [0,1,...,N-1]` for all 
 - `fa_logging.py` — `FA_LOG_LEVEL` debug logging
 - `testing.py` — `attention_ref`, tolerance helpers
 - `bench_utils.py` — flops computation
-- `benchmark.py` — `benchmark_forward`
 
 ## Key Patterns
 
-- **blk128**: Compile-time constants use `cutlass.Constexpr[type]` for kernel specialization. `block_sparse_num` is a runtime `Int32` parameter (not compile-time); different values do not require recompilation
-- **blk64**: Compile-time template parameter `HasVarBlockNums` selects kernel variant. Phantom block padding rounds `block_sparse_num` up to multiples of 8 (`kSparseBlocksPerKV * 2`) for even kv_iters
+- **blk128**: Compile-time constants use `cutlass.Constexpr[type]` for kernel specialization. `max_topk` is a runtime `Int32` parameter (not compile-time); different values do not require recompilation
+- **blk64**: Compile-time template parameter `HasVarBlockNums` selects kernel variant. Phantom block padding rounds `max_topk` up to multiples of 8 (`kSparseBlocksPerKV * 2`) for even kv_iters
 - `q2k_block_nums` enables per-Q-block variable KV block counts; uses a separate compile path (`has_variable_block_nums` in compile key for blk128, `HasVarBlockNums` template for blk64). Pipeline phases (`phase_s0`/`phase_s1`) persist across tiles to handle variable `block_iter_count` in persistent scheduling. Odd values are rounded up to even internally; the phantom block uses a clamped index (`max_i` in `get_n_block_idx`) and `block_size=0` mask for zero contribution
 - Forward execution: load Q tile -> loop over K/V blocks selected by `q2k_block_index` (pipelined) -> online softmax with per-block `block_sizes` masking -> store O and LSE. Both backends output LSE `(batch, num_heads, seqlen_q)` float32; blk128 writes LSE in the correction warp of `flash_fwd_sm100.py`, blk64 writes LSE in the correction warp of `mainloop_fwd_sm100.hpp` after warp-pair stats exchange
 - Load order for N KV blocks (blk128): K[idx(N-1)], Q, K[idx(N-2)], {V[idx(N-1-i)], K[idx(N-3-i)]}x(N-2), V[idx(1)], V[idx(0)] -- where `idx(i) = q2k_block_index[batch, head, m_block, i]`

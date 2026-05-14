@@ -24,9 +24,6 @@ from tabulate import tabulate
 from bsa_attn_interface import (
     bsa_attn_fwd_blk64,
     bsa_attn_bwd as bsa_attn_bwd_blk64,
-    bsa_attn_bwd_csr_scheduled as bsa_attn_bwd_csr_scheduled_blk64,
-    bsa_attn_bwd_qbucket as bsa_attn_bwd_qbucket_blk64,
-    convert_q2k_to_k2q_csr,
 )
 
 # import block_sparse_attention
@@ -36,7 +33,7 @@ def bsa_attn_fwd(
     k,
     v,
     q2k_block_index,
-    block_sparse_num,
+    max_topk,
     block_sizes=None,
     softmax_scale=None,
     q2k_block_nums=None,
@@ -71,10 +68,8 @@ def bsa_attn_fwd(
         k = torch.nn.functional.pad(k, (0, 0, 0, pad_k))
         v = torch.nn.functional.pad(v, (0, 0, 0, pad_k))
 
-    if q2k_block_nums is not None:
-        block_sparse_num = 0
     out, lse = torch.ops.bsa_blk64.fwd(
-        q, k, v, q2k_block_index, block_sparse_num, block_sizes, softmax_scale, q2k_block_nums, use_clc)
+        q, k, v, q2k_block_index, max_topk, block_sizes, softmax_scale, q2k_block_nums, use_clc)
 
     # Kernel returns out as BHSD (B, H, S_q_rounded, D). Trim seqlen (dim 2).
     if out.size(2) != seqlen_q:
@@ -95,7 +90,7 @@ def bsa_attn_bwd(
     out,
     lse,
     q2k_block_index,
-    block_sparse_num,
+    max_topk,
     block_sizes=None,
     q2k_block_nums=None,
     softmax_scale=None,
@@ -104,7 +99,7 @@ def bsa_attn_bwd(
     dv=None,
 ):
     return bsa_attn_bwd_blk64(
-        dout, q, k, v, out, lse, q2k_block_index, block_sparse_num,
+        dout, q, k, v, out, lse, q2k_block_index, max_topk,
         block_sizes, q2k_block_nums, softmax_scale, dq, dk, dv,
     )
 
@@ -319,10 +314,10 @@ def prepare_inputs(
     # q2k_block_index: (batch, heads, n_q_blocks, n_kv_blocks) sorted indices
     q2k_block_index = sparse_map.argsort(
         dim=3, descending=True, stable=True).to(torch.int32)
-    block_sparse_num = real_topk
+    max_topk = real_topk
     q2k_block_nums = torch.full(
         (batch_size, head_size, q2k_block_index.size(2)),
-        block_sparse_num,
+        max_topk,
         dtype=torch.int32,
         device=device,
     )
@@ -335,7 +330,7 @@ def prepare_inputs(
     block_sizes = kv_mask_padded.view(
         num_kv_blocks, BLKK).sum(dim=-1).to(torch.int32)
 
-    return (q, k, v, q2k_block_index, block_sparse_num, q2k_block_nums, block_sizes,
+    return (q, k, v, q2k_block_index, max_topk, q2k_block_nums, block_sizes,
             S_q, S_k, density, kv_mask)
 
 
@@ -362,7 +357,7 @@ def bench_bsa(
     When check_correctness=True, also runs fa4_sla's sparse_flash_attn_cute_func
     as a baseline and reports the max absolute error.
     """
-    (q, k, v, q2k_block_index, block_sparse_num, q2k_block_nums, block_sizes,
+    (q, k, v, q2k_block_index, max_topk, q2k_block_nums, block_sizes,
      S_q, S_k, density, kv_mask) = prepare_inputs(
         batch_size, head_size, S_aud, S_txt, n_frames, height, width,
         head_dim, BLKQ, BLKK, topk_ratio, block_fhw=block_fhw, device=device,
@@ -372,7 +367,7 @@ def bench_bsa(
     out, lse = bsa_attn_fwd(
         q, k, v,
         q2k_block_index=q2k_block_index,
-        block_sparse_num=block_sparse_num,
+        max_topk=max_topk,
         block_sizes=block_sizes,
         q2k_block_nums=q2k_block_nums,
         # blk_n=BLKK,
@@ -391,7 +386,7 @@ def bench_bsa(
         v_bshd = v.permute(0, 2, 1, 3).contiguous()
 
         # indices: topk selected KV-block indices per (batch, head, q_block)
-        indices = q2k_block_index[:, :, :, :block_sparse_num].contiguous()
+        indices = q2k_block_index[:, :, :, :max_topk].contiguous()
 
         out_ref = sparse_flash_attn_cute_func(
             q_bshd, k_bshd, v_bshd,
@@ -414,7 +409,7 @@ def bench_bsa(
         return bsa_attn_fwd(
             q, k, v,
             q2k_block_index=q2k_block_index,
-            block_sparse_num=block_sparse_num,
+            max_topk=max_topk,
             block_sizes=block_sizes,
             q2k_block_nums=q2k_block_nums,
             # blk_n=BLKK,
@@ -431,7 +426,7 @@ def bench_bsa(
         'H': head_size,
         'D': head_dim,
         'density': density,
-        'block_sparse_num': block_sparse_num,
+        'max_topk': max_topk,
         'fwd_time_ms': fwd_time,
         'tflops': tflops,
         'mfu': mfu,
@@ -460,10 +455,9 @@ def bench_bsa_bwd(
     runs=20,
     check_correctness=False,
     hfu=False,
-    bwd_impl="default",
 ):
     """Benchmark bsa_attn_bwd with given configuration."""
-    (q, k, v, q2k_block_index, block_sparse_num, q2k_block_nums, block_sizes,
+    (q, k, v, q2k_block_index, max_topk, q2k_block_nums, block_sizes,
      S_q, S_k, density, kv_mask) = prepare_inputs(
         batch_size, head_size, S_aud, S_txt, n_frames, height, width,
         head_dim, BLKQ, BLKK, topk_ratio, block_fhw=block_fhw, device=device,
@@ -473,7 +467,7 @@ def bench_bsa_bwd(
     out, lse = bsa_attn_fwd(
         q, k, v,
         q2k_block_index=q2k_block_index,
-        block_sparse_num=block_sparse_num,
+        max_topk=max_topk,
         block_sizes=block_sizes,
         q2k_block_nums=q2k_block_nums,
         # blk_n=BLKK,
@@ -481,96 +475,15 @@ def bench_bsa_bwd(
     torch.cuda.synchronize()
 
     dout = torch.randn_like(out)
-    prebuilt_csr = None
-    if bwd_impl == "csr_prebuilt":
-        prebuilt_csr = convert_q2k_to_k2q_csr(
-            q2k_block_index,
-            block_sparse_num,
-            _ceil_div_int(S_k, BLKK),
-            q2k_block_nums=q2k_block_nums,
-        )
-        torch.cuda.synchronize()
-    elif bwd_impl == "csr_scheduled_prebuilt":
-        prebuilt_csr = convert_q2k_to_k2q_csr(
-            q2k_block_index,
-            block_sparse_num,
-            _ceil_div_int(S_k, BLKK),
-            q2k_block_nums=q2k_block_nums,
-            return_schedule=True,
-            schedule_mode="qrange",
-        )
-        torch.cuda.synchronize()
 
     # Warmup bwd
-    def _run_bwd():
-        if bwd_impl == "default":
-            return bsa_attn_bwd(
-                dout, q, k, v, out, lse,
-                q2k_block_index=q2k_block_index,
-                block_sparse_num=block_sparse_num,
-                block_sizes=block_sizes,
-                q2k_block_nums=q2k_block_nums,
-            )
-        if bwd_impl == "qbuck":
-            return bsa_attn_bwd_qbucket_blk64(
-                dout, q, k, v, out, lse,
-                q2k_block_index=q2k_block_index,
-                block_sparse_num=block_sparse_num,
-                block_sizes=block_sizes,
-                q2k_block_nums=q2k_block_nums,
-            )
-        if bwd_impl == "csr":
-            return bsa_attn_bwd_blk64(
-                dout, q, k, v, out, lse,
-                q2k_block_index=q2k_block_index,
-                block_sparse_num=block_sparse_num,
-                block_sizes=block_sizes,
-                q2k_block_nums=q2k_block_nums,
-                use_k2q_csr=True,
-            )
-        if bwd_impl == "csr_prebuilt":
-            k2q_row_ptr, k2q_q_indices = prebuilt_csr
-            return bsa_attn_bwd_blk64(
-                dout, q, k, v, out, lse,
-                q2k_block_index=q2k_block_index,
-                block_sparse_num=block_sparse_num,
-                block_sizes=block_sizes,
-                q2k_block_nums=q2k_block_nums,
-                use_k2q_csr=True,
-                k2q_row_ptr=k2q_row_ptr,
-                k2q_q_indices=k2q_q_indices,
-            )
-        if bwd_impl == "csr_scheduled":
-            return bsa_attn_bwd_csr_scheduled_blk64(
-                dout, q, k, v, out, lse,
-                q2k_block_index=q2k_block_index,
-                block_sparse_num=block_sparse_num,
-                block_sizes=block_sizes,
-                q2k_block_nums=q2k_block_nums,
-                schedule_mode="qrange",
-            )
-        if bwd_impl == "csr_scheduled_prebuilt":
-            (
-                k2q_row_ptr,
-                k2q_q_indices,
-                k2q_schedule_metadata,
-                k2q_schedule_work_counts,
-            ) = prebuilt_csr
-            return bsa_attn_bwd_csr_scheduled_blk64(
-                dout, q, k, v, out, lse,
-                q2k_block_index=q2k_block_index,
-                block_sparse_num=block_sparse_num,
-                block_sizes=block_sizes,
-                q2k_block_nums=q2k_block_nums,
-                k2q_row_ptr=k2q_row_ptr,
-                k2q_q_indices=k2q_q_indices,
-                k2q_schedule_metadata=k2q_schedule_metadata,
-                k2q_schedule_work_counts=k2q_schedule_work_counts,
-                schedule_mode="qrange",
-            )
-        raise ValueError(f"unknown bwd_impl={bwd_impl!r}")
-
-    dq, dk, dv = _run_bwd()
+    dq, dk, dv = bsa_attn_bwd(
+        dout, q, k, v, out, lse,
+        q2k_block_index=q2k_block_index,
+        max_topk=max_topk,
+        block_sizes=block_sizes,
+        # q2k_block_nums=q2k_block_nums,
+    )
     torch.cuda.synchronize()
 
     # ── Optional correctness check against fa4_sla baseline ──
@@ -588,7 +501,7 @@ def bench_bsa_bwd(
         k_bshd = k.permute(0, 2, 1, 3).contiguous().requires_grad_(True)
         v_bshd = v.permute(0, 2, 1, 3).contiguous().requires_grad_(True)
 
-        indices = q2k_block_index[:, :, :, :block_sparse_num].contiguous()
+        indices = q2k_block_index[:, :, :, :max_topk].contiguous()
 
         out_ref = sparse_flash_attn_cute_func(
             q_bshd, k_bshd, v_bshd,
@@ -621,7 +534,13 @@ def bench_bsa_bwd(
             f"dV max={max_abs_err_dv:.6e} mean={mean_abs_err_dv:.6e}")
 
     def bwd_fn():
-        return _run_bwd()
+        return bsa_attn_bwd(
+            dout, q, k, v, out, lse,
+            q2k_block_index=q2k_block_index,
+            max_topk=max_topk,
+            block_sizes=block_sizes,
+            # q2k_block_nums=q2k_block_nums,
+        )
 
     bwd_time = do_bench(bwd_fn, warmup=warmup, runs=runs)
 
@@ -635,7 +554,7 @@ def bench_bsa_bwd(
         'H': head_size,
         'D': head_dim,
         'density': density,
-        'block_sparse_num': block_sparse_num,
+        'max_topk': max_topk,
         'bwd_time_ms': bwd_time,
         'tflops': tflops,
         'mfu': mfu,
@@ -712,18 +631,6 @@ if __name__ == '__main__':
                         help='Use HFU (factor=10) instead of MFU (factor=8) for bwd flops calculation')
     parser.add_argument('--fwd', action='store_true',
                         help='Benchmark bsa_attn_fwd (forward pass)')
-    parser.add_argument('--bwd-impl', default='default',
-                        choices=[
-                            'default', 'qbuck',
-                            'csr', 'csr_prebuilt',
-                            'csr_scheduled', 'csr_scheduled_prebuilt',
-                            'all', 'all_prebuilt',
-                        ],
-                        help='Backward implementation to benchmark')
-    parser.add_argument('--warmup', type=int, default=5,
-                        help='Warmup iterations for do_bench')
-    parser.add_argument('--runs', type=int, default=20,
-                        help='Timed iterations for do_bench')
     args = parser.parse_args()
 
     set_seed(42)
@@ -753,7 +660,7 @@ if __name__ == '__main__':
                 print(f">>> Running config: {tag} ...")
                 tag = f"B1-H{cfg_kw['head_size']}"
                 try:
-                    res = bench_bsa(**cfg, warmup=args.warmup, runs=args.runs)
+                    res = bench_bsa(**cfg)
                     row = [
                         tag,
                         res['S_q'],
@@ -782,44 +689,31 @@ if __name__ == '__main__':
     # ─── Backward benchmark ───
     if args.bwd:
         bwd_results_table = []
-        if args.bwd_impl == 'all':
-            bwd_impls = ['default', 'qbuck', 'csr', 'csr_scheduled']
-        elif args.bwd_impl == 'all_prebuilt':
-            bwd_impls = ['qbuck', 'csr_prebuilt', 'csr_scheduled_prebuilt']
-        else:
-            bwd_impls = [args.bwd_impl]
         for cfg_kw in configs:
             for topk in topk_ratios:
                 res_name = cfg_kw.get('resolution', 'custom')
                 label = f"{res_name}-{cfg_kw['duration']}s-H{cfg_kw['head_size']}"
                 cfg = make_config(**cfg_kw, topk_ratio=topk)
-                for bwd_impl in bwd_impls:
-                    tag = f"{label}-topk{topk}-{bwd_impl}"
-                    print(f">>> Running BWD config: {tag} ...")
-                    short_tag = f"B1-H{cfg_kw['head_size']}-{bwd_impl}"
-                    try:
-                        res = bench_bsa_bwd(
-                            **cfg,
-                            hfu=args.hfu,
-                            warmup=args.warmup,
-                            runs=args.runs,
-                            bwd_impl=bwd_impl,
-                        )
-                        row = [
-                            short_tag,
-                            res['S_q'],
-                            res['S_k'],
-                            f"{1 - res['density']:.3f}",
-                            f"{res['bwd_time_ms']:.3f}",
-                            f"{res['tflops']:.2f}",
-                            f"{res['mfu']:.2f}",
-                        ]
-                        bwd_results_table.append(row)
-                    except Exception as e:
-                        import traceback
-                        traceback.print_exc()
-                        fail_row = [short_tag, "-", "-", "-", "FAILED", str(e)[:40], "-"]
-                        bwd_results_table.append(fail_row)
+                tag = f"{label}-topk{topk}"
+                print(f">>> Running BWD config: {tag} ...")
+                tag = f"B1-H{cfg_kw['head_size']}"
+                try:
+                    res = bench_bsa_bwd(**cfg, hfu=args.hfu)
+                    row = [
+                        tag,
+                        res['S_q'],
+                        res['S_k'],
+                        f"{1 - res['density']:.3f}",
+                        f"{res['bwd_time_ms']:.3f}",
+                        f"{res['tflops']:.2f}",
+                        f"{res['mfu']:.2f}",
+                    ]
+                    bwd_results_table.append(row)
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    fail_row = [tag, "-", "-", "-", "FAILED", str(e)[:40], "-"]
+                    bwd_results_table.append(fail_row)
 
         bwd_headers = [
             "Config", "S_q", "S_k",
