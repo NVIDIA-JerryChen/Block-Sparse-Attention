@@ -114,8 +114,13 @@ class BlockSparseAttnBackwardSm90:
         dqaccum_stage: int = 1,
         pds_stage: int = 1,
         qdo_stage: int = 2,
+        qbucket_task_offsets: Optional[cute.Tensor] = None,
+        qbucket_task_q_indices: Optional[cute.Tensor] = None,
+        dkv_accum_output: bool = False,
     ):
+        qbucket = qbucket_task_offsets is not None
         wg_specialized_pipeline = blocksparse_tensors is None
+        assert qbucket_task_q_indices is not None or not qbucket
         assert not kv_in_regs or wg_specialized_pipeline, "KV-in-regs is dense-only"
         assert not kv_in_regs or sdp_swap_ab, "KV-in-regs requires SdP_swapAB"
         assert not dkv_rs_wg1 or wg_specialized_pipeline, "WG1 dKV-RS is dense-only"
@@ -123,6 +128,7 @@ class BlockSparseAttnBackwardSm90:
         assert not dkv_rs_split or wg_specialized_pipeline, "Split dKV-RS is dense-only"
         assert not dkv_rs_split or sdp_swap_ab, "Split dKV-RS requires SdP_swapAB"
         assert not (dkv_rs_wg1 and dkv_rs_split), "dKV-RS experiments are mutually exclusive"
+        assert not qbucket or dkv_accum_output, "SM90 qbucket requires fp32 dKV accum output"
         assert pds_stage in [1, 2], "PdS stage must be 1 or 2"
         assert qdo_stage in [1, 2, 3], "Q/dO stage must be 1, 2, or 3"
         assert pds_stage == 1 or pds_stage == qdo_stage, "PdS stage must be 1 or match Q/dO stage"
@@ -153,6 +159,8 @@ class BlockSparseAttnBackwardSm90:
             dKV_rs_wg1=dkv_rs_wg1,
             dKV_rs_split=dkv_rs_split,
             dQaccum_stage=dqaccum_stage,
+            qbucket=qbucket,
+            dKV_accum_output=dkv_accum_output,
         )
         compile_options = "--enable-tvm-ffi"
         dump_dir = os.environ.get("BSA_SM90_BWD_DUMP_DIR")
@@ -182,6 +190,8 @@ class BlockSparseAttnBackwardSm90:
             None,
             None,
             blocksparse_tensors,
+            qbucket_task_offsets,
+            qbucket_task_q_indices,
             stream,
             options=compile_options,
         )
@@ -416,6 +426,8 @@ def bsa_attn_bwd_sm90(
             None,
             None,
             sparse_tensors_runtime,
+            None,
+            None,
             current_stream,
         )
     _bwd_postprocess_convert(
@@ -449,3 +461,258 @@ def bsa_attn_bwd_sm90(
 
 
 bsa_attn_bwd_sm90.mainloop_cache = get_jit_cache("bsa_bwd_sm90")
+
+
+def bsa_attn_bwd_sm90_qbucket_from_tasks(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    task_offsets: torch.Tensor,
+    task_q_indices: torch.Tensor,
+    block_sizes: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    dq: Optional[torch.Tensor] = None,
+    dk: Optional[torch.Tensor] = None,
+    dv: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """SM90 q-range bucketed sparse backward using the split WG pipeline.
+
+    The qbucket task tensors follow the SM100 qbucket contract:
+    task_offsets is (B, H, num_q_groups, num_kv_blocks + 1) and task_q_indices
+    is (B, H, max_edges), both int32.
+    """
+    q, k, v, out, dout = [_maybe_contiguous(t) for t in (q, k, v, out, dout)]
+    lse = _maybe_contiguous(lse)
+
+    assert q.dtype in [torch.float16, torch.bfloat16]
+    assert q.dtype == k.dtype == v.dtype == out.dtype == dout.dtype
+    assert lse.dtype == torch.float32
+    assert task_offsets.dtype == torch.int32 and task_q_indices.dtype == torch.int32
+    assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
+
+    batch_size, num_heads, seqlen_q, head_dim = q.shape
+    num_heads_kv, seqlen_k, head_dim_k = k.shape[1], k.shape[2], k.shape[3]
+    assert head_dim == 128 and head_dim_k == 128, "SM90 qbucket bwd requires D=128"
+    assert num_heads == num_heads_kv, "SM90 qbucket bwd does not support GQA/MQA yet"
+    assert k.shape == v.shape == (batch_size, num_heads, seqlen_k, head_dim)
+    assert out.shape == q.shape and dout.shape == q.shape
+    assert lse.shape == (batch_size, num_heads, seqlen_q)
+    num_kv_blocks = (seqlen_k + BlockSparseAttnBackwardSm90.tile_n - 1) // BlockSparseAttnBackwardSm90.tile_n
+    assert task_offsets.shape[:2] == (batch_size, num_heads)
+    assert task_offsets.shape[3] == num_kv_blocks + 1
+    assert task_q_indices.shape[:2] == (batch_size, num_heads)
+    if not is_fake_mode():
+        assert all(t.is_cuda for t in (q, k, v, out, dout, lse, task_offsets, task_q_indices))
+        if block_sizes is not None:
+            assert block_sizes.is_cuda and block_sizes.dtype == torch.int32
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    if block_sizes is not None:
+        if block_sizes.ndim == 1:
+            assert block_sizes.shape == (num_kv_blocks,)
+            block_sizes = block_sizes.unsqueeze(0).expand(batch_size, -1).contiguous()
+        else:
+            assert block_sizes.shape == (batch_size, num_kv_blocks)
+            block_sizes = block_sizes.contiguous()
+        if (
+            seqlen_k % BlockSparseAttnBackwardSm90.tile_n == 0
+            and not is_fake_mode()
+            and torch.all(block_sizes == BlockSparseAttnBackwardSm90.tile_n).item()
+        ):
+            block_sizes = None
+
+    q_bshd = q.transpose(1, 2).contiguous()
+    k_bshd = k.transpose(1, 2).contiguous()
+    v_bshd = v.transpose(1, 2).contiguous()
+    out_bshd = out.transpose(1, 2).contiguous()
+    dout_bshd = dout.transpose(1, 2).contiguous()
+
+    dq_bshd = torch.empty_like(q_bshd)
+    dk_bshd = torch.empty_like(k_bshd)
+    dv_bshd = torch.empty_like(v_bshd)
+
+    dtype = torch2cute_dtype_map[q.dtype]
+    kernel = BlockSparseAttnBackwardSm90(dtype, head_dim, head_dim)
+
+    stats_shape = kernel._get_stats_size(seqlen_q, num_heads, batch_size)
+    dpsum = torch.empty(stats_shape, dtype=torch.float32, device=q.device)
+    lse_log2 = torch.empty(stats_shape, dtype=torch.float32, device=q.device)
+    dq_accum = torch.empty(
+        kernel._get_workspace_size(seqlen_q, head_dim, num_heads, batch_size),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    dk_accum = torch.zeros(
+        kernel._get_workspace_size(seqlen_k, head_dim, num_heads, batch_size),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    dv_accum = torch.zeros_like(dk_accum)
+
+    current_stream = (
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        if is_fake_mode()
+        else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    )
+    kv_in_regs = os.environ.get("BSA_SM90_BWD_KV_REGS", "1") != "0"
+    sdp_swap_ab = True
+    dkv_rs_split = os.environ.get("BSA_SM90_BWD_DKV_RS_SPLIT", "1") != "0"
+    dqaccum_stage = int(os.environ.get("BSA_SM90_BWD_DQACCUM_STAGE", "1"))
+    assert dqaccum_stage in [1, 2, 3], "BSA_SM90_BWD_DQACCUM_STAGE must be 1, 2, or 3"
+    pds_stage = int(os.environ.get("BSA_SM90_BWD_PDS_STAGE", "1"))
+    assert pds_stage in [1, 2], "BSA_SM90_BWD_PDS_STAGE must be 1 or 2"
+    qdo_stage = int(os.environ.get("BSA_SM90_BWD_QDO_STAGE", "3"))
+    assert qdo_stage in [1, 2, 3], "BSA_SM90_BWD_QDO_STAGE must be 1, 2, or 3"
+    if pds_stage > qdo_stage:
+        pds_stage = qdo_stage
+    if pds_stage != 1 and pds_stage != qdo_stage:
+        pds_stage = 1
+
+    main_key = (
+        "qbuck",
+        q.dtype,
+        head_dim,
+        num_heads,
+        task_offsets.shape[2],
+        block_sizes is not None,
+        kv_in_regs,
+        dkv_rs_split,
+        dqaccum_stage,
+        pds_stage,
+        qdo_stage,
+    )
+
+    _bwd_preprocess(
+        out_bshd,
+        dout_bshd,
+        dpsum,
+        lse,
+        lse_log2,
+        dq_accum,
+        None,
+        None,
+        None,
+        dtype,
+        head_dim,
+        head_dim,
+        kernel.tile_m,
+    )
+    if main_key not in bsa_attn_bwd_sm90_qbucket_from_tasks.mainloop_cache:
+        bsa_attn_bwd_sm90_qbucket_from_tasks.mainloop_cache[main_key] = kernel.compile_mainloop(
+            _convert_to_cute_tensor(q_bshd),
+            _convert_to_cute_tensor(k_bshd),
+            _convert_to_cute_tensor(v_bshd),
+            _convert_to_cute_tensor(dout_bshd),
+            _convert_to_cute_tensor(lse_log2),
+            _convert_to_cute_tensor(dpsum),
+            _convert_to_cute_tensor(dq_accum),
+            _convert_to_cute_tensor(dk_accum),
+            _convert_to_cute_tensor(dv_accum),
+            Float32(softmax_scale),
+            _convert_to_cute_tensor(block_sizes, assumed_align=4) if block_sizes is not None else None,
+            current_stream,
+            skip_score_mask=False,
+            sdp_swap_ab=sdp_swap_ab,
+            kv_in_regs=kv_in_regs,
+            dkv_rs_split=dkv_rs_split,
+            dqaccum_stage=dqaccum_stage,
+            pds_stage=pds_stage,
+            qdo_stage=qdo_stage,
+            qbucket_task_offsets=_convert_to_cute_tensor(task_offsets, assumed_align=4),
+            qbucket_task_q_indices=_convert_to_cute_tensor(task_q_indices, assumed_align=4),
+            dkv_accum_output=True,
+        )
+
+    if not is_fake_mode():
+        bsa_attn_bwd_sm90_qbucket_from_tasks.mainloop_cache[main_key](
+            q_bshd,
+            k_bshd,
+            v_bshd,
+            dout_bshd,
+            lse_log2,
+            dpsum,
+            dq_accum,
+            dk_accum,
+            dv_accum,
+            softmax_scale,
+            block_sizes,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            task_offsets,
+            task_q_indices,
+            current_stream,
+        )
+
+    _bwd_postprocess_convert(
+        dq_accum,
+        dq_bshd,
+        softmax_scale,
+        None,
+        None,
+        kernel.arch,
+        dtype,
+        head_dim,
+        kernel.tile_m,
+        kernel.num_mma_wg * 128,
+        1,
+        False,
+    )
+    _bwd_postprocess_convert(
+        dk_accum,
+        dk_bshd,
+        softmax_scale,
+        None,
+        None,
+        kernel.arch,
+        dtype,
+        head_dim,
+        kernel.tile_n,
+        kernel.num_mma_wg * 128,
+        1,
+        False,
+    )
+    _bwd_postprocess_convert(
+        dv_accum,
+        dv_bshd,
+        1.0,
+        None,
+        None,
+        kernel.arch,
+        dtype,
+        head_dim,
+        kernel.tile_n,
+        kernel.num_mma_wg * 128,
+        1,
+        False,
+    )
+
+    dq_result = dq_bshd.transpose(1, 2).contiguous()
+    dk_result = dk_bshd.transpose(1, 2).contiguous()
+    dv_result = dv_bshd.transpose(1, 2).contiguous()
+    if dq is not None:
+        dq.copy_(dq_result)
+        dq_result = dq
+    if dk is not None:
+        dk.copy_(dk_result)
+        dk_result = dk
+    if dv is not None:
+        dv.copy_(dv_result)
+        dv_result = dv
+    return dq_result, dk_result, dv_result
+
+
+bsa_attn_bwd_sm90_qbucket_from_tasks.mainloop_cache = get_jit_cache("bsa_bwd_sm90_qbucket")

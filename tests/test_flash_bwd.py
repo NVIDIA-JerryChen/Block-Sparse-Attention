@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 import torch
 
+import bsa_attn_interface as bsa_iface
 from bsa_attn_interface import bsa_attn_bwd, bsa_attn_bwd_qbucket, convert_q2k_to_k2q
 from test_flash_fwd import (
     make_dense_block_sparse_args,
@@ -28,6 +29,65 @@ from utils.bench_utils import flops, bwd_flops
 
 # The bwd kernel only exists for blk64 (sparse_block_size=64, head_dim=128, MHA, bf16).
 BLK = 64
+
+
+class _sm90_qbucket_default:
+    def __init__(self, enabled):
+        self.enabled = enabled
+        self.prev = None
+
+    def __enter__(self):
+        self.prev = bsa_iface.BSA_SM90_BWD_QBUCKET
+        bsa_iface.BSA_SM90_BWD_QBUCKET = self.enabled
+
+    def __exit__(self, exc_type, exc, tb):
+        bsa_iface.BSA_SM90_BWD_QBUCKET = self.prev
+
+
+def _full_block_sizes(seqlen_k, device="cuda"):
+    num_kv_blocks = (seqlen_k + BLK - 1) // BLK
+    block_sizes = torch.full((num_kv_blocks,), BLK, dtype=torch.int32, device=device)
+    tail = seqlen_k - (num_kv_blocks - 1) * BLK
+    block_sizes[-1] = tail
+    return block_sizes
+
+
+def _max_abs(a, b):
+    return (a.float() - b.float()).abs().max().item()
+
+
+def _sanitize_grads(*grads):
+    return tuple(
+        torch.nan_to_num(g.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        for g in grads
+    )
+
+
+def _grad_tols(refs, pts):
+    tols = []
+    for ref, pt in zip(refs, pts):
+        ref = torch.nan_to_num(ref.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        pt = torch.nan_to_num(pt.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        pt_diff = (pt - ref).abs().max().item()
+        bf16_eps = (ref + 0.3 - 0.3 - ref).abs().max().item()
+        tols.append(3 * pt_diff + 3 * bf16_eps + 5e-3)
+    return tuple(tols)
+
+
+def _assert_bwd_close(label, grads, refs, tols):
+    diffs = tuple(_max_abs(g, r) for g, r in zip(grads, refs))
+    passed = all(diff <= tol for diff, tol in zip(diffs, tols))
+    print(
+        f"  {'PASS' if passed else 'FAIL'} {label}: "
+        f"dq={diffs[0]:.4f}/{tols[0]:.4f} "
+        f"dk={diffs[1]:.4f}/{tols[1]:.4f} "
+        f"dv={diffs[2]:.4f}/{tols[2]:.4f}"
+    )
+    assert passed, (
+        f"{label}: dq_diff={diffs[0]}>tol={tols[0]}, "
+        f"dk_diff={diffs[1]}>tol={tols[1]}, dv_diff={diffs[2]}>tol={tols[2]}"
+    )
+    return diffs
 
 
 def _torch_ref_bwd(q, k, v, dout, attn_bias, softmax_scale, upcast=True):
@@ -331,6 +391,200 @@ def test_flash_bwd_sm90_blk64_sparse(seqlen_q, seqlen_k, use_variable_block_nums
     )
 
 
+@pytest.mark.parametrize("use_variable_block_nums", [False, True])
+def test_flash_bwd_sm90_blk64_qbucket_multi_group(use_variable_block_nums):
+    if _cuda_major() != 9:
+        pytest.skip("SM90 test")
+    _test_bwd_single(
+        1,
+        512,
+        768,
+        2,
+        use_variable_block_nums=use_variable_block_nums,
+        impl="qbuck",
+        q_bucket_size_blocks=2,
+    )
+
+
+def test_flash_bwd_sm90_blk64_sparse_path_compare_no_block_sizes():
+    if _cuda_major() != 9:
+        pytest.skip("SM90 test")
+    device = "cuda"
+    dtype = torch.bfloat16
+    bs, nheads, seqlen_q, seqlen_k, d = 1, 2, 512, 768, 128
+
+    torch.manual_seed(123)
+    torch.cuda.empty_cache()
+
+    q = torch.randn(bs, nheads, seqlen_q, d, device=device, dtype=dtype)
+    k = torch.randn(bs, nheads, seqlen_k, d, device=device, dtype=dtype)
+    v = torch.randn(bs, nheads, seqlen_k, d, device=device, dtype=dtype)
+    dout = torch.randn_like(q)
+
+    q2k_block_index, block_sparse_num, block_sizes, q2k_block_nums = make_topk_block_sparse_args(
+        bs,
+        seqlen_q,
+        seqlen_k,
+        nheads,
+        topk=4,
+        blk_m=BLK,
+        blk_n=BLK,
+        device=device,
+        use_block_sizes=False,
+    )
+    assert block_sizes is None
+    ref_block_sizes = _full_block_sizes(seqlen_k, device=device)
+    attn_bias = block_sparse_to_attn_bias(
+        q2k_block_index,
+        block_sparse_num,
+        ref_block_sizes,
+        seqlen_q,
+        seqlen_k,
+        blk_m=BLK,
+        blk_n=BLK,
+        q2k_block_nums=q2k_block_nums,
+    )
+    softmax_scale = 1.0 / math.sqrt(d)
+    out_ref, lse_ref, dq_ref, dk_ref, dv_ref = _torch_ref_bwd(
+        q, k, v, dout, attn_bias, softmax_scale,
+    )
+    _, _, dq_pt, dk_pt, dv_pt = _torch_ref_bwd(
+        q, k, v, dout, attn_bias, softmax_scale, upcast=False,
+    )
+    refs = _sanitize_grads(dq_ref, dk_ref, dv_ref)
+    tols = _grad_tols(refs, _sanitize_grads(dq_pt, dk_pt, dv_pt))
+
+    with _sm90_qbucket_default(False):
+        old_k2q = bsa_attn_bwd(
+            dout,
+            q,
+            k,
+            v,
+            out_ref,
+            lse_ref,
+            q2k_block_index,
+            block_sparse_num,
+            None,
+            q2k_block_nums=q2k_block_nums,
+            softmax_scale=softmax_scale,
+        )
+    with _sm90_qbucket_default(True):
+        default_qbucket = bsa_attn_bwd(
+            dout,
+            q,
+            k,
+            v,
+            out_ref,
+            lse_ref,
+            q2k_block_index,
+            block_sparse_num,
+            None,
+            q2k_block_nums=q2k_block_nums,
+            softmax_scale=softmax_scale,
+        )
+    direct_qbucket = bsa_attn_bwd_qbucket(
+        dout,
+        q,
+        k,
+        v,
+        out_ref,
+        lse_ref,
+        q2k_block_index,
+        block_sparse_num,
+        None,
+        q2k_block_nums=q2k_block_nums,
+        softmax_scale=softmax_scale,
+        q_bucket_size_blocks=2,
+    )
+
+    _assert_bwd_close("sm90 old-k2q sparse block_sizes=None", old_k2q, refs, tols)
+    _assert_bwd_close("sm90 default-qbucket sparse block_sizes=None", default_qbucket, refs, tols)
+    _assert_bwd_close("sm90 direct-qbucket sparse block_sizes=None", direct_qbucket, refs, tols)
+    old_new = tuple(_max_abs(a, b) for a, b in zip(old_k2q, direct_qbucket))
+    print(
+        "  compare old-k2q vs direct-qbucket: "
+        f"dq={old_new[0]:.4f} dk={old_new[1]:.4f} dv={old_new[2]:.4f}"
+    )
+
+
+def test_flash_bwd_sm90_blk64_dense_qbucket_compare_no_block_sizes():
+    if _cuda_major() != 9:
+        pytest.skip("SM90 test")
+    device = "cuda"
+    dtype = torch.bfloat16
+    bs, nheads, seqlen_q, seqlen_k, d = 1, 2, 512, 768, 128
+
+    torch.manual_seed(321)
+    torch.cuda.empty_cache()
+
+    q = torch.randn(bs, nheads, seqlen_q, d, device=device, dtype=dtype)
+    k = torch.randn(bs, nheads, seqlen_k, d, device=device, dtype=dtype)
+    v = torch.randn(bs, nheads, seqlen_k, d, device=device, dtype=dtype)
+    dout = torch.randn_like(q)
+
+    q2k_block_index, block_sparse_num, _block_sizes = _make_dense_blk64_args(
+        bs, seqlen_q, seqlen_k, nheads, device=device
+    )
+    ref_block_sizes = _full_block_sizes(seqlen_k, device=device)
+    attn_bias = block_sparse_to_attn_bias(
+        q2k_block_index,
+        block_sparse_num,
+        ref_block_sizes,
+        seqlen_q,
+        seqlen_k,
+        blk_m=BLK,
+        blk_n=BLK,
+    )
+    softmax_scale = 1.0 / math.sqrt(d)
+    out_ref, lse_ref, dq_ref, dk_ref, dv_ref = _torch_ref_bwd(
+        q, k, v, dout, attn_bias, softmax_scale,
+    )
+    _, _, dq_pt, dk_pt, dv_pt = _torch_ref_bwd(
+        q, k, v, dout, attn_bias, softmax_scale, upcast=False,
+    )
+    refs = _sanitize_grads(dq_ref, dk_ref, dv_ref)
+    tols = _grad_tols(refs, _sanitize_grads(dq_pt, dk_pt, dv_pt))
+
+    dense_path = bsa_attn_bwd(
+        dout,
+        q,
+        k,
+        v,
+        out_ref,
+        lse_ref,
+        q2k_block_index,
+        block_sparse_num,
+        None,
+        softmax_scale=softmax_scale,
+    )
+    qbucket_split_path = bsa_attn_bwd_qbucket(
+        dout,
+        q,
+        k,
+        v,
+        out_ref,
+        lse_ref,
+        q2k_block_index,
+        block_sparse_num,
+        None,
+        softmax_scale=softmax_scale,
+        q_bucket_size_blocks=2,
+    )
+
+    _assert_bwd_close("sm90 dense path block_sizes=None", dense_path, refs, tols)
+    _assert_bwd_close(
+        "sm90 qbucket split dense-equivalent block_sizes=None",
+        qbucket_split_path,
+        refs,
+        tols,
+    )
+    dense_qbucket = tuple(_max_abs(a, b) for a, b in zip(dense_path, qbucket_split_path))
+    print(
+        "  compare dense path vs qbucket split: "
+        f"dq={dense_qbucket[0]:.4f} dk={dense_qbucket[1]:.4f} dv={dense_qbucket[2]:.4f}"
+    )
+
+
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -408,6 +662,10 @@ def _bench_bwd_one(dout, q, k, v, out, lse, q2k, bsn, bsize, q2k_block_nums=None
         if impl == "baseline":
             bsa_attn_bwd(dout, q, k, v, out, lse, q2k, bsn, bsize,
                          q2k_block_nums=q2k_block_nums)
+        elif impl == "k2q":
+            with _sm90_qbucket_default(False):
+                bsa_attn_bwd(dout, q, k, v, out, lse, q2k, bsn, bsize,
+                             q2k_block_nums=q2k_block_nums)
         elif impl == "qbuck":
             bsa_attn_bwd_qbucket(
                 dout, q, k, v, out, lse, q2k, bsn, bsize,
@@ -483,8 +741,16 @@ def run_benchmark_suite():
                 q2k, bsn, bsize = make_dense_block_sparse_args(
                     bs, seqlen_q, seqlen_k, nheads, blk_m=BLK, blk_n=BLK, device=device,
                 )
+                if not use_block_sizes:
+                    bsize = None
                 q2k_block_nums = None
-                label = f"bs={bs} h={nheads} sq={seqlen_q} sk={seqlen_k} d={hdim} dense"
+                block_sizes_label = (
+                    f"bsz={block_size_mode}" if use_block_sizes else "bsz=0"
+                )
+                label = (
+                    f"bs={bs} h={nheads} sq={seqlen_q} sk={seqlen_k} "
+                    f"d={hdim} dense {block_sizes_label}"
+                )
                 effective_sk = seqlen_k
             else:
                 if topk > num_kv_blocks:

@@ -28,7 +28,10 @@ from csrc.bwd.sm100_blk64.flash_bwd_sm100_qbucket import (
     BlockSparseAttnBackwardQRangeBucketed,
 )
 from csrc.bwd.sm90_blk64.block_sparsity import BlockSparseTensorsTorch
-from csrc.bwd.sm90_blk64.flash_bwd_sm90 import bsa_attn_bwd_sm90
+from csrc.bwd.sm90_blk64.flash_bwd_sm90 import (
+    bsa_attn_bwd_sm90,
+    bsa_attn_bwd_sm90_qbucket_from_tasks,
+)
 
 try:
     import bsa_fwd_blk64_ext  # triggers TORCH_LIBRARY registration of bsa_blk64.fwd
@@ -39,6 +42,8 @@ BSA_BWD_SPARSE_BLOCK_SIZE = 64
 BSA_BWD_HEAD_DIM = 128
 BSA_BWD_AUTO_QBUCKET = os.environ.get("BSA_BWD_AUTO_QBUCKET", "1") == "1"
 BSA_BWD_AUTO_Q_BUCKET_BLOCKS = int(os.environ.get("BSA_BWD_AUTO_Q_BUCKET_BLOCKS", "1024"))
+BSA_SM90_BWD_QBUCKET = os.environ.get("BSA_SM90_BWD_QBUCKET", "1") == "1"
+BSA_SM90_BWD_Q_BUCKET_BLOCKS = int(os.environ.get("BSA_SM90_BWD_Q_BUCKET_BLOCKS", "384"))
 
 _bsa_clc_enabled: bool = os.environ.get("BSA_CLC", "1") == "1"
 
@@ -484,6 +489,24 @@ def bsa_attn_bwd(
 
         block_sparse_tensors = None
         if not sm90_dense_equivalent:
+            if BSA_SM90_BWD_QBUCKET:
+                return bsa_attn_bwd_qbucket(
+                    dout,
+                    q,
+                    k,
+                    v,
+                    out,
+                    lse,
+                    q2k_block_index,
+                    block_sparse_num,
+                    block_sizes=block_sizes,
+                    q2k_block_nums=q2k_block_nums,
+                    softmax_scale=softmax_scale,
+                    dq=dq,
+                    dk=dk,
+                    dv=dv,
+                    q_bucket_size_blocks=BSA_SM90_BWD_Q_BUCKET_BLOCKS,
+                )
             k2q_block_index, k2q_block_nums = convert_q2k_to_k2q(
                 q2k_block_index,
                 block_sparse_num,
@@ -1084,13 +1107,17 @@ def bsa_attn_bwd_qbucket(
     assert lse.shape == (batch_size, num_heads, seqlen_q)
 
     arch = _get_device_arch()
-    assert arch // 10 in [10, 11], "BSA q-bucket bwd only supports SM100/SM110"
+    assert arch // 10 in [9, 10, 11], "BSA q-bucket bwd only supports SM90/SM100/SM110"
 
     sparse_block_size = BSA_BWD_SPARSE_BLOCK_SIZE
     num_q_blocks = (seqlen_q + sparse_block_size - 1) // sparse_block_size
     num_kv_blocks = (seqlen_k + sparse_block_size - 1) // sparse_block_size
     if q_bucket_size_blocks is None or q_bucket_size_blocks <= 0:
-        q_bucket_size_blocks = _default_q_bucket_size_blocks(num_q_blocks)
+        q_bucket_size_blocks = (
+            BSA_SM90_BWD_Q_BUCKET_BLOCKS
+            if arch // 10 == 9
+            else _default_q_bucket_size_blocks(num_q_blocks)
+        )
 
     assert q2k_block_index.dtype == torch.int32
     assert q2k_block_index.shape[:3] == (batch_size, num_heads, num_q_blocks)
@@ -1127,6 +1154,29 @@ def bsa_attn_bwd_qbucket(
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    if arch // 10 == 9:
+        if dq is None:
+            dq = torch.empty_like(q)
+        if dk is None:
+            dk = torch.empty_like(k)
+        if dv is None:
+            dv = torch.empty_like(v)
+        return bsa_attn_bwd_sm90_qbucket_from_tasks(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            lse,
+            task_offsets,
+            task_q_indices,
+            block_sizes=block_sizes,
+            softmax_scale=softmax_scale,
+            dq=dq,
+            dk=dk,
+            dv=dv,
+        )
 
     if dq is None:
         dq = torch.empty_like(q)
