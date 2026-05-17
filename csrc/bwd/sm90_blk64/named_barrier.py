@@ -16,6 +16,8 @@ class NamedBarrierBwd(enum.IntEnum):
     dQEmptyWG0 = 12
     dQEmptyWG1 = 13
     dQEmptyWG2 = 14
+    EpilogueV = 11
+    EpilogueK = 14
     WarpSchedulerWG1 = 15
     WarpSchedulerWG2 = 15
     WarpSchedulerWG3 = 15

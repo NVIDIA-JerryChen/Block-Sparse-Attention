@@ -1,4 +1,5 @@
 import math
+import os
 from typing import Optional, Tuple
 
 import cuda.bindings.driver as cuda
@@ -106,8 +107,19 @@ class BlockSparseAttnBackwardSm90:
         stream: cuda.CUstream,
         blocksparse_tensors=None,
         skip_score_mask: bool = False,
+        sdp_swap_ab: bool = False,
+        kv_in_regs: bool = False,
+        dkv_rs_wg1: bool = False,
+        dkv_rs_split: bool = False,
     ):
         wg_specialized_pipeline = blocksparse_tensors is None
+        assert not kv_in_regs or wg_specialized_pipeline, "KV-in-regs is dense-only"
+        assert not kv_in_regs or sdp_swap_ab, "KV-in-regs requires SdP_swapAB"
+        assert not dkv_rs_wg1 or wg_specialized_pipeline, "WG1 dKV-RS is dense-only"
+        assert not dkv_rs_wg1 or sdp_swap_ab, "WG1 dKV-RS requires SdP_swapAB"
+        assert not dkv_rs_split or wg_specialized_pipeline, "Split dKV-RS is dense-only"
+        assert not dkv_rs_split or sdp_swap_ab, "Split dKV-RS requires SdP_swapAB"
+        assert not (dkv_rs_wg1 and dkv_rs_split), "dKV-RS experiments are mutually exclusive"
         bwd = FlashAttentionBackwardSm90(
             self.dtype,
             self.head_dim,
@@ -121,17 +133,19 @@ class BlockSparseAttnBackwardSm90:
             Q_stage=2,
             dO_stage=2,
             PdS_stage=1,
-            SdP_swapAB=False,
+            SdP_swapAB=sdp_swap_ab,
             dKV_swapAB=not wg_specialized_pipeline,
             dQ_swapAB=False,
             AtomLayoutMSdP=1,
             AtomLayoutNdKV=2,
             AtomLayoutMdQ=1,
             num_threads=self.num_threads,
-            V_in_regs=False,
+            V_in_regs=kv_in_regs,
             dQ_single_wg=wg_specialized_pipeline,
             wg_specialized_pipeline=wg_specialized_pipeline,
             skip_score_mask=skip_score_mask,
+            dKV_rs_wg1=dkv_rs_wg1,
+            dKV_rs_split=dkv_rs_split,
         )
         return cute.compile(
             bwd,
@@ -261,6 +275,28 @@ def bsa_attn_bwd_sm90(
         if is_fake_mode()
         else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     )
+    sdp_swap_ab = os.environ.get("BSA_SM90_BWD_SDP_SWAPAB", "0") == "1"
+    kv_in_regs = (
+        normalized_block_sparse_tensors is None
+        and os.environ.get("BSA_SM90_BWD_KV_REGS", "1") != "0"
+    )
+    dkv_rs_wg1 = (
+        normalized_block_sparse_tensors is None
+        and os.environ.get("BSA_SM90_BWD_DKV_RS_WG1", "0") == "1"
+    )
+    dkv_rs_split_env = os.environ.get("BSA_SM90_BWD_DKV_RS_SPLIT", "1")
+    dkv_rs_split = (
+        normalized_block_sparse_tensors is None
+        and not dkv_rs_wg1
+        and dkv_rs_split_env != "0"
+    )
+    assert not (dkv_rs_wg1 and dkv_rs_split), "dKV-RS experiments are mutually exclusive"
+    if dkv_rs_wg1:
+        sdp_swap_ab = True
+    if dkv_rs_split:
+        sdp_swap_ab = True
+    if kv_in_regs:
+        sdp_swap_ab = True
 
     main_key = (
         q.dtype,
@@ -271,6 +307,10 @@ def bsa_attn_bwd_sm90(
         block_sparse_broadcast_pattern,
         block_sizes is not None,
         block_sizes is None and block_sparse_tensors is None and seqlen_k % kernel.tile_n == 0,
+        sdp_swap_ab,
+        kv_in_regs,
+        dkv_rs_wg1,
+        dkv_rs_split,
     )
 
     _bwd_preprocess(
@@ -313,6 +353,10 @@ def bsa_attn_bwd_sm90(
                 and normalized_block_sparse_tensors is None
                 and seqlen_k % kernel.tile_n == 0
             ),
+            sdp_swap_ab=sdp_swap_ab,
+            kv_in_regs=kv_in_regs,
+            dkv_rs_wg1=dkv_rs_wg1,
+            dkv_rs_split=dkv_rs_split,
         )
 
     if not is_fake_mode():
