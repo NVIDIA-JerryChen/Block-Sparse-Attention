@@ -111,6 +111,9 @@ class BlockSparseAttnBackwardSm90:
         kv_in_regs: bool = False,
         dkv_rs_wg1: bool = False,
         dkv_rs_split: bool = False,
+        dqaccum_stage: int = 1,
+        pds_stage: int = 1,
+        qdo_stage: int = 2,
     ):
         wg_specialized_pipeline = blocksparse_tensors is None
         assert not kv_in_regs or wg_specialized_pipeline, "KV-in-regs is dense-only"
@@ -120,6 +123,9 @@ class BlockSparseAttnBackwardSm90:
         assert not dkv_rs_split or wg_specialized_pipeline, "Split dKV-RS is dense-only"
         assert not dkv_rs_split or sdp_swap_ab, "Split dKV-RS requires SdP_swapAB"
         assert not (dkv_rs_wg1 and dkv_rs_split), "dKV-RS experiments are mutually exclusive"
+        assert pds_stage in [1, 2], "PdS stage must be 1 or 2"
+        assert qdo_stage in [1, 2, 3], "Q/dO stage must be 1, 2, or 3"
+        assert pds_stage == 1 or pds_stage == qdo_stage, "PdS stage must be 1 or match Q/dO stage"
         bwd = FlashAttentionBackwardSm90(
             self.dtype,
             self.head_dim,
@@ -130,9 +136,9 @@ class BlockSparseAttnBackwardSm90:
             deterministic=False,
             tile_m=self.tile_m,
             tile_n=self.tile_n,
-            Q_stage=2,
-            dO_stage=2,
-            PdS_stage=1,
+            Q_stage=qdo_stage,
+            dO_stage=qdo_stage,
+            PdS_stage=pds_stage,
             SdP_swapAB=sdp_swap_ab,
             dKV_swapAB=not wg_specialized_pipeline,
             dQ_swapAB=False,
@@ -146,7 +152,12 @@ class BlockSparseAttnBackwardSm90:
             skip_score_mask=skip_score_mask,
             dKV_rs_wg1=dkv_rs_wg1,
             dKV_rs_split=dkv_rs_split,
+            dQaccum_stage=dqaccum_stage,
         )
+        compile_options = "--enable-tvm-ffi"
+        dump_dir = os.environ.get("BSA_SM90_BWD_DUMP_DIR")
+        if dump_dir:
+            compile_options += f" --dump-dir={dump_dir} --keep-cubin --keep-ptx"
         return cute.compile(
             bwd,
             mQ,
@@ -172,7 +183,7 @@ class BlockSparseAttnBackwardSm90:
             None,
             blocksparse_tensors,
             stream,
-            options="--enable-tvm-ffi",
+            options=compile_options,
         )
 
 
@@ -297,6 +308,17 @@ def bsa_attn_bwd_sm90(
         sdp_swap_ab = True
     if kv_in_regs:
         sdp_swap_ab = True
+    dqaccum_stage = int(os.environ.get("BSA_SM90_BWD_DQACCUM_STAGE", "1"))
+    assert dqaccum_stage in [1, 2, 3], "BSA_SM90_BWD_DQACCUM_STAGE must be 1, 2, or 3"
+    pds_stage = int(os.environ.get("BSA_SM90_BWD_PDS_STAGE", "1"))
+    assert pds_stage in [1, 2], "BSA_SM90_BWD_PDS_STAGE must be 1 or 2"
+    qdo_stage_default = "3" if normalized_block_sparse_tensors is None else "2"
+    qdo_stage = int(os.environ.get("BSA_SM90_BWD_QDO_STAGE", qdo_stage_default))
+    assert qdo_stage in [1, 2, 3], "BSA_SM90_BWD_QDO_STAGE must be 1, 2, or 3"
+    if pds_stage > qdo_stage:
+        pds_stage = qdo_stage
+    if pds_stage != 1 and pds_stage != qdo_stage:
+        pds_stage = 1
 
     main_key = (
         q.dtype,
@@ -311,6 +333,9 @@ def bsa_attn_bwd_sm90(
         kv_in_regs,
         dkv_rs_wg1,
         dkv_rs_split,
+        dqaccum_stage,
+        pds_stage,
+        qdo_stage,
     )
 
     _bwd_preprocess(
@@ -357,6 +382,9 @@ def bsa_attn_bwd_sm90(
             kv_in_regs=kv_in_regs,
             dkv_rs_wg1=dkv_rs_wg1,
             dkv_rs_split=dkv_rs_split,
+            dqaccum_stage=dqaccum_stage,
+            pds_stage=pds_stage,
+            qdo_stage=qdo_stage,
         )
 
     if not is_fake_mode():

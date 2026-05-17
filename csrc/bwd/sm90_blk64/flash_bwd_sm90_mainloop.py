@@ -81,6 +81,7 @@ class FlashAttentionBackwardSm90:
         skip_score_mask: bool = False,
         dKV_rs_wg1: bool = False,
         dKV_rs_split: bool = False,
+        dQaccum_stage: int = 1,
     ):
         assert head_dim == 128, "SM90 blk64 BSA bwd is currently specialized for D=128"
         assert head_dim_v in [None, 128], "SM90 blk64 BSA bwd is currently specialized for Dv=128"
@@ -89,7 +90,11 @@ class FlashAttentionBackwardSm90:
         assert not is_local, "SM90 blk64 BSA bwd currently supports global attention only"
         assert not deterministic, "SM90 blk64 BSA bwd uses non-deterministic dQ reductions"
         assert tile_m == 64 and tile_n == 64, "SM90 blk64 BSA bwd requires 64x64 tiles"
-        assert Q_stage == 2 and dO_stage == 2, "SM90 blk64 BSA bwd keeps Q/dO double-buffered"
+        assert Q_stage == dO_stage and Q_stage in [
+            1,
+            2,
+            3,
+        ], "SM90 blk64 BSA bwd supports matching 1/2/3-stage Q/dO buffers"
         assert PdS_stage in [1, 2], "SM90 blk64 BSA bwd uses one or two P/dS smem stages"
         assert num_threads == 384, "SM90 blk64 BSA bwd assumes WG0 + two MMA WGs"
         assert not V_in_regs or (
@@ -120,7 +125,7 @@ class FlashAttentionBackwardSm90:
         self.dO_stage = dO_stage
         self.PdS_stage = PdS_stage
         assert self.dO_stage in [1, self.Q_stage]
-        assert self.PdS_stage in [1, self.Q_stage]
+        assert self.PdS_stage == 1 or self.PdS_stage == self.Q_stage
         self.SdP_swapAB = SdP_swapAB
         self.dKV_swapAB = dKV_swapAB
         self.dQ_swapAB = dQ_swapAB
@@ -170,7 +175,7 @@ class FlashAttentionBackwardSm90:
         self.skip_score_mask = skip_score_mask
         self.dKV_rs_wg1 = dKV_rs_wg1
         self.dKV_rs_split = dKV_rs_split
-        self.dQaccum_stage = 2 if wg_specialized_pipeline else 1
+        self.dQaccum_stage = dQaccum_stage if wg_specialized_pipeline else 1
         self.num_dQ_store_warps = 1
         if wg_specialized_pipeline:
             assert self.num_wg_mma == 2, "WG-specialized pipeline assumes two MMA WGs"
@@ -178,6 +183,7 @@ class FlashAttentionBackwardSm90:
             assert not dKV_rs_wg1 or SdP_swapAB, "WG1 dKV-RS requires SdP_swapAB"
             assert not dKV_rs_split or SdP_swapAB, "Split dKV-RS requires SdP_swapAB"
             assert not (dKV_rs_wg1 and dKV_rs_split), "dKV-RS experiments are mutually exclusive"
+            assert dQaccum_stage in [1, 2, 3], "WG-specialized dQaccum stage must be 1, 2, or 3"
             assert not skip_score_mask or (
                 not is_causal and not is_local and mask_mod is None
             ), "skip_score_mask is only valid for dense unmasked full tiles"
@@ -1858,7 +1864,6 @@ class FlashAttentionBackwardSm90:
                 tdKrdS = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_dP), self.dtype)
                 copy_dS_r2s(tdKrdS, dst_idx=smem_idx_PdS)
                 cute.arch.fence_view_async_shared()
-
                 acc_dQ = mma_dsk_fn(A_idx=smem_idx_PdS, wg_wait=-1)
                 gemm_w_idx(
                     tiled_mma_dK,
