@@ -27,6 +27,8 @@ from csrc.bwd.sm100_blk64.flash_bwd_sm100 import BlockSparseAttnBackward
 from csrc.bwd.sm100_blk64.flash_bwd_sm100_qbucket import (
     BlockSparseAttnBackwardQRangeBucketed,
 )
+from csrc.bwd.sm90_blk64.block_sparsity import BlockSparseTensorsTorch
+from csrc.bwd.sm90_blk64.flash_bwd_sm90 import bsa_attn_bwd_sm90
 
 try:
     import bsa_fwd_blk64_ext  # triggers TORCH_LIBRARY registration of bsa_blk64.fwd
@@ -437,7 +439,7 @@ def bsa_attn_bwd(
     assert lse.shape == (batch_size, num_heads, seqlen_q)
 
     arch = _get_device_arch()
-    assert arch // 10 in [10, 11], "BSA bwd only supports SM100/SM110"
+    assert arch // 10 in [9, 10, 11], "BSA bwd only supports SM90/SM100/SM110"
 
     sparse_block_size = BSA_BWD_SPARSE_BLOCK_SIZE
     num_q_blocks = (seqlen_q + sparse_block_size - 1) // sparse_block_size
@@ -451,9 +453,65 @@ def bsa_attn_bwd(
     if q2k_block_nums is not None:
         assert q2k_block_nums.dtype == torch.int32
         assert q2k_block_nums.shape == (batch_size, num_heads, num_q_blocks)
+    else:
+        assert q2k_block_index.shape[-1] >= block_sparse_num, (
+            f"q2k_block_index last dim ({q2k_block_index.shape[-1]}) must be >= "
+            f"block_sparse_num ({block_sparse_num})"
+        )
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    if arch // 10 == 9:
+        sm90_dense_equivalent = q2k_block_nums is None and block_sparse_num == num_kv_blocks
+        if not is_fake_mode():
+            if sm90_dense_equivalent:
+                expected_q2k = torch.arange(
+                    num_kv_blocks, dtype=torch.int32, device=q2k_block_index.device
+                )
+                sm90_dense_equivalent = torch.all(
+                    q2k_block_index[..., :num_kv_blocks] == expected_q2k
+                ).item()
+        sm90_block_sizes = None
+        if block_sizes is not None:
+            assert block_sizes.dtype == torch.int32
+            if block_sizes.ndim == 1:
+                assert block_sizes.shape == (num_kv_blocks,)
+                sm90_block_sizes = block_sizes.unsqueeze(0).expand(batch_size, -1).contiguous()
+            else:
+                assert block_sizes.shape == (batch_size, num_kv_blocks)
+                sm90_block_sizes = block_sizes.contiguous()
+
+        block_sparse_tensors = None
+        if not sm90_dense_equivalent:
+            k2q_block_index, k2q_block_nums = convert_q2k_to_k2q(
+                q2k_block_index,
+                block_sparse_num,
+                num_kv_blocks,
+                q2k_block_nums=q2k_block_nums,
+            )
+            block_sparse_tensors = BlockSparseTensorsTorch(
+                mask_block_cnt=k2q_block_nums,
+                mask_block_idx=k2q_block_index,
+                full_block_cnt=None,
+                full_block_idx=None,
+                block_size=(sparse_block_size, sparse_block_size),
+            )
+
+        return bsa_attn_bwd_sm90(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            lse,
+            softmax_scale=softmax_scale,
+            dq=dq,
+            dk=dk,
+            dv=dv,
+            block_sparse_tensors=block_sparse_tensors,
+            block_sizes=sm90_block_sizes,
+        )
 
     if (
         BSA_BWD_AUTO_QBUCKET

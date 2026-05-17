@@ -167,7 +167,88 @@ def _test_bwd_single(
     )
 
 
+def _make_dense_blk64_args(batch_size, seqlen_q, seqlen_k, nheads, device="cuda"):
+    num_q_blocks = (seqlen_q + BLK - 1) // BLK
+    num_kv_blocks = (seqlen_k + BLK - 1) // BLK
+    indices = torch.arange(num_kv_blocks, dtype=torch.int32, device=device)
+    q2k_block_index = indices[None, None, None, :].expand(
+        batch_size, nheads, num_q_blocks, num_kv_blocks
+    ).contiguous()
+    block_sizes = torch.full((num_kv_blocks,), BLK, dtype=torch.int32, device=device)
+    tail = seqlen_k - (num_kv_blocks - 1) * BLK
+    block_sizes[-1] = tail
+    return q2k_block_index, num_kv_blocks, block_sizes
+
+
+def _test_bwd_dense_single(bs, seqlen_q, seqlen_k, nheads):
+    device = "cuda"
+    dtype = torch.bfloat16
+    d = 128
+
+    torch.manual_seed(0)
+    torch.cuda.empty_cache()
+
+    q = torch.randn(bs, nheads, seqlen_q, d, device=device, dtype=dtype)
+    k = torch.randn(bs, nheads, seqlen_k, d, device=device, dtype=dtype)
+    v = torch.randn(bs, nheads, seqlen_k, d, device=device, dtype=dtype)
+    dout = torch.randn_like(q)
+
+    q2k_block_index, block_sparse_num, block_sizes = _make_dense_blk64_args(
+        bs, seqlen_q, seqlen_k, nheads, device=device
+    )
+    attn_bias = block_sparse_to_attn_bias(
+        q2k_block_index, block_sparse_num, block_sizes, seqlen_q, seqlen_k,
+        blk_m=BLK, blk_n=BLK,
+    )
+
+    softmax_scale = 1.0 / math.sqrt(d)
+    out_ref, lse_ref, dq_ref, dk_ref, dv_ref = _torch_ref_bwd(
+        q, k, v, dout, attn_bias, softmax_scale,
+    )
+    _, _, dq_pt, dk_pt, dv_pt = _torch_ref_bwd(
+        q, k, v, dout, attn_bias, softmax_scale, upcast=False,
+    )
+
+    dq, dk, dv = bsa_attn_bwd(
+        dout, q, k, v, out_ref, lse_ref,
+        q2k_block_index, block_sparse_num, block_sizes,
+        softmax_scale=softmax_scale,
+    )
+
+    def _max_abs(a, b):
+        return (a.float() - b.float()).abs().max().item()
+
+    def _tol(ref, pt):
+        ref = torch.nan_to_num(ref.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        pt = torch.nan_to_num(pt.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        pt_diff = (pt - ref).abs().max().item()
+        bf16_eps = (ref + 0.3 - 0.3 - ref).abs().max().item()
+        return 3 * pt_diff + 3 * bf16_eps + 5e-3
+
+    dq_diff = _max_abs(dq, dq_ref)
+    dk_diff = _max_abs(dk, dk_ref)
+    dv_diff = _max_abs(dv, dv_ref)
+    dq_tol = _tol(dq_ref, dq_pt)
+    dk_tol = _tol(dk_ref, dk_pt)
+    dv_tol = _tol(dv_ref, dv_pt)
+    passed = dq_diff <= dq_tol and dk_diff <= dk_tol and dv_diff <= dv_tol
+    print(
+        f"  {'PASS' if passed else 'FAIL'} dense bs={bs} sq={seqlen_q} sk={seqlen_k} h={nheads}: "
+        f"dq={dq_diff:.4f}/{dq_tol:.4f} "
+        f"dk={dk_diff:.4f}/{dk_tol:.4f} "
+        f"dv={dv_diff:.4f}/{dv_tol:.4f}"
+    )
+    assert passed, (
+        f"dq_diff={dq_diff}>tol={dq_tol}, dk_diff={dk_diff}>tol={dk_tol}, "
+        f"dv_diff={dv_diff}>tol={dv_tol}"
+    )
+
+
 # ============== Pytest ==============
+
+def _cuda_major():
+    return torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
+
 
 @pytest.mark.parametrize("use_variable_block_nums", [False, True])
 @pytest.mark.parametrize(
@@ -183,6 +264,8 @@ def _test_bwd_single(
     ],
 )
 def test_flash_bwd_sm100_blk64(seqlen_q, seqlen_k, use_variable_block_nums):
+    if _cuda_major() not in [10, 11]:
+        pytest.skip("SM100/SM110 test")
     bs = 2 if seqlen_k <= 512 else 1
     nheads = 4
     _test_bwd_single(bs, seqlen_q, seqlen_k, nheads,
@@ -199,6 +282,8 @@ def test_flash_bwd_sm100_blk64(seqlen_q, seqlen_k, use_variable_block_nums):
     ],
 )
 def test_flash_bwd_qbucket_sm100_blk64(seqlen_q, seqlen_k, use_variable_block_nums):
+    if _cuda_major() not in [10, 11]:
+        pytest.skip("SM100/SM110 test")
     bs = 2 if seqlen_k <= 512 else 1
     nheads = 4
     _test_bwd_single(
@@ -213,6 +298,8 @@ def test_flash_bwd_qbucket_sm100_blk64(seqlen_q, seqlen_k, use_variable_block_nu
 
 @pytest.mark.parametrize("use_variable_block_nums", [False, True])
 def test_flash_bwd_qbucket_multi_group_sm100_blk64(use_variable_block_nums):
+    if _cuda_major() not in [10, 11]:
+        pytest.skip("SM100/SM110 test")
     _test_bwd_single(
         1,
         512,
@@ -222,6 +309,46 @@ def test_flash_bwd_qbucket_multi_group_sm100_blk64(use_variable_block_nums):
         impl="qbuck",
         q_bucket_size_blocks=2,
     )
+
+
+@pytest.mark.parametrize("use_variable_block_nums", [False, True])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (128, 256),
+        (128, 384),
+    ],
+)
+def test_flash_bwd_sm90_blk64_sparse(seqlen_q, seqlen_k, use_variable_block_nums):
+    if _cuda_major() != 9:
+        pytest.skip("SM90 test")
+    _test_bwd_single(
+        1,
+        seqlen_q,
+        seqlen_k,
+        2,
+        use_variable_block_nums=use_variable_block_nums,
+    )
+
+
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (64, 256),
+        (128, 256),
+        (128, 512),
+        (256, 512),
+        (256, 1024),
+        (512, 512),
+        (1024, 1024),
+    ],
+)
+def test_flash_bwd_sm90_blk64_dense(seqlen_q, seqlen_k):
+    if _cuda_major() != 9:
+        pytest.skip("SM90 test")
+    bs = 2 if seqlen_k <= 512 else 1
+    nheads = 4
+    _test_bwd_dense_single(bs, seqlen_q, seqlen_k, nheads)
 
 
 # ============== Quick test (make ttb) ==============
