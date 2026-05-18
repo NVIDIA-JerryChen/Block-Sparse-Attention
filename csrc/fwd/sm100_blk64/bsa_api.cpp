@@ -9,6 +9,7 @@
 // Q/K/V are consumed in the caller-provided natural BHSD layout.
 
 #include <cmath>
+#include <limits>
 #include <tuple>
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
@@ -18,12 +19,25 @@
 
 namespace flash {
 
+namespace {
+
+void check_bhsd_view(torch::Tensor const& t, char const* name) {
+    TORCH_CHECK(t.stride(3) == 1, name, " must have head_dim stride 1");
+    TORCH_CHECK(t.stride(0) > 0 && t.stride(1) > 0 && t.stride(2) > 0,
+                name, " must have positive B/H/S strides");
+    TORCH_CHECK(t.stride(1) <= std::numeric_limits<int>::max()
+                && t.stride(2) <= std::numeric_limits<int>::max(),
+                name, " head/seqlen strides must fit int32");
+}
+
+} // namespace
+
 // Defined in bsa_fwd_launch_template.h, instantiated in instantiations/bsa_fwd_hdim128_bf16_hbs{0,1}_hvbn{0,1}_{,clc_}sm100.cu
 template<int kHeadDim, bool HasBlockSizes, bool HasVarBlockNums, bool UseClc>
 void run_bsa_fwd(bsa_fwd_params const&, cudaStream_t);
 
 // FA Hopper pattern: populate bsa_fwd_params from torch tensors.
-// BHSD-only: stride(1) is the head stride, stride(2) is the seqlen stride.
+// Logical BHSD: stride(1) is the head stride, stride(2) is the seqlen stride.
 void set_params_fprop(bsa_fwd_params &params,
                       int b, int seqlen_q, int seqlen_k, int h, int h_k, int d,
                       const torch::Tensor &q, const torch::Tensor &k, const torch::Tensor &v,
@@ -40,7 +54,7 @@ void set_params_fprop(bsa_fwd_params &params,
     params.o_ptr = out.data_ptr();
     params.softmax_lse_ptr = lse.data_ptr();
 
-    // BHSD: axis 0=batch, 1=head, 2=seq, 3=dim (stride 1).
+    // Logical BHSD: axis 0=batch, 1=head, 2=seq, 3=dim (stride 1).
     params.q_batch_stride = q.stride(0);   params.q_head_stride = q.stride(1);   params.q_row_stride = q.stride(2);
     params.k_batch_stride = k.stride(0);   params.k_head_stride = k.stride(1);   params.k_row_stride = k.stride(2);
     params.v_batch_stride = v.stride(0);   params.v_head_stride = v.stride(1);   params.v_row_stride = v.stride(2);
@@ -61,7 +75,9 @@ void set_params_fprop(bsa_fwd_params &params,
     params.scale_softmax_log2 = float(scale_softmax * M_LOG2E);
 }
 
-// Entry point: BHSD-only, zero-copy for Q/K/V.
+// Entry point: logical BHSD, zero-copy for Q/K/V. The tensors may be
+// non-contiguous views as long as head_dim is stride-1 and B/H/S strides are
+// representable by the TMA descriptors.
 std::tuple<torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_impl(
         torch::Tensor q, torch::Tensor k, torch::Tensor v,
         torch::Tensor q2k_block_index, int64_t block_sparse_num,
@@ -72,8 +88,10 @@ std::tuple<torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_impl(
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "q/k/v must be CUDA");
     TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "q/k/v must be 4D");
     TORCH_CHECK(q.size(3) == 128, "requires D=128");
-    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
-                "q/k/v must be BHSD-contiguous");
+    TORCH_CHECK(k.size(3) == 128 && v.size(3) == 128, "k/v require D=128");
+    check_bhsd_view(q, "q");
+    check_bhsd_view(k, "k");
+    check_bhsd_view(v, "v");
 
     // BHSD: (batch, num_heads, seqlen, head_dim)
     const int b = q.size(0);
@@ -96,13 +114,16 @@ std::tuple<torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_impl(
     const int seqlen_k_rounded = ((seqlen_k + kSparseBlockSize - 1) / kSparseBlockSize) * kSparseBlockSize;
     const int num_m_blocks = (seqlen_q + kRows - 1) / kRows;
 
-    // ======== Output (BHSD) ========
+    // ======== Output (logical BHSD, matching Q layout) ========
     // out: actual seqlen_q. O TMA descriptor is 4D with seq as a single mode
     //   (globalDim[seq] = seqlen_q), so the last partial tile's OOB rows are
     //   silently dropped by TMA store — no host pad / allocation rounding needed.
     // lse: actual seqlen_q; kernel has a row bounds-check around the thread-level
     //   store (matches blk128 pattern).
-    auto out = torch::empty({b, h, seqlen_q, kOutputCols}, q.options());
+    auto out = torch::empty_strided(
+        {b, h, seqlen_q, kOutputCols},
+        {q.stride(0), q.stride(1), q.stride(2), q.stride(3)},
+        q.options());
     auto lse = torch::empty({b, h, seqlen_q},
                             torch::dtype(torch::kFloat32).device(q.device()));
 
@@ -174,7 +195,7 @@ std::tuple<torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_impl(
         });
     });
 
-    // ======== Return BHSD output directly ========
+    // ======== Return logical BHSD output directly ========
     return std::make_tuple(out, lse);
 }
 
@@ -197,7 +218,8 @@ TORCH_LIBRARY(bsa_blk64, m) {
           "Tensor q2k_block_nums, bool use_clc) -> (Tensor, Tensor)");
 }
 // Note: schema uses "int" (maps to int64_t) and "float" (maps to double) in C++.
-// Tensors must be BHSD: (batch, num_heads, seqlen, head_dim).
+// Tensors must be logical BHSD: (batch, num_heads, seqlen, head_dim), with
+// head_dim stride 1. B/H/S strides may be dynamic.
 
 TORCH_LIBRARY_IMPL(bsa_blk64, CUDA, m) {
     m.impl("fwd", &flash::bsa_fused_fwd_blk64_impl);

@@ -7,65 +7,68 @@
 # https://github.com/NVIDIA/cutlass/tree/main/examples/77_blackwell_fmha
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
 
+import enum
 import math
-from typing import Type, Tuple, Callable, Optional, Literal
+import operator
+import types
+from dataclasses import dataclass
+from enum import IntEnum
 from functools import partial
+from typing import Callable, Literal, Optional, Protocol, Tuple, TypeAlias
+
+try:
+    from typing import override
+except ImportError:  # Python < 3.12
+    from typing_extensions import override
 
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Int64, Boolean, const_expr
-from cutlass.cute.nvgpu import cpasync
-import cutlass.cute.nvgpu.tcgen05 as tcgen05
-import cutlass.utils.blackwell_helpers as sm100_utils_basic
-from cutlass import pipeline
-from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-from cutlass.base_dsl.arch import Arch
-from cutlass.cutlass_dsl import BaseDSL
-
-from quack import copy_utils, layout_utils
-
-from .cute_dsl_utils import assume_tensor_aligned
-from . import utils
-from . import pipeline as pipeline_custom
-from .mask import apply_block_size_mask
-from .softmax import SoftmaxSm100
-from .seqlen_info import SeqlenInfoQK
-from .block_info import BlockInfo
-from .pack_gqa import PackGQA, pack_gqa_layout
-from . import mma_sm100_desc as sm100_desc
-from . import blackwell_helpers as sm100_utils
-from .named_barrier import NamedBarrierFwdSm100
-from quack.cute_dsl_utils import ParamsBase
 import cutlass.pipeline as cutlass_pipeline
-from .tile_scheduler import (
-    TileSchedulerArguments,
-    TileSchedulerProtocol,
-    SchedulingMode,
-    SingleTileScheduler,
-    StaticPersistentTileScheduler,
+from cutlass import Boolean, Float32, Int32, Int64, Uint32, const_expr, pipeline
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm, nvvm
+from cutlass.base_dsl.arch import Arch
+from cutlass.cutlass_dsl import BaseDSL, T, dsl_user_op, if_generate
+from cutlass.cute import FastDivmodDivisor
+from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.pipeline import (
+    NamedBarrier as NamedBarrierOg,
+    PipelineAsync as PipelineAsyncOg,
+    PipelineAsyncUmma as PipelineAsyncUmmaOg,
+    PipelineState,
+    PipelineTmaUmma as PipelineTmaUmmaOg,
+    PipelineUmmaAsync as PipelineUmmaAsyncOg,
+    pipeline_init_arrive,
+    pipeline_init_wait,
 )
+import cutlass.utils.blackwell_helpers as sm100_utils_basic
 
-class FlashAttentionForwardSm100:
+import quack.activation
+from quack import copy_utils, layout_utils
+from quack.cute_dsl_utils import ParamsBase
+
+# =============================================================================
+# Public Kernel Class
+# =============================================================================
+class BlockSparseAttnForwardSm100Blk128:
+    tile_m = 128
+    tile_n = 128
+    use_2cta_instrs_default = False
+    use_clc_scheduler_default = True
+    is_persistent_default = True
 
     def __init__(
         self,
-        # dtype: Type[cutlass.Numeric],
         head_dim: int,
         head_dim_v: Optional[int] = None,
         qhead_per_kvhead: cutlass.Constexpr[int] = 1,
-        pack_gqa: bool = False,
-        m_block_size: int = 128,
-        n_block_size: int = 128,
-        is_persistent: bool = True,
-        use_2cta_instrs: bool = False,
-        use_clc_scheduler: bool = False,
+        pack_gqa: Optional[bool] = None,
         allow_empty_block_nums: bool = False,
         has_block_sizes: bool = True,
     ):
         self.use_tma_KV = True
-        # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
         self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
@@ -75,14 +78,14 @@ class FlashAttentionForwardSm100:
         self.same_hdim_kv_padded = self.head_dim_padded == self.head_dim_v_padded
         self.check_hdim_oob = head_dim != self.head_dim_padded
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
-        self.m_block_size = m_block_size
-        self.n_block_size = n_block_size
+        self.m_block_size = self.tile_m
+        self.n_block_size = self.tile_n
         self.q_stage = 1
-        self.use_2cta_instrs = use_2cta_instrs
+        self.use_2cta_instrs = self.use_2cta_instrs_default
         # If split_P_arrive, the softmax warps write some columns of P first, signal to the MMA warp
         # to being the P @ V MMA, then write the rest of P and signal again. This allows some overlap
         # between compute the last couple columns of P and the P @ V MMA.
-        self.split_P_arrive = n_block_size // 4 * 3
+        self.split_P_arrive = self.n_block_size // 4 * 3
         self.split_P_arrive = int(self.split_P_arrive / 32) * 32  # multiple of 32
         assert self.split_P_arrive % 32 == 0
         assert self.split_P_arrive < self.n_block_size
@@ -91,18 +94,26 @@ class FlashAttentionForwardSm100:
 
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
         # cta_tiler M includes only 1 CTA, the scheduler will take into account the cluster shape
-        self.cta_tiler = (1 * m_block_size, n_block_size, self.head_dim_padded)
+        self.cta_tiler = (self.m_block_size, self.n_block_size, self.head_dim_padded)
         # With 2CTA, the MMA tiler M covers both CTAs, so it's cta_group_size * m_block_size.
         # Each CTA owns m_block_size rows; the 2CTA MMA instruction spans both.
-        self.mma_tiler_qk = (self.cta_group_size * m_block_size, n_block_size, self.head_dim_padded)
-        self.mma_tiler_pv = (self.cta_group_size * m_block_size, self.head_dim_v_padded, n_block_size)
+        self.mma_tiler_qk = (
+            self.cta_group_size * self.m_block_size,
+            self.n_block_size,
+            self.head_dim_padded,
+        )
+        self.mma_tiler_pv = (
+            self.cta_group_size * self.m_block_size,
+            self.head_dim_v_padded,
+            self.n_block_size,
+        )
         self.qk_acc_dtype = Float32
         self.pv_acc_dtype = Float32
         self.cluster_shape_mn = (2, 1) if self.use_2cta_instrs else (1, 1)
-        self.is_persistent = is_persistent
+        self.is_persistent = self.is_persistent_default
         # CLC persistent scheduling
         self.use_clc_scheduler = (
-            use_clc_scheduler
+            self.use_clc_scheduler_default
             and self.use_tma_KV
         )
         self.sched_stages = 1
@@ -121,13 +132,28 @@ class FlashAttentionForwardSm100:
         self.use_correction_warps_for_epi = False
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = False
+        if pack_gqa is None:
+            pack_gqa = qhead_per_kvhead > 1
+        if pack_gqa and (self.m_block_size % self.qhead_per_kvhead != 0):
+            pack_gqa = False
         self.pack_gqa = pack_gqa
         if pack_gqa:
-            assert m_block_size % self.qhead_per_kvhead == 0, (
+            assert self.m_block_size % self.qhead_per_kvhead == 0, (
                 "For PackGQA, m_block_size must be divisible by qhead_per_kvhead"
             )
         is_sm103 = self.arch >= Arch.sm_103 and self.arch <= Arch.sm_103f
-        self.enable_ex2_emu = (self.head_dim_padded <= 128 or (self.head_dim_padded == 192 and self.use_2cta_instrs and not self.is_causal and not self.is_local)) and not is_sm103
+        self.enable_ex2_emu = (
+            (
+                self.head_dim_padded <= 128
+                or (
+                    self.head_dim_padded == 192
+                    and self.use_2cta_instrs
+                    and not self.is_causal
+                    and not self.is_local
+                )
+            )
+            and not is_sm103
+        )
         self.s0_s1_barrier = False
         self.overlap_sO_sQ = (
             self.head_dim_padded == 192 and self.head_dim_v_padded >= 64
@@ -213,7 +239,7 @@ class FlashAttentionForwardSm100:
         kv_stage = (224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage
         if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
             # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
-             kv_stage = 3
+            kv_stage = 3
         self.kv_stage = kv_stage
         # self.s_stage is defined in __init__ (always 2)
         assert self.s_stage >= self.q_stage
@@ -267,15 +293,17 @@ class FlashAttentionForwardSm100:
         self.v_dtype = mV.element_type
         self.o_dtype = mO.element_type
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
-        Q_layout_transpose = [1, 3, 2, 0]
+        # Kernel boundary contract is BHSD. Convert (B, H, S, D) to
+        # the mainloop/TMA-friendly (S, D, H, B) view internally.
+        Q_layout_transpose = [2, 3, 1, 0]
         mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
         # (s_k, d, h_k, b_k)
-        KV_layout_transpose = [1, 3, 2, 0]
+        KV_layout_transpose = [2, 3, 1, 0]
         mK, mV = [
             cute.make_tensor(t.iterator, cute.select(t.layout, mode=KV_layout_transpose))
             for t in (mK, mV)
         ]
-        O_layout_transpose = [1, 3, 2, 0]
+        O_layout_transpose = [2, 3, 1, 0]
         LSE_layout_transpose = [2, 1, 0]
         num_splits = Int32(1)
         mO = cute.make_tensor(mO.iterator, cute.select(mO.layout, mode=O_layout_transpose))
@@ -295,8 +323,7 @@ class FlashAttentionForwardSm100:
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
         self._setup_attributes()
         self.use_tma_O = self.arch >= Arch.sm_90
-        # This can be tuned
-        # This is currently very ad-hoc, we should tune it systematically
+        # Tuned defaults for the polynomial ex2 emulation path.
         self.ex2_emu_freq = 0
         self.ex2_emu_start_frg = 0
         if const_expr(self.enable_ex2_emu):
@@ -476,12 +503,12 @@ class FlashAttentionForwardSm100:
             cute.size(mK.shape[0]),
             mQ.shape[1],
             mV.shape[0],  # Note that this is different from Sm90 since we transpose mV in Sm100
-            total_q=cute.size(mQ.shape[0]) * cute.size(mQ.shape[3]),
-            tile_shape_mn=self.cta_tiler[:2],
-            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-            element_size=self.k_dtype.width // 8,
-            is_persistent=self.is_persistent,
-            cluster_shape_mn=self.cluster_shape_mn,
+            cute.size(mQ.shape[0]) * cute.size(mQ.shape[3]),
+            self.cta_tiler[:2],
+            self.cluster_shape_mn,
+            self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            self.k_dtype.width // 8,
+            self.is_persistent,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(
             tile_sched_args, scheduling_mode=self.scheduling_mode
@@ -1020,7 +1047,7 @@ class FlashAttentionForwardSm100:
     def clc_scheduler_warp(
         self,
         clc_pipeline: cutlass_pipeline.PipelineClcFetchAsync,
-        tile_scheduler: TileSchedulerProtocol,
+        tile_scheduler: "TileSchedulerProtocol",
     ):
         """Runs on leader CTA's scheduler warp — produces CLC work queries."""
         clc_producer_state = cutlass_pipeline.make_pipeline_state(
@@ -1046,7 +1073,7 @@ class FlashAttentionForwardSm100:
     def empty_warp(
         self,
         clc_pipeline: cutlass_pipeline.PipelineClcFetchAsync,
-        tile_scheduler: TileSchedulerProtocol,
+        tile_scheduler: "TileSchedulerProtocol",
     ):
         """Runs on empty warps (and non-leader CTA scheduler warp) — consumes CLC responses."""
         clc_consumer_state = cutlass_pipeline.make_pipeline_state(
@@ -1075,10 +1102,10 @@ class FlashAttentionForwardSm100:
         tma_atom_V: cute.CopyAtom,
         pipeline_q: pipeline.PipelineAsync,
         pipeline_kv: pipeline.PipelineAsync,
-        block_info: BlockInfo,
+        block_info: "BlockInfo",
         num_splits: Int32,
         SeqlenInfoCls: Callable,
-        tile_scheduler: TileSchedulerProtocol,
+        tile_scheduler: "TileSchedulerProtocol",
         mBlockIndex: cute.Tensor,
         block_sparse_num: Int32,
         mBlockNums: Optional[cute.Tensor],
@@ -1220,10 +1247,10 @@ class FlashAttentionForwardSm100:
         pipeline_p_lastsplit: pipeline.PipelineAsync,
         pipeline_o_acc: pipeline.PipelineAsync,
         is_leader_cta: Boolean,
-        block_info: BlockInfo,
+        block_info: "BlockInfo",
         num_splits: Int32,
         SeqlenInfoCls: Callable,
-        tile_scheduler: TileSchedulerProtocol,
+        tile_scheduler: "TileSchedulerProtocol",
         block_sparse_num: Int32,
         mBlockNums: Optional[cute.Tensor],
     ):
@@ -1445,10 +1472,10 @@ class FlashAttentionForwardSm100:
         pipeline_sm_stats: pipeline.PipelineAsync,
         sm_stats_barrier: pipeline.NamedBarrier,
         pipeline_s0_s1_sequence: Optional[pipeline.PipelineAsync],
-        block_info: BlockInfo,
+        block_info: "BlockInfo",
         num_splits: Int32,
         SeqlenInfoCls: Callable,
-        tile_scheduler: TileSchedulerProtocol,
+        tile_scheduler: "TileSchedulerProtocol",
         mBlockIndex: cute.Tensor,
         mBlockSizes: cute.Tensor,
         block_sparse_num: Int32,
@@ -1620,7 +1647,7 @@ class FlashAttentionForwardSm100:
         mma_si_consumer_phase: Int32,
         sm_stats_producer_phase: Int32,
         s0_s1_sequence_phase: Int32,
-        softmax: SoftmaxSm100,
+        softmax: "SoftmaxSm100",
         thr_mma_qk: cute.core.ThrMma,
         pipeline_s_p_o: pipeline.PipelineAsync,
         pipeline_p_lastsplit: pipeline.PipelineAsync,
@@ -1663,7 +1690,7 @@ class FlashAttentionForwardSm100:
 
         # Wait for Si
         pipeline_s_p_o.consumer_wait_w_index_phase(stage, mma_si_consumer_phase)
-        tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
+        tSrS_t2r = cute.make_rmem_tensor(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
 
         if const_expr(mask_fn is not None):
@@ -1677,7 +1704,7 @@ class FlashAttentionForwardSm100:
         sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
         softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
-        tSrP_r2t_f32 = cute.make_fragment(
+        tSrP_r2t_f32 = cute.make_rmem_tensor(
             thr_tmem_store.partition_S(cute.make_identity_tensor(tScP_shape)).shape, Float32
         )
         tSrP_r2t = cute.make_tensor(
@@ -1729,10 +1756,10 @@ class FlashAttentionForwardSm100:
         gmem_tiled_copy_O: cute.TiledCopy,
         tma_atom_O: cute.CopyAtom,
         softmax_scale_log2: Float32,
-        block_info: BlockInfo,
+        block_info: "BlockInfo",
         num_splits: Int32,
         SeqlenInfoCls: Callable,
-        tile_scheduler: TileSchedulerProtocol,
+        tile_scheduler: "TileSchedulerProtocol",
         block_sparse_num: Int32,
         mBlockNums: Optional[cute.Tensor],
     ):
@@ -1794,7 +1821,7 @@ class FlashAttentionForwardSm100:
                 sm_stats_barrier.arrive_and_wait_w_index(index=1 * 4 + warp_idx)
                 sm_stats_consumer_phase ^= 1
 
-                tSrScale_t2r = cute.make_fragment(tSrScale_t2r_shape, Float32)
+                tSrScale_t2r = cute.make_rmem_tensor(tSrScale_t2r_shape, Float32)
                 # q_stage=1 correction loop
                 if const_expr(mBlockNums is not None):
                     block_iter_count = (mBlockNums[batch_idx, head_idx, m_block] + 1) & ~1
@@ -1988,9 +2015,9 @@ class FlashAttentionForwardSm100:
         tOtO_r2t = thr_tmem_store.partition_D(tOtO_i)
 
         frg_count = self.head_dim_v_padded // corr_tile_size
-        tOrO_frg = cute.make_fragment((tOrO_t2r_shape, frg_count), self.pv_acc_dtype)
+        tOrO_frg = cute.make_rmem_tensor((tOrO_t2r_shape, frg_count), self.pv_acc_dtype)
         for i in cutlass.range_constexpr(frg_count):
-            tOrO_frg = cute.make_fragment(tOrO_t2r_shape, self.pv_acc_dtype)
+            tOrO_frg = cute.make_rmem_tensor(tOrO_t2r_shape, self.pv_acc_dtype)
             tOtO_t2r_i = cute.make_tensor(tOtO_t2r.iterator + i * corr_tile_size, tOtO_t2r.layout)
             cute.copy(thr_tmem_load, tOtO_t2r_i, tOrO_frg)
             for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
@@ -2049,7 +2076,7 @@ class FlashAttentionForwardSm100:
         for i in cutlass.range(self.head_dim_v_padded // corr_tile_size, unroll_full=True):
             tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
             tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
-            tOrO_frg = cute.make_fragment(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
+            tOrO_frg = cute.make_rmem_tensor(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
             cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
             for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
                 tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
@@ -2125,8 +2152,8 @@ class FlashAttentionForwardSm100:
             tOtO1_t2r_i = tOtO1_t2r[None, 0, 0, i]
             tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
             frg_shape = tOcO_t2r[None, 0, 0, i].shape
-            tOrO0_frg = cute.make_fragment(frg_shape, self.pv_acc_dtype)
-            tOrO1_frg = cute.make_fragment(frg_shape, self.pv_acc_dtype)
+            tOrO0_frg = cute.make_rmem_tensor(frg_shape, self.pv_acc_dtype)
+            tOrO1_frg = cute.make_rmem_tensor(frg_shape, self.pv_acc_dtype)
             # When both scales are 0 (empty tile), skip tmem reads to avoid 0*NaN=NaN.
             is_zero_output = scale0 == Float32(0.0) and scale1 == Float32(0.0)
             if not is_zero_output:
@@ -2186,7 +2213,7 @@ class FlashAttentionForwardSm100:
         )
 
         # load acc O from smem to rmem for wider vectorization
-        tOrO = cute.make_fragment_like(tOsO, self.o_dtype)
+        tOrO = cute.make_rmem_tensor_like(tOsO, self.o_dtype)
         cute.autovec_copy(tOsO, tOrO)
         # copy acc O from rmem to gmem
         if const_expr(not self.pack_gqa):
@@ -2215,10 +2242,10 @@ class FlashAttentionForwardSm100:
         gmem_tiled_copy_O: cute.TiledCopy,
         tma_atom_O: Optional[cute.CopyAtom],
         pipeline_o_epi: pipeline.PipelineAsync,
-        block_info: BlockInfo,
+        block_info: "BlockInfo",
         num_splits: int,
         SeqlenInfoCls: Callable,
-        tile_scheduler: TileSchedulerProtocol,
+        tile_scheduler: "TileSchedulerProtocol",
         mma_tile_coord_v: Int32 = 0,
     ):
         epi_consumer_phase = Int32(0)
@@ -2325,3 +2352,2219 @@ class FlashAttentionForwardSm100:
             return cute.make_tensor(sX.iterator + offset, sX.layout)
         else:
             return sX
+
+# =============================================================================
+# Core Scalar Helpers
+# =============================================================================
+def _make_local_namespace(*names: str):
+    return types.SimpleNamespace(**{name: globals()[name] for name in names if name in globals()})
+
+
+
+def assume_strides_aligned(t):
+    """Assume all strides except the last are divisible by 128 bits.
+
+    Python int strides (e.g., stride=0 from GQA expand) are kept as-is
+    since they're static and don't need alignment assumptions.
+    """
+    divby = 128 // t.element_type.width
+    strides = tuple(s if isinstance(s, int) else cute.assume(s, divby=divby) for s in t.stride[:-1])
+    return (*strides, t.stride[-1])
+
+
+def assume_tensor_aligned(t):
+    """Rebuild a tensor with 128-bit aligned stride assumptions. Passes through None."""
+    if t is None:
+        return None
+    return cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=assume_strides_aligned(t)))
+
+
+POLY_EX2 = {
+    0: (1.0),
+    1: (
+        1.0,
+        0.922497093677520751953125,
+    ),
+    2: (
+        1.0,
+        0.6657850742340087890625,
+        0.330107033252716064453125,
+    ),
+    3: (
+        1.0,
+        0.695146143436431884765625,
+        0.227564394474029541015625,
+        0.077119089663028717041015625,
+    ),
+    4: (
+        1.0,
+        0.693042695522308349609375,
+        0.2412912547588348388671875,
+        5.2225358784198760986328125e-2,
+        1.3434938155114650726318359375e-2,
+    ),
+    5: (
+        1.0,
+        0.693151414394378662109375,
+        0.24016360938549041748046875,
+        5.5802188813686370849609375e-2,
+        9.01452265679836273193359375e-3,
+        1.86810153536498546600341796875e-3,
+    ),
+}
+
+LOG2_E = math.log2(math.e)
+
+def compute_softmax_scale_log2(softmax_scale):
+    """Compute softmax_scale_log2 from softmax_scale.
+
+    Returns (softmax_scale_log2, None).
+    """
+    return softmax_scale * LOG2_E, None
+
+
+@cute.jit
+def warp_reduce(
+    val: cute.TensorSSA | cute.Numeric,
+    op: Callable,
+    width: cutlass.Constexpr[int] = cute.arch.WARP_SIZE,
+) -> cute.TensorSSA | cute.Numeric:
+    if const_expr(isinstance(val, cute.TensorSSA)):
+        res = cute.make_rmem_tensor(val.shape, val.dtype)
+        res.store(val)
+        for i in cutlass.range_constexpr(cute.size(val.shape)):
+            res[i] = warp_reduce(res[i], op, width)
+        return res.load()
+    else:
+        for i in cutlass.range_constexpr(int(math.log2(width))):
+            val = op(val, cute.arch.shuffle_sync_bfly(val, offset=1 << i))
+    return val
+
+
+@dsl_user_op
+def fmax(
+    a: float | Float32, b: float | Float32, c: float | Float32 | None = None, *, loc=None, ip=None
+) -> Float32:
+    from cutlass import CUDA_VERSION
+
+    # * NVVM call based on nvvm version
+    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
+        # Old API: requires explicit result type as first positional argument
+        return Float32(
+            nvvm.fmax(
+                T.f32(),
+                Float32(a).ir_value(loc=loc, ip=ip),
+                Float32(b).ir_value(loc=loc, ip=ip),
+                c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
+                loc=loc,
+                ip=ip,
+            )
+        )
+    else:
+        # New API: infers result type automatically
+        return Float32(
+            nvvm.fmax(
+                Float32(a).ir_value(loc=loc, ip=ip),
+                Float32(b).ir_value(loc=loc, ip=ip),
+                c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
+                loc=loc,
+                ip=ip,
+            )
+        )
+
+
+@cute.jit
+def fmax_reduce(
+    x: cute.TensorSSA, init_val: float | Float32 | None = None, arch: cutlass.Constexpr[int] = 80
+) -> Float32:
+    if const_expr(arch < 100 or cute.size(x.shape) % 8 != 0):
+        res = cute.make_rmem_tensor(x.shape, Float32)
+        res.store(x)
+        local_max = [res[0], res[1], res[2], res[3]]
+        for i in cutlass.range_constexpr(4, cute.size(x.shape), 4):
+            local_max[0] = fmax(local_max[0], res[i + 0])
+            local_max[1] = fmax(local_max[1], res[i + 1])
+            local_max[2] = fmax(local_max[2], res[i + 2])
+            local_max[3] = fmax(local_max[3], res[i + 3])
+        local_max[0] = fmax(local_max[0], local_max[1])
+        local_max[2] = fmax(local_max[2], local_max[3])
+        local_max[0] = fmax(local_max[0], local_max[2])
+        return local_max[0] if const_expr(init_val is None) else fmax(local_max[0], init_val)
+    else:
+        res = cute.make_rmem_tensor(x.shape, Float32)
+        res.store(x)
+        local_max_0 = (
+            fmax(init_val, res[0], res[1])
+            if const_expr(init_val is not None)
+            else fmax(res[0], res[1])
+        )
+        local_max = [
+            local_max_0,
+            fmax(res[2], res[3]),
+            fmax(res[4], res[5]),
+            fmax(res[6], res[7]),
+        ]
+        for i in cutlass.range_constexpr(8, cute.size(x.shape), 8):
+            local_max[0] = fmax(local_max[0], res[i], res[i + 1])
+            local_max[1] = fmax(local_max[1], res[i + 2], res[i + 3])
+            local_max[2] = fmax(local_max[2], res[i + 4], res[i + 5])
+            local_max[3] = fmax(local_max[3], res[i + 6], res[i + 7])
+        local_max[0] = fmax(local_max[0], local_max[1])
+        return fmax(local_max[0], local_max[2], local_max[3])
+
+
+@cute.jit
+def fadd_reduce(
+    x: cute.TensorSSA, init_val: float | Float32 | None = None, arch: cutlass.Constexpr[int] = 80
+) -> Float32:
+    if const_expr(arch < 100 or cute.size(x.shape) % 8 != 0):
+        if const_expr(init_val is None):
+            init_val = Float32.zero
+        return x.reduce(cute.ReductionOp.ADD, init_val, 0)
+    else:
+        res = cute.make_rmem_tensor(x.shape, Float32)
+        res.store(x)
+        local_sum_0 = (
+            cute.arch.add_packed_f32x2((init_val, 0.0), (res[0], res[1]))
+            if const_expr(init_val is not None)
+            else (res[0], res[1])
+        )
+        local_sum = [local_sum_0, (res[2], res[3]), (res[4], res[5]), (res[6], res[7])]
+        for i in cutlass.range_constexpr(8, cute.size(x.shape), 8):
+            local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], (res[i + 0], res[i + 1]))
+            local_sum[1] = cute.arch.add_packed_f32x2(local_sum[1], (res[i + 2], res[i + 3]))
+            local_sum[2] = cute.arch.add_packed_f32x2(local_sum[2], (res[i + 4], res[i + 5]))
+            local_sum[3] = cute.arch.add_packed_f32x2(local_sum[3], (res[i + 6], res[i + 7]))
+        local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], local_sum[1])
+        local_sum[2] = cute.arch.add_packed_f32x2(local_sum[2], local_sum[3])
+        local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], local_sum[2])
+        return local_sum[0][0] + local_sum[0][1]
+
+
+@dsl_user_op
+def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
+    return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
+
+
+@cute.jit
+def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
+    # Only compute predicates for the "k" dimension. For the mn dimension, we will use "if"
+    tApA = cute.make_rmem_tensor(
+        cute.make_layout(
+            (cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]), cute.size(tAcA, mode=[2])),
+            stride=(cute.size(tAcA, mode=[2]), 0, 1),
+        ),
+        cutlass.Boolean,
+    )
+    for rest_v in cutlass.range_constexpr(tApA.shape[0]):
+        for rest_k in cutlass.range_constexpr(tApA.shape[2]):
+            tApA[rest_v, 0, rest_k] = cute.elem_less(tAcA[(0, rest_v), 0, rest_k][1], limit)
+    return tApA
+
+
+@cute.jit
+def shuffle_sync(
+    value: cute.Numeric,
+    offset: cute.typing.Int,
+    width: cutlass.Constexpr[int] = cute.arch.WARP_SIZE,
+) -> cute.Numeric:
+    assert value.width % 32 == 0, "value type must be a multiple of 32 bits"
+    # 1 -> 0b11111, 2 -> 0b11110, 4 -> 0b11100, 8 -> 0b11000, 16 -> 0b10000, 32 -> 0b00000
+    mask = cute.arch.WARP_SIZE - width
+    clamp = cute.arch.WARP_SIZE - 1
+    mask_and_clamp = mask << 8 | clamp
+    # important: need stride 1 and not 0 for recast_tensor to work
+    val = cute.make_rmem_tensor(cute.make_layout((1,), stride=(1,)), type(value))
+    val[0] = value
+    val_i32 = cute.recast_tensor(val, cutlass.Int32)
+    for i in cutlass.range_constexpr(cute.size(val_i32)):
+        val_i32[i] = cute.arch.shuffle_sync(val_i32[i], offset, mask_and_clamp=mask_and_clamp)
+    return val[0]
+
+
+@dsl_user_op
+def shr_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Uint32:
+    """
+    Unsigned right-shift val by shift bits using PTX shr.u32 (zero-fills).
+
+    See ``shl_u32`` docstring for why inline PTX is used instead of plain
+    CuTeDSL shift operators (LLVM shift-by-type-width UB).
+    """
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                cutlass.Uint32(val).ir_value(loc=loc, ip=ip),
+                cutlass.Uint32(shift).ir_value(loc=loc, ip=ip),
+            ],
+            "shr.u32 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+@cute.jit
+def evaluate_polynomial_2(
+    x: Float32, y: Float32, poly: Tuple[Float32, ...], *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    deg = len(poly) - 1
+    out = (poly[deg], poly[deg])
+    for i in cutlass.range_constexpr(deg - 1, -1, -1):
+        out = cute.arch.fma_packed_f32x2(out, (x, y), (poly[i], poly[i]))
+    return out
+
+
+@dsl_user_op
+def combine_int_frac_ex2(x_rounded: Float32, frac_ex2: Float32, *, loc=None, ip=None) -> Float32:
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Float32(x_rounded).ir_value(loc=loc, ip=ip),
+                Float32(frac_ex2).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n\t"
+            ".reg .s32 x_rounded_i, frac_ex_i, x_rounded_e, out_i;\n\t"
+            "mov.b32 x_rounded_i, $1;\n\t"
+            "mov.b32 frac_ex_i, $2;\n\t"
+            "shl.b32 x_rounded_e, x_rounded_i, 23;\n\t"
+            # add.u32 generates IMAD instruction and add.s32 generates LEA instruction
+            # IMAD uses the FMA pipeline and LEA uses the ALU pipeline, afaik
+            "add.s32 out_i, x_rounded_e, frac_ex_i;\n\t"
+            "mov.b32 $0, out_i;\n\t"
+            "}\n",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def ex2_emulation_2(
+    x: Float32, y: Float32, *, poly_degree: int = 3, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    # We assume x <= 127.0 and y <= 127.0
+    fp32_round_int = float(2**23 + 2**22)
+    xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
+    # We want to round down here, so that the fractional part is in [0, 1)
+    xy_rounded = cute.arch.add_packed_f32x2(xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm")
+    # The integer floor of x & y are now in the last 8 bits of xy_rounded
+    # We want the next 2 ops to round to nearest even. The rounding mode is important.
+    xy_rounded_back = quack.activation.sub_packed_f32x2(
+        xy_rounded, (fp32_round_int, fp32_round_int)
+    )
+    xy_frac = quack.activation.sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    xy_frac_ex2 = evaluate_polynomial_2(*xy_frac, POLY_EX2[poly_degree], loc=loc, ip=ip)
+    x_out = combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0], loc=loc, ip=ip)
+    y_out = combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1], loc=loc, ip=ip)
+    return x_out, y_out
+
+# =============================================================================
+# Softmax Helpers
+# =============================================================================
+@dataclass
+class Softmax(ParamsBase):
+    scale_log2: Float32
+    num_rows: cutlass.Constexpr[int]
+    row_max: cute.Tensor
+    row_sum: cute.Tensor
+    arch: cutlass.Constexpr[int] = 80
+    softmax_scale: Float32 | None = None
+
+    @staticmethod
+    def create(
+        scale_log2: Float32,
+        num_rows: cutlass.Constexpr[int],
+        arch: cutlass.Constexpr[int] = 80,
+        softmax_scale: Float32 | None = None,
+    ):
+        row_max = cute.make_rmem_tensor(num_rows, Float32)
+        row_sum = cute.make_rmem_tensor(num_rows, Float32)
+        return Softmax(scale_log2, num_rows, row_max, row_sum, arch, softmax_scale)
+
+    def reset(self) -> None:
+        self.row_max.fill(-Float32.inf)
+        self.row_sum.fill(0.0)
+
+    def _compute_row_max(
+        self, acc_S_row: cute.TensorSSA, init_val: float | Float32 | None = None
+    ) -> Float32:
+        return utils.fmax_reduce(acc_S_row, init_val, arch=self.arch)
+
+    def _compute_row_sum(
+        self, acc_S_row_exp: cute.TensorSSA, init_val: float | Float32 | None = None
+    ) -> Float32:
+        return utils.fadd_reduce(acc_S_row_exp, init_val, arch=self.arch)
+
+    @cute.jit
+    def online_softmax(
+        self,
+        acc_S: cute.Tensor,
+        is_first: cutlass.Constexpr[bool] = False,
+        check_inf: cutlass.Constexpr[bool] = True,
+    ) -> cute.Tensor:
+        """Apply online softmax and return the row_scale to rescale O.
+
+        :param acc_S: acc_S tensor
+        :type acc_S: cute.Tensor
+        :param is_first: is first n_block
+        :type is_first: cutlass.Constexpr
+        """
+        # Change acc_S to M,N layout view.
+        acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
+        row_scale = cute.make_rmem_tensor_like(self.row_max, Float32)
+
+        row_max = self.row_max
+        row_sum = self.row_sum
+        scale_log2 = self.scale_log2
+        arch = self.arch
+
+        # Each iteration processes one row of acc_S
+        for r in cutlass.range(cute.size(row_max), unroll_full=True):
+            acc_S_row = acc_S_mn[r, None].load()  # (n_block_size)
+
+            row_max_cur = utils.fmax_reduce(
+                acc_S_row,
+                init_val=row_max[r] if cutlass.const_expr(not is_first) else None,
+                arch=arch,
+            )
+
+            row_max_cur = cute.arch.warp_reduction_max(row_max_cur, threads_in_group=4)
+            # Update row_max before changing row_max_cur to safe value for -inf
+            row_max_prev = row_max[r]
+            row_max[r] = row_max_cur
+
+            if cutlass.const_expr(check_inf):
+                row_max_cur = 0.0 if row_max_cur == -Float32.inf else row_max_cur
+
+            if cutlass.const_expr(is_first):
+                row_max_cur_scaled = row_max_cur * scale_log2
+                acc_S_row_exp = cute.math.exp2(
+                    acc_S_row * scale_log2 - row_max_cur_scaled, fastmath=True
+                )
+                acc_S_row_sum = utils.fadd_reduce(acc_S_row_exp, init_val=None, arch=arch)
+                row_scale[r] = 1.0
+            else:
+                row_max_cur_scaled = row_max_cur * scale_log2
+                acc_S_row_exp = cute.math.exp2(
+                    acc_S_row * scale_log2 - row_max_cur_scaled, fastmath=True
+                )
+                row_scale[r] = cute.math.exp2(
+                    (row_max_prev - row_max_cur) * scale_log2, fastmath=True
+                )
+                acc_S_row_sum = utils.fadd_reduce(
+                    acc_S_row_exp, init_val=row_sum[r] * row_scale[r], arch=arch
+                )
+
+            row_sum[r] = acc_S_row_sum
+            acc_S_mn[r, None].store(acc_S_row_exp)
+
+        return row_scale
+
+    @cute.jit
+    def finalize(
+        self, final_scale: Float32 = 1.0, sink_val: Float32 | cute.Tensor | None = None
+    ) -> cute.Tensor:
+        """Finalize the online softmax by computing the scale and logsumexp."""
+        if cutlass.const_expr(sink_val is not None and isinstance(sink_val, cute.Tensor)):
+            assert cute.size(sink_val) == cute.size(self.row_sum)
+        row_sum = self.row_sum
+        row_max = self.row_max
+        scale_log2 = self.scale_log2
+
+        # quad reduction for row_sum as we didn't do it during each iteration of online softmax
+        row_sum.store(utils.warp_reduce(row_sum.load(), operator.add, width=4))
+        row_scale = cute.make_rmem_tensor_like(row_max, Float32)
+
+        for r in cutlass.range(cute.size(row_sum), unroll_full=True):
+            if cutlass.const_expr(sink_val is not None):
+                sink_val_cur = sink_val if not isinstance(sink_val, cute.Tensor) else sink_val[r]
+                LOG2_E = math.log2(math.e)
+                row_sum[r] += cute.math.exp2(
+                    sink_val_cur * LOG2_E - row_max[r] * scale_log2, fastmath=True
+                )
+
+            # if row_sum is zero or nan, set acc_O_mn_row to 1.0
+            acc_O_mn_row_is_zero_or_nan = row_sum[r] == 0.0 or row_sum[r] != row_sum[r]
+            row_scale[r] = (
+                cute.arch.rcp_approx(row_sum[r] if not acc_O_mn_row_is_zero_or_nan else 1.0)
+            ) * final_scale
+            row_sum_cur = row_sum[r]
+            LN2 = math.log(2.0)
+            row_sum[r] = (
+                (row_max[r] * scale_log2 + cute.math.log2(row_sum_cur, fastmath=True)) * LN2
+                if not acc_O_mn_row_is_zero_or_nan
+                else -Float32.inf
+            )
+        return row_scale
+
+    @cute.jit
+    def rescale_O(self, acc_O: cute.Tensor, row_scale: cute.Tensor) -> None:
+        """Scale each row of acc_O by the given scale tensor.
+        :param acc_O: input tensor
+        :type acc_O: cute.Tensor
+        :param row_scale: row_scale tensor
+        :type row_scale: cute.Tensor
+        """
+        acc_O_mn = layout_utils.reshape_acc_to_mn(acc_O)
+        assert cute.size(row_scale) == cute.size(acc_O_mn, mode=[0])
+        for r in cutlass.range(cute.size(row_scale), unroll_full=True):
+            acc_O_mn[r, None].store(acc_O_mn[r, None].load() * row_scale[r])
+
+
+@dataclass
+class SoftmaxSm100(Softmax):
+    rescale_threshold: cutlass.Constexpr[float] = 0.0
+
+    @staticmethod
+    def create(
+        scale_log2: Float32,
+        rescale_threshold: cutlass.Constexpr[float] = 0.0,
+        softmax_scale: Float32 | None = None,
+    ):
+        num_rows = 1
+        arch = 100
+        row_max = cute.make_rmem_tensor(num_rows, Float32)
+        row_sum = cute.make_rmem_tensor(num_rows, Float32)
+        return SoftmaxSm100(
+            scale_log2,
+            num_rows,
+            row_max,
+            row_sum,
+            arch,
+            softmax_scale,
+            rescale_threshold=rescale_threshold,
+        )
+
+    @cute.jit
+    def update_row_max(self, acc_S_row: cute.TensorSSA, is_first: int) -> Tuple[Float32, Float32]:
+        if cutlass.const_expr(is_first):
+            row_max_new = self._compute_row_max(acc_S_row)
+            row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
+            acc_scale = 0.0
+        else:
+            row_max_old = self.row_max[0]
+            row_max_new = self._compute_row_max(acc_S_row, init_val=row_max_old)
+            row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
+            acc_scale_ = (row_max_old - row_max_safe) * self.scale_log2
+            acc_scale = cute.math.exp2(acc_scale_, fastmath=True)
+            if cutlass.const_expr(self.rescale_threshold > 0.0):
+                if acc_scale_ >= -self.rescale_threshold:
+                    row_max_new = row_max_old
+                    row_max_safe = row_max_old
+                    acc_scale = 1.0
+        self.row_max[0] = row_max_new
+        return row_max_safe, acc_scale
+
+    def update_row_sum(
+        self, acc_S_row_exp: cute.TensorSSA, row_scale: Float32, is_first: int = False
+    ) -> None:
+        init_val = self.row_sum[0] * row_scale if cutlass.const_expr(not is_first) else None
+        self.row_sum[0] = self._compute_row_sum(acc_S_row_exp, init_val=init_val)
+
+    @cute.jit
+    def scale_subtract_rowmax(
+        self,
+        acc_S_row: cute.Tensor,
+        row_max: Float32,
+    ):
+        assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
+        row_max_scaled = row_max * self.scale_log2
+        for i in cutlass.range(0, cute.size(acc_S_row.shape), 2, unroll_full=True):
+            acc_S_row[i], acc_S_row[i + 1] = cute.arch.fma_packed_f32x2(
+                (acc_S_row[i], acc_S_row[i + 1]),
+                (self.scale_log2, self.scale_log2),
+                (-row_max_scaled, -row_max_scaled),
+            )
+
+    @cute.jit
+    def apply_exp2_convert(
+        self,
+        acc_S_row: cute.Tensor,
+        acc_S_row_converted: cute.Tensor,
+        ex2_emu_freq: cutlass.Constexpr[int] = 0,
+        ex2_emu_res: cutlass.Constexpr[int] = 4,
+        ex2_emu_start_frg: cutlass.Constexpr[int] = 0,
+    ):
+        assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
+        frg_tile = 32
+        assert frg_tile % 2 == 0
+        frg_cnt = cute.size(acc_S_row) // frg_tile
+        assert cute.size(acc_S_row) % frg_tile == 0
+        acc_S_row_frg = cute.logical_divide(acc_S_row, cute.make_layout(frg_tile))
+        acc_S_row_converted_frg = cute.logical_divide(
+            acc_S_row_converted, cute.make_layout(frg_tile)
+        )
+        for j in cutlass.range_constexpr(frg_cnt):
+            for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
+                if cutlass.const_expr(ex2_emu_freq == 0):
+                    acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
+                    acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
+                else:
+                    if cutlass.const_expr(
+                        k % ex2_emu_freq < ex2_emu_freq - ex2_emu_res
+                        or j >= frg_cnt - 1
+                        or j < ex2_emu_start_frg
+                    ):
+                        acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
+                        acc_S_row_frg[k + 1, j] = cute.math.exp2(
+                            acc_S_row_frg[k + 1, j], fastmath=True
+                        )
+                    else:
+                        acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
+                            acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
+                        )
+            acc_S_row_converted_frg[None, j].store(
+                acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
+            )
+
+    @cute.jit
+    def scale_apply_exp2_convert(
+        self,
+        acc_S_row: cute.Tensor,
+        row_max: Float32,
+        acc_S_row_converted: cute.Tensor,
+    ):
+        assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
+        minus_row_max_scaled = -row_max * self.scale_log2
+        for i in cutlass.range_constexpr(0, cute.size(acc_S_row.shape), 2):
+            acc_S_row[i], acc_S_row[i + 1] = cute.arch.fma_packed_f32x2(
+                (acc_S_row[i], acc_S_row[i + 1]),
+                (self.scale_log2, self.scale_log2),
+                (minus_row_max_scaled, minus_row_max_scaled),
+            )
+
+        frg_tile = 32
+        assert frg_tile % 2 == 0
+        frg_cnt = cute.size(acc_S_row) // frg_tile
+        assert cute.size(acc_S_row) % frg_tile == 0
+        acc_S_row_frg = cute.logical_divide(acc_S_row, cute.make_layout(frg_tile))
+        acc_S_row_converted_frg = cute.logical_divide(
+            acc_S_row_converted, cute.make_layout(frg_tile)
+        )
+        for j in cutlass.range_constexpr(frg_cnt):
+            for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
+                acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
+                acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
+            acc_S_row_converted_frg[None, j].store(
+                acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
+            )
+
+# =============================================================================
+# Sequence Metadata
+# =============================================================================
+@dataclass(frozen=True)
+class SeqlenInfoQK:
+    seqlen_q: Int32
+    seqlen_k: Int32
+
+    @staticmethod
+    def create(
+        seqlen_q_static: Int32,
+        seqlen_k_static: Int32,
+    ):
+        return SeqlenInfoQK(
+            seqlen_q_static,
+            seqlen_k_static,
+        )
+
+
+@dataclass(frozen=True)
+class BlockInfo:
+    tile_m: cutlass.Constexpr[int]
+    tile_n: cutlass.Constexpr[int]
+    qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
+
+    @cute.jit
+    def get_n_block_idx(
+        self,
+        block_index: cute.Tensor,
+        batch_idx: Int32,
+        head_idx: Int32,
+        m_block: Int32,
+        i: Int32,
+        max_i: Optional[Int32] = None,
+    ) -> Int32:
+        idx = cutlass.min(i, max_i) if const_expr(max_i is not None) else i
+        return block_index[batch_idx, head_idx, m_block, idx]
+
+# =============================================================================
+# Scheduler Metadata
+# =============================================================================
+class NamedBarrierFwdSm100(enum.IntEnum):
+    Epilogue = enum.auto()  # starts from 1 as barrier 0 is reserved for sync_threads()
+    TmemPtr = enum.auto()
+    SoftmaxStatsW0 = enum.auto()
+    SoftmaxStatsW1 = enum.auto()
+    SoftmaxStatsW2 = enum.auto()
+    SoftmaxStatsW3 = enum.auto()
+    SoftmaxStatsW4 = enum.auto()
+    SoftmaxStatsW5 = enum.auto()
+    SoftmaxStatsW6 = enum.auto()
+    SoftmaxStatsW7 = enum.auto()
+
+
+class SchedulingMode(IntEnum):
+    NONE = 0
+    STATIC = 1
+    DYNAMIC = 2
+    CLC = 3
+
+
+class TileSchedulerProtocol(Protocol):
+    """Protocol defining the interface all tile schedulers must implement."""
+
+    def get_current_work(self) -> "WorkTileInfo": ...
+    def initial_work_tile_info(self) -> "WorkTileInfo": ...
+    def advance_to_next_work(self, *, mbarrier_addr=None) -> None: ...
+    def prefetch_next_work(self) -> None: ...
+    def consumer_advance(self) -> "WorkTileInfo": ...
+
+
+class WorkTileInfo(cutlass.utils.WorkTileInfo):
+    """Altered WorkTileInfo which includes four axes: (block, head, batch, split)"""
+
+    @override
+    def __new_from_mlir_values__(self, values: list[ir.Value]) -> "WorkTileInfo":
+        assert len(values) == 5
+        new_tile_idx = cutlass.new_from_mlir_values(self._tile_idx, values[:-1])
+        new_is_valid_tile = cutlass.new_from_mlir_values(self._is_valid_tile, [values[-1]])
+        return WorkTileInfo(new_tile_idx, new_is_valid_tile)
+
+
+@dataclass
+class TileSchedulerArguments(ParamsBase):
+    num_block: Int32
+    num_head: Int32
+    num_batch: Int32
+    num_splits: Int32
+    seqlen_k: Int32
+    headdim: Int32
+    headdim_v: Int32
+    total_q: Int32
+    tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]
+    cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
+    qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
+    element_size: cutlass.Constexpr[int] = 2
+    is_persistent: cutlass.Constexpr[bool] = False
+
+# =============================================================================
+# SM100 MMA Descriptor Helpers
+# =============================================================================
+utils = _make_local_namespace(
+    "compute_softmax_scale_log2",
+    "warp_reduce",
+    "fmax_reduce",
+    "fadd_reduce",
+    "elem_pointer",
+    "predicate_k",
+    "shuffle_sync",
+    "shr_u32",
+    "ex2_emulation_2",
+)
+
+
+class Major(IntEnum):  # matrix "layout" in the ISA docs
+    K = 0
+    MN = 1
+
+
+class ScaleIn(IntEnum):  # negate flags
+    One = 0
+    Neg = 1
+
+
+class Saturate(IntEnum):
+    False_ = 0
+    True_ = 1
+
+
+class CFormat(IntEnum):  # 2-bit field (bits 4-5)
+    F16 = 0
+    F32 = 1
+    S32 = 2
+
+
+class F16F32Format(IntEnum):  # 3-bit field (A/B element type)
+    F16 = 0
+    BF16 = 1
+    TF32 = 2
+
+
+class S8Format(IntEnum):
+    UINT8 = 0
+    INT8 = 1
+
+
+class MXF8F6F4Format(IntEnum):
+    E4M3 = 0
+    E5M2 = 1
+    E2M3 = 3
+    E3M2 = 4
+    E2M1 = 5
+
+
+class MaxShift(IntEnum):
+    NoShift = 0
+    MaxShift8 = 1
+    MaxShift16 = 2
+    MaxShift32 = 3
+
+
+def to_UMMA_format(cutlass_type) -> int:
+    """
+    Map a CUTLASS scalar class to the 3-bit encoding for Matrix A/B.
+    """
+    if cutlass_type is cutlass.Int8:
+        return S8Format.INT8
+    # Unsigned 8-bit (if available in your CUTLASS build)
+    if cutlass_type is cutlass.Uint8:
+        return S8Format.UINT8
+    # FP-16 / BF-16
+    if cutlass_type is cutlass.Float16:
+        return F16F32Format.F16
+    if cutlass_type is cutlass.BFloat16:
+        return F16F32Format.BF16
+    # TensorFloat-32 (8-bit exponent, 10-bit mantissa packed in 19 bits)
+    if cutlass_type is cutlass.TFloat32:
+        return F16F32Format.TF32
+    # Float-8 / Float-6 / Float-4 – add whenever CUTLASS exposes them
+    if cutlass_type is cutlass.FloatE4M3FN:
+        return MXF8F6F4Format.E4M3
+    if cutlass_type is cutlass.FloatE5M2:
+        return MXF8F6F4Format.E5M2
+    raise TypeError(f"Unsupported CUTLASS scalar type for A/B: {cutlass_type!r}")
+
+
+def to_C_format(cutlass_type) -> int:
+    """
+    Map a CUTLASS scalar class to the 2-bit accumulator encoding.
+    """
+    if cutlass_type is cutlass.Float16:
+        return CFormat.F16
+    if cutlass_type is cutlass.Float32:
+        return CFormat.F32
+    if cutlass_type is cutlass.Int32:
+        return CFormat.S32
+    raise TypeError(f"Unsupported CUTLASS scalar type for accumulator: {cutlass_type!r}")
+
+
+def make_instr_desc(
+    a_type,  # CUTLASS scalar class, e.g. cutlass.Int8
+    b_type,
+    c_type,
+    M: int,  # 64, 128 or 256
+    N: int,  # 8 … 256 (multiple of 8)
+    a_major: Major,
+    b_major: Major,
+    a_neg: ScaleIn = ScaleIn.One,
+    b_neg: ScaleIn = ScaleIn.One,
+    c_sat: Saturate = Saturate.False_,
+    is_sparse: bool = False,
+    max_shift: MaxShift = MaxShift.NoShift,
+) -> int:
+    """
+    Build the 32-bit instruction descriptor for Blackwell MMA.
+    All matrix/accumulator **types must be CUTLASS scalar classes** –
+    passing integers is forbidden.
+    """
+    # --- encode element formats -------------------------------------------------
+    a_fmt = int(to_UMMA_format(a_type))
+    b_fmt = int(to_UMMA_format(b_type))
+    c_fmt = int(to_C_format(c_type))
+
+    # --- range checks on M/N -----------------------------------------------------
+    if M not in (64, 128, 256):
+        raise ValueError("M must be 64, 128 or 256")
+    if N < 8 or N > 256 or (N & 7):
+        raise ValueError("N must be a multiple of 8 in the range 8…256")
+
+    m_dim = M >> 4  # 5-bit field
+    n_dim = N >> 3  # 6-bit field
+
+    # fmt: off
+    # --- pack the bit-fields -----------------------------------------------------
+    desc = 0
+    desc |= (0                 & 0x3) << 0        # sparse_id2 (always 0 here)
+    desc |= (int(is_sparse)    & 0x1) << 2        # sparse_flag
+    desc |= (int(c_sat)        & 0x1) << 3        # saturate
+    desc |= (c_fmt             & 0x3) << 4        # c_format
+    desc |= (a_fmt             & 0x7) << 7        # a_format
+    desc |= (b_fmt             & 0x7) << 10       # b_format
+    desc |= (int(a_neg)        & 0x1) << 13       # a_negate
+    desc |= (int(b_neg)        & 0x1) << 14       # b_negate
+    desc |= (int(a_major)      & 0x1) << 15       # a_major
+    desc |= (int(b_major)      & 0x1) << 16       # b_major
+    desc |= (n_dim             & 0x3F) << 17      # n_dim (6 bits)
+    desc |= (m_dim             & 0x1F) << 24      # m_dim (5 bits)
+    desc |= (int(max_shift)    & 0x3) << 30       # max_shift (2 bits)
+    # fmt: on
+
+    return desc & 0xFFFF_FFFF  # ensure 32-bit result
+
+
+def mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp):
+    return make_instr_desc(
+        op.a_dtype,
+        op.b_dtype,
+        op.acc_dtype,
+        op.shape_mnk[0],
+        op.shape_mnk[1],
+        Major.K if op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
+        Major.K if op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
+    )
+
+
+class LayoutType(IntEnum):  # occupies the top-3 bits [61:64)
+    SWIZZLE_NONE = 0  # (a.k.a. "INTERLEAVE" in older docs)
+    SWIZZLE_128B_BASE32B = 1
+    SWIZZLE_128B = 2
+    SWIZZLE_64B = 4
+    SWIZZLE_32B = 6
+
+
+def _layout_type(swizzle: cute.Swizzle) -> LayoutType:
+    B, M, S = swizzle.num_bits, swizzle.num_base, swizzle.num_shift
+
+    if M == 4:  # Swizzle<*,4,3>
+        if S != 3:
+            raise ValueError("Unexpected swizzle shift – want S==3 for M==4")
+        return {
+            0: LayoutType.SWIZZLE_NONE,
+            1: LayoutType.SWIZZLE_32B,
+            2: LayoutType.SWIZZLE_64B,
+            3: LayoutType.SWIZZLE_128B,
+        }[B]  # KeyError ⇒ invalid B→ raise
+    if M == 5:  # Swizzle<2,5,2> (the only legal triple for M==5)
+        if (B, S) != (2, 2):
+            raise ValueError("Only Swizzle<2,5,2> supported for 128B_BASE32B")
+        return LayoutType.SWIZZLE_128B_BASE32B
+
+    # Any other (M,B,S) triple is not a UMMA-legal shared-memory layout
+    raise ValueError("Unsupported swizzle triple for UMMA smem descriptor")
+
+
+def make_smem_desc_base(layout: cute.Layout, swizzle: cute.Swizzle, major: Major) -> int:
+    """
+    Convert a 2-D *shared-memory* Cute layout into the Blackwell 64-bit
+    smem-descriptor, without the smem start address.
+    layout must correspond to layout of an uint128 tensor.
+    """
+    # ------------------------------------------------------------------ meta
+    layout_type = _layout_type(swizzle)  # resolve SWIZZLE_* family
+
+    VERSION = 1  # bits 46–47
+    LBO_MODE = 0  # bit  52
+    BASE_OFFSET = 0  # bits 49–51   (CUTLASS always 0)
+
+    # ---------------------------------------------------------- strides  (units: uint128_t = 16 B)
+    swizzle_atom_mn_size = {
+        LayoutType.SWIZZLE_NONE: 1,
+        LayoutType.SWIZZLE_32B: 2,
+        LayoutType.SWIZZLE_64B: 4,
+        LayoutType.SWIZZLE_128B: 8,
+        LayoutType.SWIZZLE_128B_BASE32B: 8,
+    }[layout_type]
+
+    if major is Major.MN:
+        swizzle_atom_k_size = 4 if layout_type is LayoutType.SWIZZLE_128B_BASE32B else 8
+        canonical_layout = cute.logical_divide(layout, (swizzle_atom_mn_size, swizzle_atom_k_size))
+        if not cute.is_congruent(canonical_layout, ((1, 1), (1, 1))):
+            raise ValueError("Not a canonical UMMA_MN Layout: Expected profile failure.")
+        stride_00 = canonical_layout.stride[0][0]
+        if layout_type is not LayoutType.SWIZZLE_NONE and stride_00 != 1:
+            raise ValueError("Not a canonical UMMA_MN Layout: Expected stride failure.")
+        stride_10 = canonical_layout.stride[1][0]
+        if stride_10 != swizzle_atom_mn_size:
+            raise ValueError("Not a canonical UMMA_MN Layout: Expected stride failure.")
+        stride_01, stride_11 = canonical_layout.stride[0][1], canonical_layout.stride[1][1]
+        if layout_type is LayoutType.SWIZZLE_NONE:
+            stride_byte_offset, leading_byte_offset = stride_01, stride_11
+        else:
+            stride_byte_offset, leading_byte_offset = stride_11, stride_01
+    else:
+        if layout_type == LayoutType.SWIZZLE_128B_BASE32B:
+            raise ValueError("SWIZZLE_128B_BASE32B is invalid for Major-K")
+        if not cute.size(layout.shape[0]) % 8 == 0:
+            raise ValueError("Not a canonical UMMA_K Layout: Expected MN-size multiple of 8.")
+        canonical_layout = cute.logical_divide(layout, (8, 2))
+        if not cute.is_congruent(canonical_layout, ((1, 1), (1, 1))):
+            raise ValueError("Not a canonical UMMA_K Layout: Expected profile failure.")
+        stride_00 = canonical_layout.stride[0][0]
+        if stride_00 != swizzle_atom_mn_size:
+            raise ValueError("Not a canonical UMMA_K Layout: Expected stride failure.")
+        stride_10 = canonical_layout.stride[1][0]
+        if layout_type is not LayoutType.SWIZZLE_NONE and stride_10 != 1:
+            raise ValueError("Not a canonical UMMA_K Layout: Expected stride failure.")
+        stride_01 = canonical_layout.stride[0][1]
+        stride_byte_offset, leading_byte_offset = stride_01, stride_10
+
+    # ------------------------------------------------------------------ pack
+    desc = 0
+    # leading_byte_offset_  [16:30)
+    desc |= (leading_byte_offset & 0x3FFF) << 16
+    # stride_byte_offset_   [32:46)
+    desc |= (stride_byte_offset & 0x3FFF) << 32
+    # version_             [46:48)
+    desc |= (VERSION & 0x3) << 46
+    # base_offset_         [49:52)
+    desc |= (BASE_OFFSET & 0x7) << 49
+    # lbo_mode_            [52:53)
+    desc |= (LBO_MODE & 0x1) << 52
+    # layout_type_         [61:64)
+    desc |= (int(layout_type) & 0x7) << 61
+
+    return desc & 0xFFFF_FFFF_FFFF_FFFF  # force 64-bit width
+
+
+def make_smem_desc_start_addr(start_addr: cute.Pointer) -> cutlass.Int32:
+    # 14 bits, remove 4 LSB (bits 0-13 in desc)
+    return (start_addr.toint() & 0x3FFFF) >> 4
+
+
+def smem_desc_base_from_tensor(sA: cute.Tensor, major: Major) -> int:
+    sA_swizzle = sA.iterator.type.swizzle_type
+    return make_smem_desc_base(
+        cute.recast_layout(128, sA.element_type.width, sA.layout[0]),
+        sA_swizzle,
+        major,
+    )
+
+sm100_desc = _make_local_namespace(
+    "Major",
+    "mma_op_to_idesc",
+    "make_smem_desc_base",
+    "make_smem_desc_start_addr",
+    "smem_desc_base_from_tensor",
+)
+
+
+def i64_to_i32x2(i: int) -> Tuple[int, int]:
+    """Convert a 64-bit integer to a tuple of two 32-bit integers."""
+    return i & 0xFFFF_FFFF, (i >> 32) & 0xFFFF_FFFF
+
+
+@cute.jit
+def gemm_ptx_partial(
+    op: cute.nvgpu.tcgen05.mma.MmaOp,
+    acc_tmem_addr: Int32,
+    tCrA: cute.Tensor,
+    tCrB: cute.Tensor,
+    sA: Optional[cute.Tensor],
+    sB: cute.Tensor,
+    mbar_ptr: Optional[cutlass.Pointer] = None,
+    mbar_phase: Optional[Int32] = None,
+    split_arrive: Optional[int] = None,
+    zero_init: bool | Boolean = False,
+    # sA_offset: Int32 = 0,
+    # acc_offset: Int32 = 0,
+    tA_addr: Optional[Int32] = None,
+    cta_group: int = 1,
+) -> None:
+    # acc_tmem_addr += acc_offset
+    is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
+    if const_expr(not is_ts):
+        assert sA is not None, "sA must be provided when a_src is not TMEM"
+    sA_layout = sA.layout if sA is not None else tCrA.layout
+    sB_layout = sB.layout
+    idesc: int = const_expr(sm100_desc.mma_op_to_idesc(op))
+    if const_expr(not is_ts):
+        sA_swizzle = sA.iterator.type.swizzle_type
+        smem_desc_base_a: int = const_expr(
+            sm100_desc.make_smem_desc_base(
+                cute.recast_layout(128, op.a_dtype.width, sA_layout[0]),
+                sA_swizzle,
+                sm100_desc.Major.K
+                if const_expr(op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
+                else sm100_desc.Major.MN,
+            )
+        )
+        smem_desc_base_a_lo, smem_desc_a_hi = i64_to_i32x2(smem_desc_base_a)
+        smem_desc_base_a_lo = const_expr(smem_desc_base_a_lo)
+        smem_desc_a_hi = const_expr(smem_desc_a_hi)
+    else:
+        smem_desc_base_a = None
+        smem_desc_base_a_lo, smem_desc_a_hi = None, None
+    sB_swizzle = sB.iterator.type.swizzle_type
+    smem_desc_base_b: int = const_expr(
+        sm100_desc.make_smem_desc_base(
+            cute.recast_layout(128, op.b_dtype.width, sB_layout[0]),
+            sB_swizzle,
+            sm100_desc.Major.K
+            if const_expr(op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
+            else sm100_desc.Major.MN,
+        )
+    )
+    smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
+    smem_desc_base_b_lo = const_expr(smem_desc_base_b_lo)
+    smem_desc_b_hi = const_expr(smem_desc_b_hi)
+
+    tCrA_layout = (
+        tCrA.layout
+        if const_expr(not is_ts)
+        else cute.recast_layout(32, tCrA.element_type.width, tCrA.layout)
+    )
+    offset_a = [cute.crd2idx((0, 0, k), tCrA_layout) for k in range(cute.size(tCrA.shape[2]))]
+    offset_a_diff = [offset_a[k] - offset_a[k - 1] for k in range(1, cute.size(tCrA.shape[2]))]
+    offset_b = [cute.crd2idx((0, 0, k), tCrB.layout) for k in range(cute.size(tCrB.shape[2]))]
+    offset_b_diff = [offset_b[k] - offset_b[k - 1] for k in range(1, cute.size(tCrB.shape[2]))]
+
+    if const_expr(not is_ts):
+        smem_desc_start_a_lo = Int32(
+            smem_desc_base_a_lo | sm100_desc.make_smem_desc_start_addr(sA[None, None, 0].iterator)
+        )
+        # ) + sA_offset
+    else:
+        smem_desc_start_a_lo = None
+    smem_desc_start_b_lo = Int32(
+        smem_desc_base_b_lo | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator)
+    )
+    zero_init_is_dynamic = isinstance(zero_init, Boolean)
+    pred_str = "p" if zero_init_is_dynamic else "0" if zero_init else "1"
+    pred_input = zero_init if zero_init_is_dynamic else not zero_init
+    pred_setp = "setp.eq.b32" if zero_init_is_dynamic else "setp.ne.b32"
+    if const_expr(not is_ts):
+        assert mbar_ptr is None, "mbar_ptr must be None when a_src is not TMEM"
+        llvm.inline_asm(
+            None,
+            [
+                # acc.iterator.toint().ir_value(),
+                Int32(cute.arch.make_warp_uniform(smem_desc_start_a_lo)).ir_value(),
+                Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
+                Int32(pred_input).ir_value(),
+                Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
+            ],
+            "{\n\t"
+            ".reg .pred leader_thread;\n\t"
+            ".reg .pred p;\n\t"
+            ".reg .b32 idesc;\n\t"
+            ".reg .b32 tmem_acc;\n\t"
+            ".reg .b32 smem_desc_a_lo_start, smem_desc_b_lo_start;\n\t"
+            ".reg .b32 smem_desc_a_lo, smem_desc_b_lo;\n\t"
+            ".reg .b32 smem_desc_a_hi, smem_desc_b_hi;\n\t"
+            ".reg .b64 smem_desc_a, smem_desc_b;\n\t"
+            "elect.sync _|leader_thread, -1;\n\t"
+            f"mov.b32 idesc, {hex(idesc)};\n\t"
+            # f"mov.b32 tmem_acc, {hex(acc_tmem_addr)};\n\t"
+            f"mov.b32 tmem_acc, $3;\n\t"
+            "mov.b32 smem_desc_a_lo_start, $0;\n\t"
+            "mov.b32 smem_desc_b_lo_start, $1;\n\t"
+            f"mov.b32 smem_desc_a_hi, {hex(smem_desc_a_hi)};\n\t"
+            f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+            f"mov.b64 smem_desc_a, {{smem_desc_a_lo_start, smem_desc_a_hi}};\n\t"
+            f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
+            f"{pred_setp} p, $2, 0;\n\t"
+            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], smem_desc_a, smem_desc_b, idesc, {pred_str};\n\t"
+            + "".join(
+                (
+                    # f"add.u32 smem_desc_a_lo, smem_desc_a_lo, {hex(offset_a_diff[k - 1])};\n\t"
+                    # f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
+                    f"add.u32 smem_desc_a_lo, smem_desc_a_lo_start, {hex(offset_a[k])};\n\t"
+                    f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                    f"mov.b64 smem_desc_a, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
+                    f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], smem_desc_a, smem_desc_b, idesc, 1;\n\t"
+                )
+                for k in range(1, cute.size(tCrA.shape[2]))
+            )
+            + "}\n",
+            # "r,r,r",
+            "r,r,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    else:
+        # For TS gemm, somehow tCrA.iterator.toint() returns 0 no matter what, so we need to
+        # explicitly pass in the tA_addr for correctness.
+        tA_addr = tCrA[None, None, 0].iterator.toint() if tA_addr is None else tA_addr
+        input_args = [
+            # Int32(cute.arch.make_warp_uniform(tCrA[None, None, 0].iterator.toint())).ir_value(),
+            Int32(cute.arch.make_warp_uniform(tA_addr)).ir_value(),
+            Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
+            Int32(pred_input).ir_value(),
+            Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
+        ]
+        if const_expr(mbar_ptr is not None):
+            assert mbar_phase is not None, "mbar_phase must be provided when mbar_ptr is not None"
+            assert split_arrive is not None, (
+                "split_arrive must be provided when mbar_ptr is not None"
+            )
+            split_arrive_idx = split_arrive // op.shape_mnk[2]
+            input_args.append(mbar_ptr.toint().ir_value())
+            input_args.append(Int32(mbar_phase).ir_value())
+            mbar_wait_str = (
+                ".reg .pred P1; \n\t"
+                "LAB_WAIT: \n\t"
+                "mbarrier.try_wait.parity.shared::cta.b64 P1, [$4], $5, 10000000; \n\t"
+                "@P1 bra DONE; \n\t"
+                "bra     LAB_WAIT; \n\t"
+                "DONE: \n\t"
+            )
+        else:
+            mbar_wait_str = ""
+        llvm.inline_asm(
+            None,
+            # [
+            #     # acc.iterator.toint().ir_value(),
+            #     Int32(tCrA[None, None, 0].iterator.toint()).ir_value(),
+            #     Int32(smem_desc_start_b_lo).ir_value(),
+            #     Int32(not zero_init).ir_value(),
+            # ],
+            input_args,
+            "{\n\t"
+            ".reg .pred leader_thread;\n\t"
+            ".reg .pred p;\n\t"
+            ".reg .b32 idesc;\n\t"
+            ".reg .b32 tmem_acc;\n\t"
+            ".reg .b32 tmem_a;\n\t"
+            ".reg .b32 smem_desc_b_lo_start;\n\t"
+            ".reg .b32 smem_desc_b_lo;\n\t"
+            ".reg .b32 smem_desc_b_hi;\n\t"
+            ".reg .b64 smem_desc_b;\n\t"
+            "elect.sync _|leader_thread, -1;\n\t"
+            f"mov.b32 idesc, {hex(idesc)};\n\t"
+            # f"mov.b32 tmem_acc, {hex(acc_tmem_addr)};\n\t"
+            f"mov.b32 tmem_acc, $3;\n\t"
+            f"mov.b32 tmem_a, $0;\n\t"
+            f"mov.b32 smem_desc_b_lo_start, $1;\n\t"
+            f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+            f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
+            f"{pred_setp} p, $2, 0;\n\t"
+            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], [tmem_a], smem_desc_b, idesc, {pred_str};\n\t"
+            + "".join(
+                (
+                    # f"add.u32 tmem_a, tmem_a, {hex(offset_a_diff[k - 1])};\n\t"
+                    # f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
+                    f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                    f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                    # f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], [tmem_a], smem_desc_b, idesc, 1;\n\t"
+                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
+                )
+                for k in range(
+                    1,
+                    cute.size(tCrA.shape[2]) if const_expr(mbar_ptr is None) else split_arrive_idx,
+                )
+            )
+            + mbar_wait_str
+            + (
+                "".join(
+                    (
+                        f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
+                        f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                        f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
+                    )
+                    for k in range(split_arrive_idx, cute.size(tCrA.shape[2]))
+                )
+                if const_expr(mbar_ptr is not None)
+                else ""
+            )
+            + "}\n",
+            "r,r,r,r" if const_expr(mbar_ptr is None) else "r,r,r,r,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+
+
+@cute.jit
+def declare_ptx_smem_desc(
+    smem_desc_start_a: Int32,  # If TS, then this is the tmem start address for A
+    smem_desc_base_a: Optional[int],
+    tCrA_layout: cute.Layout,
+    var_name_prefix: str = "smem_desc",
+) -> None:
+    is_ts = const_expr(smem_desc_base_a is None)
+    num_k_tile = cute.size(tCrA_layout.shape[2])
+    smem_desc_base_a_lo, smem_desc_a_hi = None, None
+    if const_expr(not is_ts):
+        smem_desc_base_a_lo, smem_desc_a_hi = i64_to_i32x2(smem_desc_base_a)
+    tCrA_layout = (
+        tCrA_layout
+        if const_expr(not is_ts)
+        # else cute.recast_layout(32, tCrA.element_type.width, tCrA_layout)
+        # currently hard-coding the width to 16
+        else cute.recast_layout(32, 16, tCrA_layout)
+    )
+    offset_a = [cute.crd2idx((0, 0, k), tCrA_layout) for k in range(num_k_tile)]
+    smem_desc_start_a_lo = None
+    if const_expr(not is_ts):
+        smem_desc_start_a_lo = Int32(smem_desc_base_a_lo | smem_desc_start_a)
+    if const_expr(not is_ts):
+        llvm.inline_asm(
+            None,
+            [Int32(cute.arch.make_warp_uniform(smem_desc_start_a_lo)).ir_value()],
+            f".reg .b32 {var_name_prefix}_lo;\n\t"
+            f".reg .b64 {var_name_prefix}_<{num_k_tile}>;\n\t"
+            f"mov.b64 {var_name_prefix}_0, {{$0, {hex(smem_desc_a_hi)}}};\n\t"
+            + "".join(
+                (
+                    f"add.s32 {var_name_prefix}_lo, $0, {hex(offset_a[k])};\n\t"
+                    f"mov.b64 {var_name_prefix}_{k}, {{{var_name_prefix}_lo, {hex(smem_desc_a_hi)}}};\n\t"
+                )
+                for k in range(1, num_k_tile)
+            ),
+            "r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+
+
+@cute.jit
+def declare_ptx_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp, var_name: str = "idesc") -> None:
+    idesc = const_expr(sm100_desc.mma_op_to_idesc(op))
+    llvm.inline_asm(
+        None,
+        [],
+        f".reg .b32 {var_name};\n\t"  # noqa
+        f"mov.b32 {var_name}, {hex(idesc)};\n\t",
+        constraints="",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def gemm_ptx_precomputed_varname(
+    acc_tmem_addr: Int32,
+    smem_desc_start_b: Int32,
+    # idesc: int,
+    smem_desc_base_b: int,
+    tCrB_layout: cute.Layout,
+    smem_var_name_prefix: str,
+    idesc_var_name: str,
+    smem_offset: int,
+    zero_init: bool | Boolean = False,
+    cta_group: int = 1,
+) -> None:
+    is_ts = False
+    num_k_tile = cute.size(tCrB_layout.shape[2])
+    smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
+    offset_b = [cute.crd2idx((0, 0, k), tCrB_layout) for k in range(num_k_tile)]
+
+    smem_desc_start_b_lo = Int32(smem_desc_base_b_lo | smem_desc_start_b)
+    zero_init_is_dynamic = isinstance(zero_init, Boolean)
+    pred_str = "p" if zero_init_is_dynamic else "0" if zero_init else "1"
+    pred_input = zero_init if zero_init_is_dynamic else not zero_init
+    pred_setp = "setp.eq.b32" if zero_init_is_dynamic else "setp.ne.b32"
+    if const_expr(not is_ts):
+        llvm.inline_asm(
+            None,
+            [
+                Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
+                Int32(pred_input).ir_value(),
+                Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
+            ],
+            "{\n\t"
+            ".reg .pred leader_thread;\n\t"
+            ".reg .pred p;\n\t"
+            # ".reg .b32 idesc;\n\t"
+            ".reg .b32 tmem_acc;\n\t"
+            ".reg .b32 smem_desc_b_lo_start;\n\t"
+            ".reg .b32 smem_desc_a_lo, smem_desc_b_lo;\n\t"
+            ".reg .b32 smem_desc_a_hi, smem_desc_b_hi;\n\t"
+            # ".reg .b64 smem_desc_b;\n\t"
+            f".reg .b64 smem_desc_b_<{num_k_tile}>;\n\t"
+            "elect.sync _|leader_thread, -1;\n\t"
+            # f"mov.b32 idesc, {hex(idesc)};\n\t"
+            # f"mov.b32 tmem_acc, {hex(acc_tmem_addr)};\n\t"
+            f"mov.b32 tmem_acc, $2;\n\t"
+            "mov.b32 smem_desc_b_lo_start, $0;\n\t"
+            f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+            f"mov.b64 {{smem_desc_a_lo, smem_desc_a_hi}}, {smem_var_name_prefix}_0;\n\t"
+            f"add.s32 smem_desc_a_lo, smem_desc_a_lo, {smem_offset};\n\t"
+            f"mov.b64 {smem_var_name_prefix}_0, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
+            f"mov.b64 smem_desc_b_0, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
+            + "".join(
+                (
+                    f"mov.b64 {{smem_desc_a_lo, smem_desc_a_hi}}, {smem_var_name_prefix}_{k};\n\t"
+                    f"add.s32 smem_desc_a_lo, smem_desc_a_lo, {smem_offset};\n\t"
+                    f"add.s32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                    f"mov.b64 {smem_var_name_prefix}_{k}, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
+                    f"mov.b64 smem_desc_b_{k}, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                )
+                for k in range(1, num_k_tile)
+            )
+            + f"{pred_setp} p, $1, 0;\n\t"
+            # f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], {smem_var_name_prefix}_0, smem_desc_b, idesc, {pred_str};\n\t"
+            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], {smem_var_name_prefix}_0, smem_desc_b_0, {idesc_var_name}, {pred_str};\n\t"
+            + "".join(
+                (
+                    # f"mov.b64 {{smem_desc_a_lo, smem_desc_a_hi}}, {smem_var_name_prefix}_{k};\n\t"
+                    # f"add.s32 smem_desc_a_lo, smem_desc_a_lo, {smem_offset};\n\t"
+                    # f"add.s32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                    # f"mov.b64 {smem_var_name_prefix}_{k}, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
+                    # f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                    # f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], {smem_var_name_prefix}_{k}, smem_desc_b, idesc, 1;\n\t"
+                    # f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], {smem_var_name_prefix}_{k}, smem_desc_b, {idesc_var_name}, 1;\n\t"
+                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], {smem_var_name_prefix}_{k}, smem_desc_b_{k}, {idesc_var_name}, 1;\n\t"
+                )
+                for k in range(1, num_k_tile)
+            )
+            + "}\n",
+            "r,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+
+sm100_utils = _make_local_namespace(
+    "declare_ptx_smem_desc",
+    "declare_ptx_idesc",
+    "gemm_ptx_partial",
+    "gemm_ptx_precomputed_varname",
+)
+
+# =============================================================================
+# Pipeline Helpers
+# =============================================================================
+class NamedBarrier(NamedBarrierOg):
+    @staticmethod
+    def create(*args, **kwargs):
+        obj = NamedBarrierOg.create(*args, **kwargs)
+        # Can't assign to __class__ directly since the dataclass is frozen
+        object.__setattr__(obj, "__class__", NamedBarrier)
+        return obj
+
+    @dsl_user_op
+    def arrive_w_index(self, index: Int32, *, loc=None, ip=None) -> None:
+        """
+        The aligned flavor of arrive is used when all threads in the CTA will execute the
+        same instruction. See PTX documentation.
+        """
+        cute.arch.barrier_arrive(
+            barrier_id=self.barrier_id + index,
+            number_of_threads=self.num_threads,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def arrive_and_wait_w_index(self, index: Int32, *, loc=None, ip=None) -> None:
+        cute.arch.barrier(
+            barrier_id=self.barrier_id + index,
+            number_of_threads=self.num_threads,
+            loc=loc,
+            ip=ip,
+        )
+
+
+class PipelineAsync(PipelineAsyncOg):
+    @staticmethod
+    def create(*args, **kwargs):
+        obj = PipelineAsyncOg.create(*args, **kwargs)
+        # Can't assign to __class__ directly since the dataclass is frozen
+        # obj.__class__ = PipelineAsync
+        object.__setattr__(obj, "__class__", PipelineAsync)
+        return obj
+
+    @dsl_user_op
+    def producer_acquire_w_index_phase(
+        self,
+        index: Int32,
+        phase: Int32,
+        try_acquire_token: Optional[Boolean] = None,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        if_generate(
+            try_acquire_token is None or try_acquire_token == 0,
+            lambda: self.sync_object_empty.wait(index, phase, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def producer_commit_w_index(self, index: Int32, *, loc=None, ip=None):
+        self.sync_object_full.arrive(index, self.producer_mask, loc=loc, ip=ip)
+
+    @dsl_user_op
+    def consumer_wait_w_index_phase(
+        self,
+        index: Int32,
+        phase: Int32,
+        try_wait_token: Optional[Boolean] = None,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        if_generate(
+            try_wait_token is None or try_wait_token == 0,
+            lambda: self.sync_object_full.wait(index, phase, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def consumer_release_w_index(self, index: Int32, *, loc=None, ip=None):
+        self.sync_object_empty.arrive(index, self.consumer_mask, loc=loc, ip=ip)
+
+
+class PipelineTmaUmma(PipelineTmaUmmaOg):
+    """
+    Override producer_acquire to take in extra_tx_count parameter.
+    """
+
+    @staticmethod
+    def create(*args, **kwargs):
+        obj = PipelineTmaUmmaOg.create(*args, **kwargs)
+        # Can't assign to __class__ directly since the dataclass is frozen
+        # obj.__class__ = PipelineTmaUmma
+        object.__setattr__(obj, "__class__", PipelineTmaUmma)
+        return obj
+
+    @dsl_user_op
+    def producer_acquire(
+        self,
+        state: PipelineState,
+        try_acquire_token: Optional[Boolean] = None,
+        extra_tx_count: int = 0,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        """
+        TMA producer commit conditionally waits on buffer empty and sets the transaction barrier for leader threadblocks.
+        """
+        if_generate(
+            try_acquire_token is None or try_acquire_token == 0,
+            lambda: self.sync_object_empty.wait(state.index, state.phase, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+        if const_expr(extra_tx_count == 0):
+            if_generate(
+                self.is_leader_cta,
+                lambda: self.sync_object_full.arrive(
+                    state.index, self.producer_mask, loc=loc, ip=ip
+                ),
+                loc=loc,
+                ip=ip,
+            )
+        else:
+            tx_count = self.sync_object_full.tx_count + extra_tx_count
+            if_generate(
+                self.is_leader_cta,
+                lambda: self.sync_object_full.arrive_and_expect_tx(
+                    state.index, tx_count, loc=loc, ip=ip
+                ),
+                loc=loc,
+                ip=ip,
+            )
+
+    @dsl_user_op
+    def producer_acquire_w_index_phase(
+        self,
+        index: Int32,
+        phase: Int32,
+        try_acquire_token: Optional[Boolean] = None,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        """
+        TMA producer commit conditionally waits on buffer empty and sets the transaction barrier for leader threadblocks.
+        """
+        if_generate(
+            try_acquire_token is None or try_acquire_token == 0,
+            lambda: self.sync_object_empty.wait(index, phase, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+        if_generate(
+            self.is_leader_cta,
+            lambda: self.sync_object_full.arrive(index, self.producer_mask, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def consumer_wait_w_index_phase(
+        self,
+        index: Int32,
+        phase: Int32,
+        try_wait_token: Optional[Boolean] = None,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        if_generate(
+            try_wait_token is None or try_wait_token == 0,
+            lambda: self.sync_object_full.wait(index, phase, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def consumer_release_w_index(self, index: Int32, *, loc=None, ip=None):
+        """
+        UMMA consumer release buffer empty, cta_group needs to be provided.
+        """
+        self.sync_object_empty.arrive(index, self.consumer_mask, self.cta_group, loc=loc, ip=ip)
+
+
+class PipelineUmmaAsync(PipelineUmmaAsyncOg):
+    @staticmethod
+    def create(*args, **kwargs):
+        obj = PipelineUmmaAsyncOg.create(*args, **kwargs)
+        # Can't assign to __class__ directly since the dataclass is frozen
+        object.__setattr__(obj, "__class__", PipelineUmmaAsync)
+        return obj
+
+    @dsl_user_op
+    def producer_acquire_w_index_phase(
+        self,
+        index: Int32,
+        phase: Int32,
+        try_acquire_token: Optional[Boolean] = None,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        if_generate(
+            try_acquire_token is None or try_acquire_token == 0,
+            lambda: self.sync_object_empty.wait(index, phase, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def producer_commit_w_index(self, index: Int32, *, loc=None, ip=None):
+        """
+        UMMA producer commit buffer full, cta_group needs to be provided.
+        """
+        self.sync_object_full.arrive(index, self.producer_mask, self.cta_group, loc=loc, ip=ip)
+
+    @dsl_user_op
+    def consumer_wait_w_index_phase(
+        self,
+        index: Int32,
+        phase: Int32,
+        try_wait_token: Optional[Boolean] = None,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        if_generate(
+            try_wait_token is None or try_wait_token == 0,
+            lambda: self.sync_object_full.wait(index, phase, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def consumer_release_w_index(self, index: Int32, *, loc=None, ip=None):
+        self.sync_object_empty.arrive(index, self.consumer_mask, loc=loc, ip=ip)
+
+
+class PipelineAsyncUmma(PipelineAsyncUmmaOg):
+    @staticmethod
+    def create(*args, **kwargs):
+        obj = PipelineAsyncUmmaOg.create(*args, **kwargs)
+        # Can't assign to __class__ directly since the dataclass is frozen
+        object.__setattr__(obj, "__class__", PipelineAsyncUmma)
+        return obj
+
+    @dsl_user_op
+    def producer_acquire_w_index_phase(
+        self,
+        index: Int32,
+        phase: Int32,
+        try_acquire_token: Optional[Boolean] = None,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        if_generate(
+            try_acquire_token is None or try_acquire_token == 0,
+            lambda: self.sync_object_empty.wait(index, phase, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def producer_commit_w_index(self, index: Int32, *, loc=None, ip=None):
+        self.sync_object_full.arrive(index, self.producer_mask, loc=loc, ip=ip)
+
+    @dsl_user_op
+    def consumer_wait_w_index_phase(
+        self,
+        index: Int32,
+        phase: Int32,
+        try_wait_token: Optional[Boolean] = None,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        if_generate(
+            try_wait_token is None or try_wait_token == 0,
+            lambda: self.sync_object_full.wait(index, phase, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def consumer_release_w_index(self, index: Int32, *, loc=None, ip=None):
+        """
+        UMMA consumer release buffer empty, cta_group needs to be provided.
+        """
+        self.sync_object_empty.arrive(index, self.consumer_mask, self.cta_group, loc=loc, ip=ip)
+
+pipeline_custom = _make_local_namespace(
+    "NamedBarrier",
+    "PipelineAsync",
+    "PipelineTmaUmma",
+    "PipelineUmmaAsync",
+    "PipelineAsyncUmma",
+)
+
+# =============================================================================
+# Mask Helpers
+# =============================================================================
+MASK_R2P_CHUNK_SIZE: int = 32
+
+MaskGenFn: TypeAlias = Callable[[int], Uint32]
+
+@cute.jit
+def r2p_bitmask_below(limit: Int32, s: int) -> Uint32:
+    """32-bit R2P bitmask keeping positions < limit (exclusive upper bound)."""
+    m = max((s + 1) * MASK_R2P_CHUNK_SIZE - limit, 0)
+    return utils.shr_u32(Uint32(0xFFFFFFFF), Uint32(m))
+
+
+@cute.jit
+def mask_r2p_lambda(
+    X: cute.Tensor,
+    mask_gen_fn: cutlass.Constexpr[MaskGenFn],
+    rank1: bool = False,
+) -> None:
+    """Apply R2P masking with a custom bitmask generator."""
+    ncol = const_expr(cute.size(X.shape[cute.rank(X) - 1]) if not rank1 else cute.size(X.shape))
+    CHUNK_SIZE = MASK_R2P_CHUNK_SIZE
+    for s in cutlass.range_constexpr(cute.ceil_div(ncol, CHUNK_SIZE)):
+        mask = mask_gen_fn(s)
+        for i in cutlass.range_constexpr(min(CHUNK_SIZE, ncol - s * CHUNK_SIZE)):
+            in_bound = cutlass.Boolean(mask & (Uint32(1) << i))
+            c = s * CHUNK_SIZE + i
+            if const_expr(rank1):
+                X[c] = X[c] if in_bound else -Float32.inf
+            else:
+                for r in cutlass.range_constexpr(cute.size(X.shape[0])):
+                    X[r, c] = X[r, c] if in_bound else -Float32.inf
+
+
+@cute.jit
+def apply_block_size_mask(
+    acc_S: cute.Tensor,
+    block_size: Int32,
+    n_block_size: cutlass.Constexpr[int] = 128,
+) -> None:
+    """Apply R2P bitmask masking positions >= block_size within a tile."""
+    if block_size < n_block_size:
+        mask_r2p_lambda(
+            acc_S,
+            lambda s: r2p_bitmask_below(block_size, s),
+            rank1=True,
+        )
+
+# =============================================================================
+# GQA Packing Helpers
+# =============================================================================
+def pack_gqa_layout(T, qhead_per_kvhead, nheads_kv, head_idx):
+    """Reshape a tensor to fold qhead_per_kvhead into the seqlen dimension (mode 0).
+
+    The head dimension is at mode ``head_idx``.  Modes before it (1..head_idx-1)
+    are kept as-is (e.g. headdim for Q/O tensors), and modes after it are kept
+    as-is (e.g. batch).
+
+    For Q/O tensors (head_idx=2):
+        (seqlen_q, headdim, nheads, batch, ...) -> ((qhead_per_kvhead, seqlen_q), headdim, nheads_kv, batch, ...)
+    For LSE tensors (head_idx=1):
+        (seqlen_q, nheads, batch, ...) -> ((qhead_per_kvhead, seqlen_q), nheads_kv, batch, ...)
+    """
+    head_stride = T.stride[head_idx]
+    shape_packed = (
+        (qhead_per_kvhead, T.shape[0]),
+        *[T.shape[i] for i in range(1, head_idx)],
+        nheads_kv,
+        *[T.shape[i] for i in range(head_idx + 1, len(T.shape))],
+    )
+    stride_packed = (
+        (head_stride, T.stride[0]),
+        *[T.stride[i] for i in range(1, head_idx)],
+        head_stride * qhead_per_kvhead,
+        *[T.stride[i] for i in range(head_idx + 1, len(T.shape))],
+    )
+    return cute.make_tensor(T.iterator, cute.make_layout(shape_packed, stride=stride_packed))
+
+
+class PackGQA:
+    def __init__(
+        self,
+        m_block_size: cutlass.Constexpr[int],
+        head_dim_padded: cutlass.Constexpr[int],
+        check_hdim_oob: cutlass.Constexpr[bool],
+        qhead_per_kvhead: cutlass.Constexpr[bool],
+    ):
+        self.m_block_size = m_block_size
+        self.head_dim_padded = head_dim_padded
+        self.check_hdim_oob = check_hdim_oob
+        self.qhead_per_kvhead = qhead_per_kvhead
+
+    @cute.jit
+    def compute_ptr(
+        self,
+        tensor: cute.Tensor,
+        cRows: cute.Tensor,
+        tidx: cutlass.Int32,
+        block: cutlass.Int32,
+        threads_per_row: cutlass.Constexpr[int],
+        num_threads: cutlass.Constexpr[int],
+    ):
+        num_ptr_per_thread = cute.ceil_div(cute.size(cRows), threads_per_row)
+        tPrPtr = cute.make_rmem_tensor(num_ptr_per_thread, cutlass.Int64)
+        for i in cutlass.range_constexpr(num_ptr_per_thread):
+            row = i * num_threads + cRows[tidx % threads_per_row][0]
+            idx = block * self.m_block_size + row
+            m_idx = idx // self.qhead_per_kvhead
+            h_idx = idx - m_idx * self.qhead_per_kvhead
+            tPrPtr[i] = utils.elem_pointer(tensor, ((h_idx, m_idx),)).toint()
+        return tPrPtr
+
+    @cute.jit
+    def load_Q(
+        self,
+        mQ: cute.Tensor,  # ((qhead_per_kvhead, seqlen_q), headdim)
+        sQ: cute.Tensor,  # (m_block_size, head_dim_padded)
+        gmem_tiled_copy: cute.TiledCopy,
+        tidx: cutlass.Int32,
+        block: cutlass.Int32,
+        seqlen: cutlass.Int32,
+    ):
+        gmem_thr_copy = gmem_tiled_copy.get_slice(tidx)
+        cQ = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
+        tQsQ = gmem_thr_copy.partition_D(sQ)
+        tQcQ = gmem_thr_copy.partition_S(cQ)
+        t0QcQ = gmem_thr_copy.get_slice(0).partition_S(cQ)
+        tQpQ = utils.predicate_k(tQcQ, limit=mQ.shape[1])
+        tQcQ_row = tQcQ[0, None, 0]
+        threads_per_row = gmem_tiled_copy.layout_tv_tiled.shape[0][0]
+        assert cute.arch.WARP_SIZE % threads_per_row == 0, "threads_per_row must divide WARP_SIZE"
+        num_threads = gmem_tiled_copy.size
+        tPrQPtr = self.compute_ptr(mQ[None, 0], tQcQ_row, tidx, block, threads_per_row, num_threads)
+        for m in cutlass.range_constexpr(cute.size(tQsQ.shape[1])):
+            q_ptr_i64 = utils.shuffle_sync(
+                tPrQPtr[m // threads_per_row], m % threads_per_row, width=threads_per_row
+            )
+            q_gmem_ptr = cute.make_ptr(
+                mQ.element_type, q_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
+            )
+            if (
+                t0QcQ[0, m, 0][0]
+                < seqlen * self.qhead_per_kvhead - block * self.m_block_size - tQcQ_row[0][0]
+            ):
+                mQ_cur = cute.make_tensor(q_gmem_ptr, (self.head_dim_padded,))
+                elems_per_load = cute.size(tQsQ.shape[0][0])
+                mQ_cur_copy = cute.tiled_divide(mQ_cur, (elems_per_load,))
+                for k in cutlass.range_constexpr(cute.size(tQsQ.shape[2])):
+                    ki = tQcQ[0, 0, k][1] // elems_per_load
+                    cute.copy(
+                        gmem_thr_copy,
+                        mQ_cur_copy[None, ki],
+                        tQsQ[None, m, k],
+                        pred=tQpQ[None, m, k] if cutlass.const_expr(self.check_hdim_oob) else None,
+                    )
+            # We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
+
+    @cute.jit
+    def store_LSE(
+        self,
+        mLSE: cute.Tensor,  # (qhead_per_kvhead, seqlen_q)
+        tLSErLSE: cute.Tensor,  # (m_block_size, head_dim_padded)
+        tiled_mma: cute.TiledMma,
+        tidx: cutlass.Int32,
+        block: cutlass.Int32,
+        seqlen: cutlass.Int32,
+    ):
+        thr_mma = tiled_mma.get_slice(tidx)
+        caccO = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
+        taccOcO = thr_mma.partition_C(caccO)
+        taccOcO_row = layout_utils.reshape_acc_to_mn(taccOcO)[None, 0]
+        assert cute.size(tLSErLSE) == cute.size(taccOcO_row)
+        threads_per_row = tiled_mma.tv_layout_C.shape[0][0]
+        assert cute.arch.WARP_SIZE % threads_per_row == 0, "threads_per_row must divide WARP_SIZE"
+        assert cute.size(tLSErLSE) <= threads_per_row
+        num_threads = tiled_mma.size
+        tPrLSEPtr = self.compute_ptr(mLSE, taccOcO_row, tidx, block, threads_per_row, num_threads)
+        for m in cutlass.range_constexpr(cute.size(tLSErLSE)):
+            lse_ptr_i64 = utils.shuffle_sync(
+                tPrLSEPtr[m // threads_per_row],
+                m % threads_per_row,
+                width=threads_per_row,
+            )
+            lse_gmem_ptr = cute.make_ptr(
+                mLSE.element_type, lse_ptr_i64, cute.AddressSpace.gmem, assumed_align=4
+            )
+            row = block * self.m_block_size + taccOcO_row[m][0]
+            # Only the thread corresponding to column 0 writes out the lse to gmem
+            if taccOcO[0][1] == 0 and row < seqlen * self.qhead_per_kvhead:
+                mLSE_copy = cute.make_tensor(lse_gmem_ptr, (1,))
+                mLSE_copy[0] = tLSErLSE[m]
+
+    @cute.jit
+    def store_O(
+        self,
+        mO: cute.Tensor,  # ((qhead_per_kvhead, seqlen_q), headdim)
+        tOrO: cute.Tensor,  # (m_block_size, head_dim_padded) split across threads according to gmem_tiled_copy
+        gmem_tiled_copy: cute.TiledCopy,
+        tidx: cutlass.Int32,
+        block: cutlass.Int32,
+        seqlen: cutlass.Int32,
+    ):
+        gmem_thr_copy = gmem_tiled_copy.get_slice(tidx)
+        cO = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
+        tOcO = gmem_thr_copy.partition_S(cO)
+        t0OcO = gmem_thr_copy.get_slice(0).partition_S(cO)
+        tOpO = utils.predicate_k(tOcO, limit=mO.shape[1])
+        tOcO_row = tOcO[0, None, 0]
+        threads_per_row = gmem_tiled_copy.layout_tv_tiled.shape[0][0]
+        assert cute.arch.WARP_SIZE % threads_per_row == 0, "threads_per_row must divide WARP_SIZE"
+        num_threads = gmem_tiled_copy.size
+        tPrOPtr = self.compute_ptr(mO[None, 0], tOcO_row, tidx, block, threads_per_row, num_threads)
+        for m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
+            o_ptr_i64 = utils.shuffle_sync(
+                tPrOPtr[m // threads_per_row], m % threads_per_row, width=threads_per_row
+            )
+            o_gmem_ptr = cute.make_ptr(
+                mO.element_type, o_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
+            )
+            if (
+                t0OcO[0, m, 0][0]
+                < seqlen * self.qhead_per_kvhead - block * self.m_block_size - tOcO_row[0][0]
+            ):
+                mO_cur = cute.make_tensor(o_gmem_ptr, (self.head_dim_padded,))
+                elems_per_load = cute.size(tOrO.shape[0][0])
+                mO_cur_copy = cute.tiled_divide(mO_cur, (elems_per_load,))
+                for k in cutlass.range_constexpr(cute.size(tOrO.shape[2])):
+                    ki = tOcO[0, 0, k][1] // elems_per_load
+                    cute.copy(
+                        gmem_thr_copy,
+                        tOrO[None, m, k],
+                        mO_cur_copy[None, ki],
+                        pred=tOpO[None, m, k] if cutlass.const_expr(self.check_hdim_oob) else None,
+                    )
+
+# =============================================================================
+# Tile Schedulers
+# =============================================================================
+class SingleTileScheduler:
+    @dataclass
+    class Params(ParamsBase):
+        num_block: Int32
+        num_head: Int32
+        num_batch: Int32
+        num_splits: Int32
+        num_splits_divmod: FastDivmodDivisor
+        cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
+
+        @staticmethod
+        def create(
+            args: TileSchedulerArguments, *, loc=None, ip=None
+        ) -> "SingleTileScheduler.Params":
+            return SingleTileScheduler.Params(
+                args.num_block,
+                args.num_head,
+                args.num_batch,
+                args.num_splits,
+                FastDivmodDivisor(args.num_splits),
+                args.cluster_shape_mn,
+            )
+
+    def __init__(self, params: Params, blk_coord: cute.Coord, *, loc=None, ip=None):
+        self.params = params
+        self._blk_coord = blk_coord
+        self._is_first_block = True
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def to_underlying_arguments(
+        args: TileSchedulerArguments,
+        *,
+        scheduling_mode=SchedulingMode.STATIC,
+        loc=None,
+        ip=None,
+    ) -> Params:
+        return SingleTileScheduler.Params.create(args, loc=loc, ip=ip)
+
+    @staticmethod
+    def create(params: Params, clc_response_ptr=None, *, loc=None, ip=None) -> "SingleTileScheduler":
+        blk_coord = cute.arch.block_idx()
+        return SingleTileScheduler(params, blk_coord, loc=loc, ip=ip)
+
+    # called by host
+    @staticmethod
+    def get_grid_shape(
+        params: Params,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        assert params.cluster_shape_mn[1] == 1, "Only cluster_shape_mn[1] == 1 is supported"
+        return (
+            cute.round_up(params.num_block, params.cluster_shape_mn[0]),
+            params.num_head * params.num_splits,
+            params.num_batch,
+        )
+
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        block_idx, head_idx, batch_idx = self._blk_coord
+        split_idx = Int32(0)
+        return WorkTileInfo(
+            (block_idx, head_idx, batch_idx, split_idx),
+            self._is_first_block,
+        )
+
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        """No-op: the single-tile scheduler has no next work to prefetch."""
+        return None
+
+    def advance_to_next_work(self, *, loc=None, ip=None, mbarrier_addr=None):
+        assert mbarrier_addr is None
+        self._is_first_block = False
+
+    def consumer_advance(self, *, loc=None, ip=None):
+        self.advance_to_next_work()
+        return self.get_current_work()
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in [self.params, self._blk_coord]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip([self.params, self._blk_coord], self._values_pos):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return SingleTileScheduler(*(tuple(obj_list)), loc=self._loc)
+
+
+class StaticPersistentTileScheduler:
+    @dataclass
+    class Params(ParamsBase):
+        num_block_cluster_divmod: FastDivmodDivisor
+        num_head_divmod: FastDivmodDivisor
+        total_blocks_cluster: Int32
+        num_block: Int32
+        num_head: Int32
+        num_batch: Int32
+        cluster_shape_m: cutlass.Constexpr[int] = 1
+        scheduling_mode: cutlass.Constexpr[SchedulingMode] = SchedulingMode.STATIC
+
+        @staticmethod
+        def create(
+            args: TileSchedulerArguments,
+            *,
+            scheduling_mode: SchedulingMode = SchedulingMode.STATIC,
+            loc=None,
+            ip=None,
+        ) -> "StaticPersistentTileScheduler.Params":
+            num_block_cluster = cute.ceil_div(args.num_block, cute.size(args.cluster_shape_mn))
+            total_blocks_cluster = num_block_cluster * args.num_head * args.num_batch
+            return StaticPersistentTileScheduler.Params(
+                FastDivmodDivisor(num_block_cluster),
+                FastDivmodDivisor(args.num_head),
+                total_blocks_cluster,
+                args.num_block,
+                args.num_head,
+                args.num_batch,
+                cluster_shape_m=args.cluster_shape_mn[0],
+                scheduling_mode=scheduling_mode,
+            )
+
+    def __init__(
+        self,
+        params: Params,
+        tile_idx: Int32,
+        clc_scheduler=None,
+        clc_pipeline=None,
+        clc_consumer_state=None,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        self.params = params
+        self._tile_idx = tile_idx
+        self._clc_scheduler = clc_scheduler
+        self._clc_pipeline = clc_pipeline
+        self._clc_consumer_state = clc_consumer_state
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def to_underlying_arguments(
+        args: TileSchedulerArguments,
+        *,
+        scheduling_mode: SchedulingMode = SchedulingMode.STATIC,
+        loc=None,
+        ip=None,
+    ) -> Params:
+        return StaticPersistentTileScheduler.Params.create(
+            args, scheduling_mode=scheduling_mode, loc=loc, ip=ip
+        )
+
+    @staticmethod
+    @cute.jit
+    def create(
+        params: Params, clc_response_ptr=None, *, loc=None, ip=None
+    ) -> "StaticPersistentTileScheduler":
+        if const_expr(params.scheduling_mode == SchedulingMode.CLC):
+            from cutlass.utils import (
+                ClcDynamicPersistentTileScheduler,
+                ClcDynamicPersistentTileSchedulerParams,
+            )
+            cutlass_params = ClcDynamicPersistentTileSchedulerParams(
+                problem_shape_ntile_mnl=(
+                    cute.round_up(params.num_block, params.cluster_shape_m),
+                    params.num_head,
+                    params.num_batch,
+                ),
+                cluster_shape_mnk=(params.cluster_shape_m, 1, 1),
+            )
+            block_idx = cute.arch.block_idx()
+            grid_dim = cute.arch.grid_dim()
+            clc_scheduler = ClcDynamicPersistentTileScheduler.create(
+                cutlass_params,
+                block_idx,
+                grid_dim,
+                clc_response_ptr,
+            )
+            return StaticPersistentTileScheduler(
+                params, block_idx[0], clc_scheduler, loc=loc, ip=ip
+            )
+        # Static path
+        if const_expr(cute.size(params.cluster_shape_m) == 1):
+            tile_idx = cute.arch.block_idx()[0]
+        else:
+            tile_idx = cute.arch.cluster_idx()[0]
+        return StaticPersistentTileScheduler(params, tile_idx, loc=loc, ip=ip)
+
+    # called by host
+    @staticmethod
+    def get_grid_shape(
+        params: Params,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        if const_expr(params.scheduling_mode == SchedulingMode.CLC):
+            return (
+                cute.round_up(params.num_block, params.cluster_shape_m),
+                params.num_head,
+                params.num_batch,
+            )
+        hardware_info = cutlass.utils.HardwareInfo()
+        sm_count = hardware_info.get_device_multiprocessor_count()
+        # Grid must be a multiple of cluster_shape_m for CUDA cluster launch.
+        max_ctas = (sm_count // params.cluster_shape_m) * params.cluster_shape_m
+        grid_x = cutlass.min(max_ctas, params.total_blocks_cluster * params.cluster_shape_m)
+        return (grid_x, Int32(1), Int32(1))
+
+    @cute.jit
+    def _clc_work_to_coords(self, work) -> WorkTileInfo:
+        """Convert CLC response (block, head, batch) to WorkTileInfo."""
+        block_idx = work.tile_idx[0]
+        if const_expr(self.params.cluster_shape_m > 1):
+            block_idx = block_idx // self.params.cluster_shape_m
+        batch_idx = work.tile_idx[2]
+        return WorkTileInfo(
+            (Int32(block_idx), Int32(work.tile_idx[1]), Int32(batch_idx), Int32(0)),
+            work.is_valid_tile,
+        )
+
+    @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
+            work = self._clc_scheduler.get_current_work()
+            self._tile_idx = work.tile_idx[0]
+            return self._clc_work_to_coords(work)
+        hn_idx, block_idx = divmod(self._tile_idx, self.params.num_block_cluster_divmod)
+        batch_idx, head_idx = divmod(hn_idx, self.params.num_head_divmod)
+        is_valid = self._tile_idx < self.params.total_blocks_cluster
+        return WorkTileInfo(
+            (Int32(block_idx), Int32(head_idx), Int32(batch_idx), Int32(0)), is_valid
+        )
+
+    @cute.jit
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
+            work = self._clc_scheduler.initial_work_tile_info()
+            self._tile_idx = work.tile_idx[0]
+            return self._clc_work_to_coords(work)
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        """No-op: static and CLC schedulers fetch work in advance_to_next_work."""
+        return None
+
+    def advance_to_next_work(self, *, loc=None, ip=None, mbarrier_addr=None):
+        if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
+            assert mbarrier_addr is not None
+            self._clc_scheduler.advance_to_next_work(mbarrier_addr)
+        else:
+            assert mbarrier_addr is None
+            if const_expr(self.params.cluster_shape_m == 1):
+                self._tile_idx += cute.arch.grid_dim()[0]
+            else:
+                self._tile_idx += cute.arch.cluster_dim()[0]
+
+    def consumer_advance(self, *, loc=None, ip=None):
+        if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
+            self._clc_pipeline.consumer_wait(self._clc_consumer_state)
+            work_tile = self.get_current_work()
+            self._clc_pipeline.consumer_release(self._clc_consumer_state)
+            self._clc_consumer_state.advance()
+            return work_tile
+        self.advance_to_next_work()
+        return self.get_current_work()
+
+    def set_clc_pipeline(self, clc_pipeline, clc_consumer_state):
+        self._clc_pipeline = clc_pipeline
+        self._clc_consumer_state = clc_consumer_state
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        objs = [self.params, self._tile_idx]
+        if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
+            objs += [self._clc_scheduler, self._clc_pipeline, self._clc_consumer_state]
+        for obj in objs:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        objs = [self.params, self._tile_idx]
+        if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
+            objs += [self._clc_scheduler, self._clc_pipeline, self._clc_consumer_state]
+        for obj, n_items in zip(objs, self._values_pos):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return StaticPersistentTileScheduler(*(tuple(obj_list)), loc=self._loc)

@@ -2,57 +2,63 @@
 
 ## Features
 
-**Two kernel backends:**
+**Forward backends:**
 
-| | blk128 (CuTe DSL / JIT) | blk64 (C++ AOT / CUTLASS) |
+| | SM100 blk128 (CuTe DSL / JIT) | SM90 blk64 (CuTe DSL / JIT) | SM100 blk64 (C++ AOT / CUTLASS) |
+|---|---|---|---|
+| Dtype | bf16, fp16 | bf16, fp16 | bf16 only |
+| Head dim | 64, 96, 128, (192, 128) | 64, 96, 128 | 128 only |
+| Attention | MHA, GQA, MQA | MHA, GQA, MQA | MHA only |
+| pack_gqa | Yes | No | No |
+| Persistent scheduling | Static + CLC dynamic | Static | CLC dynamic (built-in) |
+| Variable block counts (`q2k_block_nums`) | Yes (>= 0) | Yes (>= 1) | Yes (>= 1) |
+| LSE output | Yes | Yes | Yes |
+
+**Backward backends:**
+
+| | SM90 blk64 (CuTe DSL / JIT) | SM100 blk64 (CuTe DSL / JIT) |
 |---|---|---|
-| Dtype | bf16, fp16 | bf16 only |
-| Head dim | 64, 96, 128, (192, 128) | 128 only |
-| Attention | MHA, GQA, MQA | MHA only |
-| pack_gqa | Yes | No |
-| Persistent scheduling | Static + CLC dynamic | CLC dynamic (built-in) |
-| Variable block counts (`q2k_block_nums`) | Yes (>= 0) | Yes (>= 1) |
-| LSE output | Yes | Yes |
+| Dtype | bf16 | bf16 |
+| Head dim | 128 | 128 |
+| Attention | MHA only | MHA only |
+| Sparse task layout | bucketed k2q CSR | bucketed k2q CSR |
 
-**Not supported (both backends):** causal, local, mask_mod, score_mod, split-kv, paged_kv, softcap, varlen
+**Not supported (current sparse kernels):** causal, local, mask_mod, score_mod, split-kv, paged_kv, softcap, varlen
 
 ## Directory Structure
 
 ```
 BSA/
-├── bsa_attn_interface.py         # Public API (fwd, bwd, qbucket bwd)
-├── test_flash_fwd.py             # Forward tests & benchmarks (blk64 + blk128)
-├── test_flash_bwd.py             # Backward tests & benchmarks (blk64)
+├── bsa_attn_interface.py         # Public API (fwd, bwd)
+├── tests/
+│   ├── test_flash_fwd.py         # Forward tests & benchmarks (blk64 + blk128)
+│   └── test_flash_bwd.py         # Backward tests & benchmarks (blk64)
 ├── requirements.txt              # Python dependencies
 ├── Makefile                      # Build & test automation
 │
 ├── csrc/fwd/
 │   ├── sm100_blk128/                 # blk128 — CuTe DSL / JIT compiled
-│   │   ├── flash_fwd_sm100.py        # Main forward kernel
-│   │   ├── blackwell_helpers.py      # SM100 UMMA-based GEMM (2CTA WIP)
-│   │   ├── softmax.py                # Online softmax
-│   │   ├── mask.py                   # Seqlen & block-size masking
-│   │   ├── block_info.py             # Tile dims, block-sparse index lookup
-│   │   ├── tile_scheduler.py         # Static persistent & CLC scheduling
-│   │   ├── pipeline.py               # Circular buffer management
-│   │   ├── pack_gqa.py               # GQA head packing
-│   │   └── ...                       # utils, named_barrier, mma descriptors
+│   │   └── flash_fwd_sm100.py        # Single-file Blackwell forward kernel
+│   ├── sm90_blk64/                   # blk64 — SM90 CuTe DSL / JIT compiled
+│   │   └── flash_fwd_sm90.py         # Single-file Hopper forward kernel
 │   │
 │   └── sm100_blk64/                  # blk64 — C++ AOT / CUTLASS compiled
-│       ├── flash_fwd_kernel_sm100.h      # Kernel definition
+│       ├── bsa_api.cpp                   # PyTorch C++ bindings (returns [out, lse])
+│       ├── bsa_fwd_kernel_sm100.h        # Kernel definition
+│       ├── bsa_fwd_launch_template.h     # Host launch wrapper
 │       ├── mainloop_fwd_sm100.hpp        # Mainloop (load, mma, softmax)
-│       ├── flash_fwd_launch_template.cu  # Host launch wrapper
 │       ├── epilogue_fwd_sm100.hpp        # Output epilogue
 │       ├── softmax.h                     # Softmax
 │       ├── pipeline.hpp                  # Pipeline management
 │       ├── tile_scheduler.hpp            # Tile scheduler
-│       ├── bindings.cpp                  # PyTorch C++ bindings (returns [out, lse])
+│       ├── instantiations/               # AOT template instantiations
 │       └── setup.py                      # Build script (bdist_wheel + CUDAExtension)
 │
 ├── csrc/bwd/
-│   └── sm100_blk64/                      # blk64 backward — CuTe DSL / JIT compiled
-│       ├── flash_bwd_sm100.py            # KV-major backward kernel
-│       └── flash_bwd_sm100_qbucket.py    # Q-range bucketed backward kernel
+│   ├── sm90_blk64/                       # blk64 backward — SM90 CuTe DSL / JIT compiled
+│   │   └── flash_bwd_sm90.py             # Localized Hopper backward kernel
+│   └── sm100_blk64/                      # blk64 backward — SM100 CuTe DSL / JIT compiled
+│       └── flash_bwd_sm100.py            # Bucketed k2q CSR backward kernel
 │
 ├── utils/
 │   ├── cache_utils.py            # JIT compilation cache
@@ -93,35 +99,49 @@ make setup
 
 ```python
 import torch
-from bsa_attn_interface import bsa_attn_fwd, bsa_attn_bwd, bsa_attn_bwd_qbucket
+from bsa_attn_interface import bsa_attn_fwd, bsa_attn_bwd
 
-q = torch.randn(1, 1024, 8, 128, device="cuda", dtype=torch.bfloat16)
-k = torch.randn(1, 1024, 8, 128, device="cuda", dtype=torch.bfloat16)
-v = torch.randn(1, 1024, 8, 128, device="cuda", dtype=torch.bfloat16)
+q = torch.randn(1, 8, 1024, 128, device="cuda", dtype=torch.bfloat16)
+k = torch.randn(1, 8, 1024, 128, device="cuda", dtype=torch.bfloat16)
+v = torch.randn(1, 8, 1024, 128, device="cuda", dtype=torch.bfloat16)
 
 out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes)
+
+# BSHD compatibility path. The wrapper canonicalizes to BHSD with view-only transposes.
+q_bshd = q.transpose(1, 2)
+k_bshd = k.transpose(1, 2)
+v_bshd = v.transpose(1, 2)
+out_bshd, lse = bsa_attn_fwd(
+    q_bshd, k_bshd, v_bshd,
+    q2k_block_index, block_sparse_num, block_sizes,
+    layout="bshd",
+)
 
 # Variable per-Q-block KV block counts
 out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, 0, block_sizes,
                          q2k_block_nums=q2k_block_nums)
 
-# Backward uses BHSD layout: (batch, heads, seqlen, dim)
-q_bhsd = q.transpose(1, 2).contiguous()
-k_bhsd = k.transpose(1, 2).contiguous()
-v_bhsd = v.transpose(1, 2).contiguous()
-out_bhsd = out.transpose(1, 2).contiguous()
-dout_bhsd = torch.randn_like(out_bhsd)
+dout = torch.randn_like(out)
 
 dq, dk, dv = bsa_attn_bwd(
-    dout_bhsd, q_bhsd, k_bhsd, v_bhsd, out_bhsd, lse,
+    dout, q, k, v, out, lse,
     q2k_block_index, block_sparse_num, block_sizes,
 )
 
-# Long-sequence experimental path: Q-range bucketed backward
-dq, dk, dv = bsa_attn_bwd_qbucket(
-    dout_bhsd, q_bhsd, k_bhsd, v_bhsd, out_bhsd, lse,
+# BSHD compatibility path for backward as well.
+dout_bshd = dout.transpose(1, 2)
+out_bshd = out.transpose(1, 2)
+dq_bshd, dk_bshd, dv_bshd = bsa_attn_bwd(
+    dout_bshd, q_bshd, k_bshd, v_bshd, out_bshd, lse,
     q2k_block_index, block_sparse_num, block_sizes,
-    q_bucket_size_blocks=512,
+    layout="bshd",
+)
+
+# Optional tuning override for the bucketed k2q CSR backward task layout
+dq, dk, dv = bsa_attn_bwd(
+    dout, q, k, v, out, lse,
+    q2k_block_index, block_sparse_num, block_sizes,
+    bucket_size_blocks=512,
 )
 ```
 
@@ -129,17 +149,22 @@ dq, dk, dv = bsa_attn_bwd_qbucket(
 
 ### `bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes, ...)`
 
-SM100 block-sparse forward attention (blk128 backend).
+Block-sparse forward attention. The repo canonical layout is `BHSD`; the
+public API also supports explicit `layout="bshd"` compatibility at the wrapper
+boundary.
 
-**Tensor layout:** `(batch, seqlen, num_heads, head_dim)`, last dim contiguous, 16-byte aligned.
+**Default tensor layout:** `(batch, num_heads, seqlen, head_dim)` (`BHSD`), last dim contiguous, 16-byte aligned.
+When `layout="bshd"`, inputs and outputs use `(batch, seqlen, num_heads, head_dim)`; the wrapper uses view-only transposes and does not materialize layout copies.
+The last dimension must be `head_dim` with stride 1. Physical `BHDS` / non-contiguous-head-dim layouts are not supported.
+`lse` is always `(batch, num_heads, seqlen_q)`.
 
 #### Input Tensors
 
 | Tensor | Shape | Type | Description |
 |--------|-------|------|-------------|
-| `q` | (batch, seqlen_q, num_heads, head_dim) | bf16/fp16 | Query |
-| `k` | (batch, seqlen_k, num_heads_kv, head_dim) | bf16/fp16 | Key |
-| `v` | (batch, seqlen_k, num_heads_kv, head_dim_v) | bf16/fp16 | Value |
+| `q` | (batch, num_heads, seqlen_q, head_dim) | bf16/fp16 | Query |
+| `k` | (batch, num_heads_kv, seqlen_k, head_dim) | bf16/fp16 | Key |
+| `v` | (batch, num_heads_kv, seqlen_k, head_dim_v) | bf16/fp16 | Value |
 
 #### Block-Sparse Parameters (mandatory)
 
@@ -165,13 +190,14 @@ SM100 block-sparse forward attention (blk128 backend).
 | `return_lse` | `False` | Whether to return log-sum-exp |
 | `out` | `None` | Pre-allocated output tensor |
 | `lse` | `None` | Pre-allocated LSE tensor |
+| `layout` | `"bhsd"` | Input/output layout: `"bhsd"` or `"bshd"` |
 
 #### Dense Attention
 
 For dense (full) attention, construct block-sparse args that cover all KV blocks:
 
 ```python
-# See make_dense_block_sparse_args() in test_flash_fwd.py
+# See make_dense_block_sparse_args() in tests/test_flash_fwd.py
 q2k_block_index = [0, 1, ..., N-1]  # for all Q blocks
 block_sparse_num = N                  # must be even, >= 2
 block_sizes = [tile_n] * N            # last block adjusted for seqlen remainder
@@ -179,11 +205,14 @@ block_sizes = [tile_n] * N            # last block adjusted for seqlen remainder
 
 ### `bsa_attn_bwd(dout, q, k, v, out, lse, q2k_block_index, block_sparse_num, block_sizes, ...)`
 
-SM100 block-sparse backward attention (blk64 backend only).
+SM90/SM100 block-sparse backward attention (blk64 backend).
 
 This recomputes the attention probabilities from `q/k/v`, `out`, and `lse`, then returns gradients `(dq, dk, dv)`.
 
-**Tensor layout:** `(batch, num_heads, seqlen, head_dim)` (`BHSD`), last dim contiguous.
+**Default tensor layout:** `(batch, num_heads, seqlen, head_dim)` (`BHSD`), matching the default forward layout. Last dim must be contiguous.
+When `layout="bshd"`, `dout/q/k/v/out` and `dq/dk/dv` use `(batch, seqlen, num_heads, head_dim)`; the wrapper uses view-only transposes and does not materialize layout copies.
+The last dimension must be `head_dim` with stride 1. Physical `BHDS` / non-contiguous-head-dim layouts are not supported.
+`lse` is always `(batch, num_heads, seqlen_q)`.
 
 #### Backward Inputs
 
@@ -204,6 +233,7 @@ The block-sparse arguments have the same meaning as forward:
 | `block_sparse_num` | scalar | int | Fixed KV block count per Q block. Ignored when `q2k_block_nums` is provided |
 | `block_sizes` | (num_kv_blocks,) or (batch, num_kv_blocks) | int32 | Actual token count per KV block |
 | `q2k_block_nums` | (batch, num_heads, num_q_blocks) | int32 | Optional variable KV block count per Q block |
+| `layout` | `"bhsd"` | Input/output layout: `"bhsd"` or `"bshd"` |
 
 #### Backward Outputs
 
@@ -223,22 +253,22 @@ dtype: bf16
 head_dim: 128
 attention: MHA only, num_heads == num_heads_kv
 block size: 64
-architecture: SM100/SM110
+architecture: SM90/SM100/SM110
 ```
 
-### `bsa_attn_bwd_qbucket(..., q_bucket_size_blocks=1024)`
+### `bsa_attn_bwd(..., bucket_size_blocks=None)`
 
-Q-range bucketed backward path for long-sequence sparse attention.
+Bucketed k2q CSR backward path for long-sequence sparse attention.
 
-It has the same tensor contract as `bsa_attn_bwd`, but builds a GPU-side Q-range task layout from `q2k_block_index` on every call. The main backward kernel then runs one task per `(q_group, kv_block)` instead of one task per `kv_block`.
+The wrapper builds a GPU-side bucketed k2q CSR task layout from `q2k_block_index` on every call. This is the only blk64 backward implementation kept in the tree for SM90/SM100/SM110.
 
-This path is intended for long sequences with random-ish topK sparsity where the baseline KV-major backward suffers from poor `dQ_acc` locality. The tradeoff is extra task construction, K/V reloads, and fp32 partial `dK/dV` accumulation.
+The main backward kernel runs one task per `(q_group, kv_block)` and uses fp32 workspace accumulation for `dQ/dK/dV` before the final conversion/writeback.
 
-For long-sequence cases (`num_q_blocks >= 3000`), `bsa_attn_bwd` automatically dispatches to this qbucket path by default, both with `block_sizes=None` and with explicit `block_sizes`. Set `BSA_BWD_AUTO_QBUCKET=0` to force the KV-major path, or `BSA_BWD_AUTO_Q_BUCKET_BLOCKS=<n>` to tune the automatic bucket size.
+Default bucket sizing is backend-owned: SM90 uses the SM90 blk64 backward default, while SM100/SM110 use the SM100 blk64 backward defaults. Pass `bucket_size_blocks` explicitly to override it for experiments.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `q_bucket_size_blocks` | `1024` | Number of Q blocks per bucket. Larger values reduce task count; smaller values improve `dQ_acc` locality |
+| `bucket_size_blocks` | backend default | Number of Q blocks per bucket. Larger values reduce task count; smaller values improve `dQ_acc` locality |
 
 ## Tests & Benchmarks
 
@@ -259,6 +289,4 @@ make help                       # Show all targets
 
 python test_flash_bwd.py                    # Backward quick correctness tests
 python test_flash_bwd.py benchmark          # Backward benchmark
-BSA_BWD_BENCH_IMPL=baseline python test_flash_bwd.py benchmark
-BSA_BWD_BENCH_IMPL=qbuck BSA_Q_BUCKET_BLOCKS=1024 python test_flash_bwd.py benchmark
 ```
