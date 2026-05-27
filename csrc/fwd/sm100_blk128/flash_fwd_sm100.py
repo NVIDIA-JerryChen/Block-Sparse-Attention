@@ -46,6 +46,7 @@ from cutlass.pipeline import (
 )
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 
+from csrc.fwd.sm100_blk128 import quack_compat  # noqa: F401
 import quack.activation
 from quack import copy_utils, layout_utils
 from quack.cute_dsl_utils import ParamsBase
@@ -4541,6 +4542,9 @@ class StaticPersistentTileScheduler:
 
     def consumer_advance(self, *, loc=None, ip=None):
         if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
+            # Match blk64 C++ ClcPersistentTileScheduler::consumer_advance:
+            # all warps must converge before consuming the next CLC response.
+            cute.arch.sync_threads()
             self._clc_pipeline.consumer_wait(self._clc_consumer_state)
             work_tile = self.get_current_work()
             self._clc_pipeline.consumer_release(self._clc_consumer_state)

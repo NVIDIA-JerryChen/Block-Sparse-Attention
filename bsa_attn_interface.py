@@ -35,6 +35,7 @@ try:
     from csrc.fwd.sm100_blk64.bsa_fwd_combine import FlashAttentionForwardCombine
 except ImportError:
     FlashAttentionForwardCombine = None
+from csrc.fwd.sm100_blk64.flash_fwd_sm100 import FlashAttentionForwardSm100Blk64
 from csrc.bwd.sm100_blk64.flash_bwd_sm100 import (
     BlockSparseAttnBackwardSm100Blk64,
     SM100_BWD_HEAD_DIM,
@@ -119,6 +120,29 @@ def _to_sm90_bwd_cute_tensor(
         assumed_align=assumed_align,
         enable_tvm_ffi=enable_tvm_ffi,
     )
+
+
+def _workaround_cutlass_hash_import_bug():
+    """Avoid optional generated dialect imports that are broken in this environment."""
+    import importlib
+    import sys
+    import types
+
+    for suffix in ("arith", "dialect_proxy", "gpu", "lru_cache_ir", "op"):
+        canonical = f"cutlass._mlir_helpers.{suffix}"
+        alias = f"cutlass.base_dsl._mlir_helpers.{suffix}"
+        try:
+            sys.modules.setdefault(alias, importlib.import_module(canonical))
+        except Exception:
+            pass
+
+    for name in (
+        "cutlass._mlir.dialects._iket_ops_gen",
+        "cutlass._mlir.dialects._bitfield_ops_gen",
+        "cutlass._mlir.dialects._pyir_ops_gen",
+        "cutlass._mlir.dialects._ub_ops_gen",
+    ):
+        sys.modules.setdefault(name, types.ModuleType(name))
 
 
 torch2cute_dtype_map = {
@@ -1047,6 +1071,192 @@ def bsa_attn_fwd_blk64(
     if layout == "bshd":
         out = out.transpose(1, 2)
     return out, lse
+
+
+def bsa_attn_fwd_blk64_cutedsl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    block_sizes: torch.Tensor,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    layout: str = "bhsd",
+    block_sparse_num: int = 0,
+    use_clc: Optional[bool] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """BSA forward attention through an independent blk64 CuTeDSL kernel class."""
+    assert q.dtype == torch.bfloat16, "blk64 CuTeDSL requires bf16"
+    assert q.is_cuda and k.is_cuda and v.is_cuda
+    assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
+
+    if layout == "bhsd":
+        q_bhsd, k_bhsd, v_bhsd = [maybe_contiguous(t) for t in (q, k, v)]
+    else:
+        assert layout == "bshd", f"layout must be 'bhsd' or 'bshd', got {layout!r}"
+        q_bhsd = q.transpose(1, 2).contiguous()
+        k_bhsd = k.transpose(1, 2).contiguous()
+        v_bhsd = v.transpose(1, 2).contiguous()
+
+    batch_size, num_head, seqlen_q, head_dim = q_bhsd.shape
+    seqlen_k = k_bhsd.shape[2]
+    num_head_kv = k_bhsd.shape[1]
+    head_dim_v = v_bhsd.shape[-1]
+
+    assert head_dim == 128 and head_dim_v == 128, "blk64 CuTeDSL requires D=DV=128"
+    assert num_head == num_head_kv, "blk64 CuTeDSL currently supports MHA only"
+    assert k_bhsd.shape == (batch_size, num_head_kv, seqlen_k, head_dim)
+    assert v_bhsd.shape == (batch_size, num_head_kv, seqlen_k, head_dim_v)
+    assert q2k_block_index.dtype == torch.int32
+    assert block_sizes.dtype == torch.int32
+    num_q_blocks = (seqlen_q + 63) // 64
+    has_variable_block_nums = q2k_block_nums is not None and q2k_block_nums.numel() > 0
+    if has_variable_block_nums:
+        q2k_block_nums = maybe_contiguous(q2k_block_nums)
+        assert q2k_block_nums.dtype == torch.int32
+        assert q2k_block_nums.shape == (
+            batch_size,
+            num_head,
+            num_q_blocks,
+        ), (
+            "q2k_block_nums must be shaped "
+            f"(B, H, ceil(S_q/64)); got {tuple(q2k_block_nums.shape)}"
+        )
+        uniform_block_sparse_num = 0
+    else:
+        assert block_sparse_num > 0, (
+            "block_sparse_num must be provided when q2k_block_nums is None or empty"
+        )
+        assert q2k_block_index.shape[-1] >= block_sparse_num, (
+            f"q2k_block_index last dim ({q2k_block_index.shape[-1]}) must be "
+            f">= block_sparse_num ({block_sparse_num})"
+        )
+        uniform_block_sparse_num = int(block_sparse_num)
+        q2k_block_nums = None
+
+    if softmax_scale is None:
+        softmax_scale = head_dim ** -0.5
+
+    out_bhsd = torch.empty(
+        (batch_size, num_head, seqlen_q, head_dim_v),
+        dtype=q_bhsd.dtype,
+        device=q_bhsd.device,
+    )
+    lse = torch.empty((batch_size, num_head, seqlen_q), dtype=torch.float32, device=q.device)
+
+    dtype = torch2cute_dtype_map[q_bhsd.dtype]
+    arch = _get_device_arch()
+    has_block_sizes = True
+    allow_empty_block_nums = has_variable_block_nums
+    sparse_block_size = 64
+    qhead_per_kvhead = 1
+    tile_m = 64
+    tile_n = 256
+    use_2cta_instrs = False
+    if use_clc is None:
+        use_clc_scheduler = choose_blk64_use_clc(
+            q_bhsd,
+            uniform_block_sparse_num,
+            q2k_block_nums if has_variable_block_nums else None,
+            layout="bhsd",
+        )
+    else:
+        use_clc_scheduler = bool(use_clc)
+    is_persistent = use_clc_scheduler
+    pack_gqa = False
+    input_layout = "bhsd_native"
+
+    current_stream = (
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        if is_fake_mode()
+        else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    )
+
+    compile_key = (
+        dtype,
+        head_dim,
+        head_dim_v,
+        qhead_per_kvhead,
+        pack_gqa,
+        tile_m,
+        tile_n,
+        sparse_block_size,
+        arch,
+        fa_logging.get_fa_log_level(),
+        has_variable_block_nums,
+        allow_empty_block_nums,
+        has_block_sizes,
+        is_persistent,
+        use_clc_scheduler,
+        input_layout,
+    )
+
+    if compile_key not in bsa_attn_fwd_blk64_cutedsl.compile_cache:
+        _workaround_cutlass_hash_import_bug()
+        q_tensor, k_tensor, v_tensor, o_tensor = [
+            _to_cute_tensor(t) for t in (q_bhsd, k_bhsd, v_bhsd, out_bhsd)
+        ]
+        lse_tensor = _to_cute_tensor(lse, assumed_align=4)
+        block_index_tensor = _to_cute_tensor(q2k_block_index)
+        block_sizes_tensor = _to_cute_tensor(block_sizes)
+        block_nums_tensor = (
+            _to_cute_tensor(q2k_block_nums) if has_variable_block_nums else None
+        )
+
+        fa_fwd = FlashAttentionForwardSm100Blk64(
+            head_dim,
+            head_dim_v,
+            qhead_per_kvhead=qhead_per_kvhead,
+            pack_gqa=pack_gqa,
+            m_block_size=tile_m,
+            n_block_size=tile_n,
+            sparse_block_size=sparse_block_size,
+            is_persistent=is_persistent,
+            use_2cta_instrs=use_2cta_instrs,
+            use_clc_scheduler=use_clc_scheduler,
+            allow_empty_block_nums=allow_empty_block_nums,
+            has_block_sizes=has_block_sizes,
+        )
+
+        t0 = time.time()
+        bsa_attn_fwd_blk64_cutedsl.compile_cache[compile_key] = cute.compile(
+            fa_fwd,
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            o_tensor,
+            lse_tensor,
+            softmax_scale,
+            block_index_tensor,
+            block_sizes_tensor,
+            uniform_block_sparse_num,
+            block_nums_tensor,
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+        print(f"Compiled blk64 CuTeDSL fwd in {time.time() - t0:.1f}s")
+
+    if not is_fake_mode():
+        with torch.cuda.nvtx.range("bsa_attn_fwd_blk64_cutedsl_kernel"):
+            bsa_attn_fwd_blk64_cutedsl.compile_cache[compile_key](
+                q_bhsd.detach(),
+                k_bhsd.detach(),
+                v_bhsd.detach(),
+                out_bhsd.detach(),
+                lse,
+                softmax_scale,
+                q2k_block_index.detach(),
+                block_sizes.detach(),
+                uniform_block_sparse_num,
+                q2k_block_nums.detach() if has_variable_block_nums else None,
+                current_stream,
+            )
+
+    out = out_bhsd if layout == "bhsd" else out_bhsd.transpose(1, 2).contiguous()
+    return out, lse
+
+
+bsa_attn_fwd_blk64_cutedsl.compile_cache = get_jit_cache("bsa_fwd_blk64_cutedsl")
 
 
 def bsa_attn_fwd(
