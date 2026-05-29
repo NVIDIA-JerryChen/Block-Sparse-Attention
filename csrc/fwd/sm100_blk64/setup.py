@@ -10,15 +10,9 @@ SRC_DIR = Path(__file__).resolve().parent
 # Kernel instantiation (nvcc, separate TU per (HasBlockSizes, HasVarBlockNums, UseClc)
 # variant for register allocation isolation)
 instantiation_sources = [
-    str(SRC_DIR / "instantiations" / "bsa_fwd_hdim128_bf16_hbs0_hvbn0_sm100.cu"),
-    str(SRC_DIR / "instantiations" / "bsa_fwd_hdim128_bf16_hbs0_hvbn1_sm100.cu"),
-    str(SRC_DIR / "instantiations" / "bsa_fwd_hdim128_bf16_hbs1_hvbn0_sm100.cu"),
-    str(SRC_DIR / "instantiations" / "bsa_fwd_hdim128_bf16_hbs1_hvbn1_sm100.cu"),
-    str(SRC_DIR / "instantiations" / "bsa_fwd_hdim128_bf16_hbs0_hvbn0_clc_sm100.cu"),
-    str(SRC_DIR / "instantiations" / "bsa_fwd_hdim128_bf16_hbs0_hvbn1_clc_sm100.cu"),
-    str(SRC_DIR / "instantiations" / "bsa_fwd_hdim128_bf16_hbs1_hvbn0_clc_sm100.cu"),
-    str(SRC_DIR / "instantiations" / "bsa_fwd_hdim128_bf16_hbs1_hvbn1_clc_sm100.cu"),
+    str(p) for p in sorted((SRC_DIR / "instantiations").glob("bsa_fwd_hdim*_bf16_*_sm100.cu"))
 ]
+assert instantiation_sources, "no instantiation .cu files found"
 
 nvcc_flags = [
     "-O3",

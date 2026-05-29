@@ -652,8 +652,9 @@ fused_attn_device(
     kernel(params, shared_memory);
 }
 
-template<bool HasBlockSizes, bool HasVarBlockNums, bool UseClc = false>
-using FusedAttnKernel = FusedAttnFwdSm100<CollectiveMainloopFwd, CollectiveEpilogueFwd,
+template<int kHeadDim, bool HasBlockSizes, bool HasVarBlockNums, bool UseClc = false>
+using FusedAttnKernel = FusedAttnFwdSm100<CollectiveMainloopFwd<kHeadDim>,
+                                          CollectiveEpilogueFwd<kHeadDim>,
                                           SingleTileScheduler, HasBlockSizes, HasVarBlockNums,
                                           UseClc>;
 

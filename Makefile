@@ -42,9 +42,10 @@ setup:
 	fi
 	@if echo "$(BLK)" | grep -q "64"; then \
 		echo "=== Building blk64 wheel ===" && \
-		$(PYTHON) csrc/fwd/sm100_blk64/setup.py bdist_wheel --dist-dir dist/ && \
+		mkdir -p artifacts/wheels/dist && \
+		$(PYTHON) csrc/fwd/sm100_blk64/setup.py bdist_wheel --dist-dir artifacts/wheels/dist/ && \
 		echo "=== Installing blk64 wheel ===" && \
-		pip install --force-reinstall --no-deps dist/bsa_fwd_blk64_ext-*.whl; \
+		pip install --force-reinstall --no-deps artifacts/wheels/dist/bsa_fwd_blk64_ext-*.whl; \
 	fi
 
 tt:
@@ -69,8 +70,9 @@ profile:
 	$(PROF_ENV) $(PYTHON) -u $(TEST_FILE) profile
 
 bm:
+	@mkdir -p artifacts/profiles/ncu
 	$(PROF_ENV) ncu --set full --nvtx --nvtx-include "bsa_attn_fwd_kernel/" \
-		-f -o profile/bsa_fwd.%p \
+		-f -o artifacts/profiles/ncu/bsa_fwd.%p \
 		$(PYTHON) -u $(TEST_FILE) profile
 
 NCU_METRICS := launch__registers_per_thread,sm__cycles_elapsed.avg,sm__cycles_elapsed.max,sm__cycles_active.avg,sm__cycles_elapsed.avg.per_second,gpu__time_duration.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed,gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed,sm__warps_active.avg.pct_of_peak_sustained_elapsed,sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_elapsed,sm__pipe_shared_cycles_active.avg.pct_of_peak_sustained_elapsed,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,sm__inst_executed.sum,sm__inst_executed_pipe_lsu.sum,sm__inst_executed_pipe_fma.sum,sm__inst_executed_pipe_xu.sum,l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum,l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum,l1tex__t_bytes_pipe_lsu_mem_local_op_ld.sum,l1tex__t_bytes_pipe_lsu_mem_local_op_st.sum,l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum,l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum,l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum
@@ -106,7 +108,9 @@ compare:
 
 clean:
 	rm -rf /tmp/$$(USER)/flash_attention_cute_dsl_cache/
-	rm -rf build/ dist/ csrc/fwd/sm100_blk64/build/ *.egg-info
+	rm -rf build/ dist/ artifacts/wheels/ *.egg-info
+	rm -rf csrc/fwd/sm100_blk64/build/ csrc/fwd/sm100_blk64/dist/
+	rm -rf csrc/fwd/sm100_blk64/*.egg-info csrc/fwd/sm100_blk64/*.so
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
 help:

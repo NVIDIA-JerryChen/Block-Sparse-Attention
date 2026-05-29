@@ -26,8 +26,9 @@ from test_flash_fwd import (
 from utils.bench_utils import bwd_flops
 
 
-# The bwd kernel only exists for blk64 (sparse_block_size=64, head_dim=128, MHA, bf16).
+# Native bwd coverage: blk64 for SM90/SM100 and blk128 for SM100/SM110.
 BLK = 64
+BLK128 = 128
 
 
 def _full_block_sizes(seqlen_k, device="cuda"):
@@ -115,11 +116,14 @@ def _test_bwd_single(
     *,
     use_variable_block_nums=False,
     bucket_size_blocks=None,
+    d=128,
+    blk=None,
 ):
     """One bwd correctness iteration."""
     device = "cuda"
     dtype = torch.bfloat16
-    d = 128
+    if blk is None:
+        blk = BLK
 
     torch.manual_seed(0)
     torch.cuda.empty_cache()
@@ -132,17 +136,17 @@ def _test_bwd_single(
     q2k_block_nums = None
     if use_variable_block_nums:
         q2k_block_index, q2k_block_nums, block_sizes = make_random_variable_block_sparse_args(
-            bs, seqlen_q, seqlen_k, nheads, blk_m=BLK, blk_n=BLK, device=device,
+            bs, seqlen_q, seqlen_k, nheads, blk_m=blk, blk_n=blk, device=device,
         )
         block_sparse_num = 0
     else:
         q2k_block_index, block_sparse_num, block_sizes = make_random_block_sparse_args(
-            bs, seqlen_q, seqlen_k, nheads, blk_m=BLK, blk_n=BLK, device=device,
+            bs, seqlen_q, seqlen_k, nheads, blk_m=blk, blk_n=blk, device=device,
         )
 
     attn_bias = block_sparse_to_attn_bias(
         q2k_block_index, block_sparse_num, block_sizes, seqlen_q, seqlen_k,
-        blk_m=BLK, blk_n=BLK, q2k_block_nums=q2k_block_nums,
+        blk_m=blk, blk_n=blk, q2k_block_nums=q2k_block_nums,
     )
 
     softmax_scale = 1.0 / math.sqrt(d)
@@ -191,7 +195,7 @@ def _test_bwd_single(
     mode_str = "var_bsn" if use_variable_block_nums else f"sparse_num={block_sparse_num}"
     tag = "PASS" if passed else "FAIL"
     print(
-        f"  {tag} bwd bs={bs} sq={seqlen_q} sk={seqlen_k} h={nheads} d={d} {mode_str}: "
+        f"  {tag} bwd bs={bs} sq={seqlen_q} sk={seqlen_k} h={nheads} d={d} blk={blk} {mode_str}: "
         f"dq={dq_diff:.4f}/{dq_tol:.4f} "
         f"dk={dk_diff:.4f}/{dk_tol:.4f} "
         f"dv={dv_diff:.4f}/{dv_tol:.4f}"
@@ -277,6 +281,87 @@ def _test_bwd_dense_single(bs, seqlen_q, seqlen_k, nheads):
         f"dq_diff={dq_diff}>tol={dq_tol}, dk_diff={dk_diff}>tol={dk_tol}, "
         f"dv_diff={dv_diff}>tol={dv_tol}"
     )
+
+
+def _make_topk_args_any(bs, seqlen_q, seqlen_k, nheads, topk, block_size, device):
+    num_q_blocks = (seqlen_q + block_size - 1) // block_size
+    num_kv_blocks = (seqlen_k + block_size - 1) // block_size
+    assert topk <= num_kv_blocks
+    q2k = torch.empty(
+        bs, nheads, num_q_blocks, topk, dtype=torch.int32, device=device
+    )
+    for b in range(bs):
+        for h in range(nheads):
+            for q_block in range(num_q_blocks):
+                q2k[b, h, q_block] = torch.randperm(
+                    num_kv_blocks, device=device
+                )[:topk].to(torch.int32)
+    block_sizes = torch.full(
+        (num_kv_blocks,), block_size, dtype=torch.int32, device=device
+    )
+    block_sizes[-1] = seqlen_k - (num_kv_blocks - 1) * block_size
+    return q2k, topk, block_sizes
+
+
+def _test_bwd_topk_blk128(
+    bs,
+    seqlen_q,
+    seqlen_k,
+    nheads,
+    topk,
+    use_block_sizes,
+    bucket_size_blocks=None,
+    d=128,
+):
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    torch.manual_seed(20260519 + topk + seqlen_k)
+    torch.cuda.empty_cache()
+
+    q = torch.randn(bs, nheads, seqlen_q, d, device=device, dtype=dtype)
+    k = torch.randn(bs, nheads, seqlen_k, d, device=device, dtype=dtype)
+    v = torch.randn(bs, nheads, seqlen_k, d, device=device, dtype=dtype)
+    dout = torch.randn_like(q)
+
+    q2k_block_index, block_sparse_num, ref_block_sizes = _make_topk_args_any(
+        bs, seqlen_q, seqlen_k, nheads, topk, BLK128, device
+    )
+    block_sizes = ref_block_sizes if use_block_sizes else None
+    attn_bias = block_sparse_to_attn_bias(
+        q2k_block_index,
+        block_sparse_num,
+        ref_block_sizes,
+        seqlen_q,
+        seqlen_k,
+        blk_m=BLK128,
+        blk_n=BLK128,
+    )
+
+    softmax_scale = 1.0 / math.sqrt(d)
+    out_ref, lse_ref, dq_ref, dk_ref, dv_ref = _torch_ref_bwd(
+        q, k, v, dout, attn_bias, softmax_scale,
+    )
+    _, _, dq_pt, dk_pt, dv_pt = _torch_ref_bwd(
+        q, k, v, dout, attn_bias, softmax_scale, upcast=False,
+    )
+    refs = _sanitize_grads(dq_ref, dk_ref, dv_ref)
+    tols = _grad_tols(refs, _sanitize_grads(dq_pt, dk_pt, dv_pt))
+
+    dq, dk, dv = bsa_attn_bwd(
+        dout,
+        q,
+        k,
+        v,
+        out_ref,
+        lse_ref,
+        q2k_block_index,
+        block_sparse_num,
+        block_sizes,
+        softmax_scale=softmax_scale,
+        bucket_size_blocks=bucket_size_blocks,
+    )
+    _assert_bwd_close(f"blk128 topk={topk}", (dq, dk, dv), refs, tols)
 
 
 def _test_bwd_layout_equivalence():
@@ -596,6 +681,42 @@ def test_flash_bwd_blk64_layout_equivalence():
 
 
 @pytest.mark.parametrize(
+    "seqlen_k,topk,use_block_sizes",
+    [
+        (512, 2, True),
+        (512, 4, True),
+        (448, 4, True),
+        (448, 4, False),
+    ],
+)
+def test_flash_bwd_sm100_blk128_topk_correctness(seqlen_k, topk, use_block_sizes):
+    if _cuda_major() not in [10, 11]:
+        pytest.skip("SM100/SM110 blk128 bwd test")
+    _test_bwd_topk_blk128(
+        bs=1,
+        seqlen_q=256,
+        seqlen_k=seqlen_k,
+        nheads=2,
+        topk=topk,
+        use_block_sizes=use_block_sizes,
+    )
+
+
+def test_flash_bwd_sm100_blk128_multi_qbucket_correctness():
+    if _cuda_major() not in [10, 11]:
+        pytest.skip("SM100/SM110 blk128 bwd test")
+    _test_bwd_topk_blk128(
+        bs=1,
+        seqlen_q=512,
+        seqlen_k=512,
+        nheads=2,
+        topk=2,
+        use_block_sizes=True,
+        bucket_size_blocks=2,
+    )
+
+
+@pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
         (64, 256),
@@ -657,6 +778,23 @@ def run_quick_tests():
             h,
             use_variable_block_nums=use_var,
             bucket_size_blocks=512,
+        )
+
+    print("-" * 70)
+    print("blk128 bwd path (D=128 and D=64 via sm100_blk128)")
+    blk128_configs = [
+        # (bs, sq, sk, h, topk, d)
+        (1, 256, 512, 2, 2, 128),
+        (1, 256, 1024, 4, 4, 128),
+        (1, 256, 512, 2, 2, 64),
+        (1, 256, 1024, 4, 4, 64),
+        (1, 512, 512, 4, 4, 64),
+        (2, 256, 512, 4, 2, 64),
+    ]
+    for bs, sq, sk, h, topk, d in blk128_configs:
+        _test_bwd_topk_blk128(
+            bs=bs, seqlen_q=sq, seqlen_k=sk, nheads=h,
+            topk=topk, use_block_sizes=True, d=d,
         )
 
     print("=" * 70)

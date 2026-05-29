@@ -24,7 +24,12 @@ namespace flash {
 namespace cute = ::cute;
 
 
+template <int kHeadDim_>
 struct CollectiveMainloopFwd {
+    static constexpr int kHeadDim = kHeadDim_;
+    static_assert(kHeadDim == 128,
+                  "sm100 blk64 fwd only supports head_dim = 128 "
+                  "(kHeadDim template kept for future D=64 redesign)");
     // ---- Element types ----
     using ElementA = cutlass::bfloat16_t;
     using ElementB = cutlass::bfloat16_t;
@@ -33,24 +38,27 @@ struct CollectiveMainloopFwd {
     // ---- Tile sizes ----
     static constexpr int kRows = 64;
     static constexpr int kQkN = 256;
-    static constexpr int kQkK = 128;
-    static constexpr int kOutputCols = 128;
+    static constexpr int kQkK = kHeadDim;
+    static constexpr int kOutputCols = kHeadDim;
     static constexpr int kDualCols = 256;
-    static constexpr int kDualK = 128;
+    static constexpr int kDualK = kHeadDim;
 
     // ---- Sparse block constants ----
     static constexpr int kSparseBlockSize = 64;   // tokens per sparse block
     static constexpr int kSparseBlocksPerKV = kDualCols / kSparseBlockSize;  // 4
-    static constexpr int kDimHalf = kDualK / 2;   // 64 — swizzle 128B splits dim in half
-    static constexpr int kDimHalves = 2;
-    static constexpr int kVDimParts = 2;
-    static constexpr int kVDimPart = kDualK / kVDimParts;
+    // 128B swizzle atom contig dim = 64 bf16 elems.
+    //   D=128 → split dim into 2 halves of 64 (kDimHalves=2)
+    //   D=64  → single 64-wide half (kDimHalves=1)
+    static constexpr int kDimHalves = kHeadDim / 64;
+    static constexpr int kDimHalf = kDualK / kDimHalves;   // always 64
+    static constexpr int kVDimParts = kHeadDim / 64;
+    static constexpr int kVDimPart = kDualK / kVDimParts;  // always 64
     static_assert(kDualK % kVDimParts == 0, "V dim split must divide kDualK");
     static_assert(kVDimParts == 1 || kVDimParts == 2,
                   "V dim split must be 1-way or 2-way for the validated MN-major sublayout mapping");
-    // SMEM offsets for K sub-tile: K layout (256,(64,2)):(64,(1,16384))
-    static constexpr int kKSubStride = kSparseBlockSize * kDimHalf;  // 4096 (token group)
-    static constexpr int kKHalfStride = kDualCols * kDimHalf;        // 16384 (dim half)
+    // SMEM offsets for K sub-tile (per dim-half, per sparse sub-block in stage).
+    static constexpr int kKSubStride = kSparseBlockSize * kDimHalf;
+    static constexpr int kKHalfStride = kDualCols * kDimHalf;
     // ---- MMA types ----
     // QK GEMM: ss mode (Q and K both in SMEM)
     using QkTiledMma = decltype(cute::make_tiled_mma(cute::SM100_MMA_F16BF16_WS_SS_NOELECT<
@@ -93,13 +101,19 @@ struct CollectiveMainloopFwd {
                   "V MN-major layout must share stage cosize with K-major BDual");
     static constexpr int kKVTotalElems = kKVElemsPerStage * kKVStages;
 
-    // ---- TMEM constants (2 S stages + 2 O stages = 512 cols) ----
+    // ---- TMEM constants (2 S stages + 2 O stages) ----
+    // S0/S1 are P (post-softmax) — 128 cols/stage independent of head_dim,
+    //   matches kDualCols / 2 (each stage covers half the KV col span).
+    // O0/O1 are PV accumulators — head_dim cols/stage. We keep stage spacing
+    //   at 128 cols (matching the D=128 layout) so D=64 leaves 64 unused cols
+    //   per stage; this avoids reshuffling the TMEM map for both heads.
     static constexpr uint32_t kTmemS0 = 0;
     static constexpr uint32_t kTmemS1 = 128;
     static constexpr uint32_t kTmemO0 = 256;
     static constexpr uint32_t kTmemO1 = 384;
 
-    static constexpr int kCSpan = 128;
+    static constexpr int kCSpan = 128;          // P col span per stage (D-indep)
+    static constexpr int kOSpan = kOutputCols;  // O col span per stage = head_dim
     static constexpr int kPackedCols = 64;
 
     // ---- Warp counts ----
@@ -323,8 +337,15 @@ struct CollectiveMainloopFwd {
 
     CUTLASS_DEVICE static int get_v_smem_offset(int stage_base, int sub, int h) {
         using namespace cute;
-        int tile_m = ((sub & 1) * kVDimParts + h) * kVDimPart;
-        int tile_n = (sub >> 1) * kSparseBlockSize;
+        // Linearize (sub, h) into a 2D tile coordinate inside SmemLayoutVDual
+        // (kDualCols × head_dim). The M-axis fits kKVMTiles = kDualCols / kVDimPart = 4
+        // tiles regardless of D; the N-axis fits kVDimParts tiles (2 for D=128, 1 for D=64).
+        // For D=128 this reproduces the original ((sub&1)*kVDimParts + h, sub>>1) mapping
+        // since `sub * kVDimParts + h` is identical when projected modulo 4 / divided by 4.
+        constexpr int kKVMTiles = kDualCols / kVDimPart;
+        int lin_idx = sub * kVDimParts + h;
+        int tile_m = (lin_idx % kKVMTiles) * kVDimPart;
+        int tile_n = (lin_idx / kKVMTiles) * kSparseBlockSize;
         return stage_base + int(SmemLayoutVDual{}(make_coord(tile_m, tile_n)));
     }
 
@@ -1073,9 +1094,10 @@ struct CollectiveMainloopFwd {
             cute::Shape<cute::Int<kRows>, cute::Int<kOutputCols>>{},
             cute::Step<cute::_1, cute::_2>{}), cute::Shape<cute::_1, cute::_1>{}));
 
-    // ---- Chunk size for TMEM loads in correction/combine ----
+    // ---- Chunk size for TMEM loads in correction/combine (O path) ----
+    // Uses kOSpan (= head_dim) so D=64 loads 2 chunks vs D=128's 4 chunks.
     static constexpr int kChunk = 32;
-    static constexpr int kNumChunks = kCSpan / kChunk;
+    static constexpr int kNumChunks = kOSpan / kChunk;
 
     struct CorrState {
         PipeState o_acc_state_0;                   // {0, 0, 0} default — OAcc consumer_wait stage 0

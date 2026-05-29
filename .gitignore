@@ -1,10 +1,19 @@
-# Python
+# Local outputs and scratch space
+/artifacts/
+/scratch/
+/design/dev_docs/
+/tools/perfsim
+
+/tests/temp
+/benchmarks/temp
+
+# Python / build artifacts
 __pycache__/
 *.py[cod]
 *.egg-info/
 *.egg
-dist/
 build/
+dist/
 *.so
 
 # CUDA / CuTeDSL compilation artifacts
@@ -16,31 +25,21 @@ build/
 .venv/
 venv/
 
-# IDE / Editor
+# Local tool state
+/.claude/
+/.codex/
+/.pytest_cache/
+
+# IDE / editor
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# Claude local settings
-.claude/
-
 # OS
 .DS_Store
 Thumbs.db
 
-# JIT cache
+# System/JIT temp caches
 /tmp/
-
-profile/*
-perfsim/*
-
-dev_docs/*
-docs/*
-benchmark_compare.py
-csrc/fwd/sm100_blk128/SASS.txt
-
-.codex
-logs/
-ncu_reports/

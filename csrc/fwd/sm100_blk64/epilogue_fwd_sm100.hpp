@@ -19,13 +19,18 @@ namespace flash {
 namespace cute = ::cute;
 
 
+template <int kHeadDim_>
 struct CollectiveEpilogueFwd {
+    static constexpr int kHeadDim = kHeadDim_;
+    static_assert(kHeadDim == 128,
+                  "sm100 blk64 fwd only supports head_dim = 128 "
+                  "(kHeadDim template kept for future D=64 redesign)");
     // ---- Element types ----
     using ElementA = cutlass::bfloat16_t;
 
     // ---- Tile sizes ----
     static constexpr int kRows = 64;
-    static constexpr int kOutputCols = 128;
+    static constexpr int kOutputCols = kHeadDim;
 
     // ---- SMEM layout for O ----
     using SmemLayoutO = decltype(cute::coalesce(cute::tile_to_shape(
@@ -47,8 +52,9 @@ struct CollectiveEpilogueFwd {
             SmemLayoutO{}));
 
     // ---- TensorStorage ----
-    static constexpr int kCSpan = 128;
-    static constexpr int kExchangePerWarp = kCSpan * 32;
+    // o_exchange holds per-warp correction-combine staging. correction_combine
+    // writes kNumChunks chunks/warp = head_dim cols × 32 lanes = kOutputCols * 32 floats.
+    static constexpr int kExchangePerWarp = kOutputCols * 32;
     struct TensorStorage {
         alignas(16) float o_exchange[4][kExchangePerWarp];
         alignas(16) float o_staging[4][64];

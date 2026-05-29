@@ -16,7 +16,7 @@
 // PHASE A (this file): types + host helpers only. Device-side persistent loop
 // wiring (warp 15 producer/consumer, while(work.is_valid_tile), CLC pipeline
 // init) lives in bsa_fwd_kernel_sm100.h and will be added in a follow-up.
-// See docs/blk64_clc_scheduler.md for the design.
+// See design/docs/blk64_clc_scheduler.md for the design.
 
 #pragma once
 

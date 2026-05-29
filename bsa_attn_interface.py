@@ -29,9 +29,15 @@ from csrc.fwd.sm90_blk64.flash_fwd_sm90 import (
 from csrc.bwd.sm100_blk64.flash_bwd_sm100 import (
     BlockSparseAttnBackwardSm100Blk64,
     SM100_BWD_HEAD_DIM,
-    SM100_BWD_SPARSE_BLOCK_SIZE,
+    SM100_BLK64_BWD_SPARSE_BLOCK_SIZE,
     sm100_bwd_auto_bucketed_k2q_size_blocks,
     sm100_bwd_default_bucketed_k2q_size_blocks,
+)
+from csrc.bwd.sm100_blk128.flash_bwd_sm100 import (
+    SM100_BWD_HEAD_DIM as SM100_BLK128_BWD_HEAD_DIM,
+    SM100_BLK128_BWD_SPARSE_BLOCK_SIZE,
+    bsa_sm100_blk128_bwd_bucketed_k2q_csr,
+    sm100_blk128_bwd_default_bucketed_k2q_size_blocks,
 )
 from csrc.bwd.sm90_blk64.flash_bwd_sm90 import (
     BlockSparseAttnBackwardSm90Blk64,
@@ -147,6 +153,43 @@ def _validate_sm100_blk64_int32_bounds(
 
 def _tensor_compile_key(t: torch.Tensor):
     return (tuple(t.shape), tuple(t.stride()), t.dtype)
+
+
+def _ceil_div_int(a: int, b: int) -> int:
+    return (int(a) + int(b) - 1) // int(b)
+
+
+def _infer_sm100_bwd_sparse_block_size(
+    *,
+    batch_size: int,
+    num_heads: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    q2k_block_index: torch.Tensor,
+    block_sizes: Optional[torch.Tensor],
+) -> int:
+    candidates = []
+    for block_size in (SM100_BLK64_BWD_SPARSE_BLOCK_SIZE, SM100_BLK128_BWD_SPARSE_BLOCK_SIZE):
+        num_q_blocks = _ceil_div_int(seqlen_q, block_size)
+        num_kv_blocks = _ceil_div_int(seqlen_k, block_size)
+        if q2k_block_index.shape[:3] != (batch_size, num_heads, num_q_blocks):
+            continue
+        if block_sizes is not None and block_sizes.numel() > 0:
+            if block_sizes.ndim == 1 and block_sizes.shape != (num_kv_blocks,):
+                continue
+            if block_sizes.ndim == 2 and block_sizes.shape != (batch_size, num_kv_blocks):
+                continue
+        candidates.append(block_size)
+
+    assert candidates, (
+        "Could not infer SM100 bwd sparse block size from q2k/block_sizes shapes"
+    )
+    # Preserve the legacy blk64 path for tiny ambiguous shapes.
+    return (
+        SM100_BLK64_BWD_SPARSE_BLOCK_SIZE
+        if SM100_BLK64_BWD_SPARSE_BLOCK_SIZE in candidates
+        else candidates[0]
+    )
 
 
 def _empty_bwd_workspace_with_zeroed_accum(
@@ -773,7 +816,7 @@ def bsa_attn_bwd(
     bucket_size_blocks: Optional[int] = None,
     layout: str = "bhsd",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Backward pass for BSA block-sparse attention (SM90/SM100 blk64).
+    """Backward pass for BSA block-sparse attention.
 
     Paired with ``bsa_attn_fwd`` (or the blk64 C++ fwd), this recomputes
     dQ, dK, dV from stored ``out``/``lse`` and the upstream ``dout`` gradient.
@@ -806,8 +849,8 @@ def bsa_attn_bwd(
     Notes:
         * Only ``head_dim == 128``, bf16, MHA (num_heads == num_heads_kv) is
           supported. No GQA/MQA, no causal/local, no varlen.
-        * Block size is fixed at 64 (``sparse_block_size``) and must match the
-          ``blk_m == blk_n == 64`` used for the forward.
+        * SM90 uses blk64. SM100/SM110 supports blk64 and blk128; blk128 routes
+          to FA4's SM100 128x128 backward kernel with BSA block-sparse metadata.
     """
     assert layout in ("bhsd", "bshd"), f"layout must be 'bhsd' or 'bshd', got {layout!r}"
     q, k, v, out, dout = [maybe_contiguous(t) for t in (q, k, v, out, dout)]
@@ -845,10 +888,29 @@ def bsa_attn_bwd(
     if arch // 10 == 9:
         bwd_head_dim = SM90_BWD_HEAD_DIM
         sparse_block_size = SM90_BWD_SPARSE_BLOCK_SIZE
+        assert head_dim == bwd_head_dim, f"sm90 bwd only supports head_dim={bwd_head_dim}, got {head_dim}"
     else:
         bwd_head_dim = SM100_BWD_HEAD_DIM
-        sparse_block_size = SM100_BWD_SPARSE_BLOCK_SIZE
-    assert head_dim == bwd_head_dim, f"bwd only supports head_dim={bwd_head_dim}, got {head_dim}"
+        sparse_block_size = _infer_sm100_bwd_sparse_block_size(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            q2k_block_index=q2k_block_index,
+            block_sizes=block_sizes,
+        )
+        assert bwd_head_dim == SM100_BLK128_BWD_HEAD_DIM
+        # blk128 bwd path now supports head_dim in {64, 128}; blk64 bwd path
+        # still only supports head_dim=128. Force blk128 path for D=64.
+        if head_dim == 64:
+            assert sparse_block_size == SM100_BLK128_BWD_SPARSE_BLOCK_SIZE, (
+                "head_dim=64 bwd only supports the SM100 blk128 path; pass "
+                "q2k_block_index sized to sparse_block_size=128"
+            )
+        else:
+            assert head_dim == bwd_head_dim, (
+                f"sm100 bwd only supports head_dim in {{64, {bwd_head_dim}}}, got {head_dim}"
+            )
     assert num_heads == num_heads_kv, "bwd does not support GQA/MQA"
     assert batch_k == batch_size and batch_v == batch_size
     assert num_heads_v == num_heads_kv
@@ -899,6 +961,43 @@ def bsa_attn_bwd(
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    if arch // 10 != 9 and sparse_block_size == SM100_BLK128_BWD_SPARSE_BLOCK_SIZE:
+        if bucket_size_blocks is None or bucket_size_blocks <= 0:
+            bucket_size_blocks = sm100_blk128_bwd_default_bucketed_k2q_size_blocks(
+                num_q_blocks,
+                num_heads,
+            )
+        bucketed_k2q_offsets, bucketed_k2q_indices, _num_q_groups, _max_k2q_rows_per_group = (
+            _build_bucketed_k2q_csr(
+                q2k_block_index,
+                block_sparse_num,
+                num_kv_blocks,
+                bucket_size_blocks=bucket_size_blocks,
+                q2k_block_nums=q2k_block_nums,
+            )
+        )
+        dq_out, dk_out, dv_out = bsa_sm100_blk128_bwd_bucketed_k2q_csr(
+            dout_bwd,
+            q_bwd,
+            k_bwd,
+            v_bwd,
+            out_bwd,
+            lse,
+            bucketed_k2q_offsets,
+            bucketed_k2q_indices,
+            softmax_scale=softmax_scale,
+            dq=dq_bwd,
+            dk=dk_bwd,
+            dv=dv_bwd,
+        )
+        if layout == "bshd":
+            return (
+                dq_out.transpose(1, 2),
+                dk_out.transpose(1, 2),
+                dv_out.transpose(1, 2),
+            )
+        return dq_out, dk_out, dv_out
 
     if bucket_size_blocks is None:
         bucket_size_blocks = (
@@ -1346,7 +1445,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         sparse_block_size = SM90_BWD_SPARSE_BLOCK_SIZE
     else:
         bwd_head_dim = SM100_BWD_HEAD_DIM
-        sparse_block_size = SM100_BWD_SPARSE_BLOCK_SIZE
+        sparse_block_size = SM100_BLK64_BWD_SPARSE_BLOCK_SIZE
     assert head_dim == bwd_head_dim
     assert num_heads == num_heads_kv, "bucketed k2q CSR bwd does not support GQA/MQA"
     assert k.shape == v.shape == (batch_size, num_heads, seqlen_k, head_dim)
