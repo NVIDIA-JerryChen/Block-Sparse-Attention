@@ -610,6 +610,127 @@ def _test_blk64_interface_layouts():
     print("  PASS default BHSD and explicit BSHD wrapper paths match")
 
 
+def test_sm100_blk64_kv_bucketed_matches_legacy():
+    arch_major = torch.cuda.get_device_capability()[0]
+    if arch_major != 10:
+        pytest.skip("KV-bucketed blk64 fwd is SM100-only")
+    if not HAS_BLK64:
+        pytest.skip("bsa_fwd_blk64_ext is not built")
+
+    bs, h, sq, sk, d = 1, 4, 128, 512, 128
+    blk = 64
+    nq = sq // blk
+    nkv = sk // blk
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    torch.manual_seed(2026)
+    q_bhsd = torch.randn(bs, h, sq, d, device=device, dtype=dtype)
+    k_bhsd = torch.randn(bs, h, sk, d, device=device, dtype=dtype)
+    v_bhsd = torch.randn(bs, h, sk, d, device=device, dtype=dtype)
+
+    q2k_block_index = torch.arange(nkv, device=device, dtype=torch.int32) \
+        .view(1, 1, 1, nkv).expand(bs, h, nq, nkv).contiguous()
+    q2k_block_nums = torch.full((bs, h, nq), nkv, device=device, dtype=torch.int32)
+    block_sizes = torch.full((nkv,), blk, device=device, dtype=torch.int32)
+
+    ref_out, ref_lse = bsa_attn_fwd_blk64(
+        q_bhsd, k_bhsd, v_bhsd, q2k_block_index, block_sizes, q2k_block_nums)
+    for kv_splits in (2, 4):
+        out, lse = bsa_attn_fwd_blk64(
+            q_bhsd,
+            k_bhsd,
+            v_bhsd,
+            q2k_block_index,
+            block_sizes,
+            q2k_block_nums,
+            kv_splits=kv_splits,
+        )
+        torch.testing.assert_close(out, ref_out, rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(lse, ref_lse, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10),
+                    reason="SM100+ required")
+@pytest.mark.skipif(not HAS_BLK64, reason="bsa_fwd_blk64_ext not built")
+def test_sm100_blk64_kv_bucketed_respects_fixed_block_sparse_num():
+    bs, h, sq, sk, d = 1, 4, 128, 512, 128
+    blk = 64
+    nq = sq // blk
+    nkv = sk // blk
+    topk = nkv // 2
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    torch.manual_seed(2027)
+    q_bhsd = torch.randn(bs, h, sq, d, device=device, dtype=dtype)
+    k_bhsd = torch.randn(bs, h, sk, d, device=device, dtype=dtype)
+    v_bhsd = torch.randn(bs, h, sk, d, device=device, dtype=dtype)
+
+    used = torch.arange(topk, device=device, dtype=torch.int32)
+    tail = torch.arange(topk, nkv, device=device, dtype=torch.int32)
+    q2k_compact = used.view(1, 1, 1, topk).expand(bs, h, nq, topk).contiguous()
+    q2k_padded = torch.cat([
+        q2k_compact,
+        tail.view(1, 1, 1, nkv - topk).expand(bs, h, nq, nkv - topk),
+    ], dim=-1).contiguous()
+    empty_nums = torch.empty(0, device=device, dtype=torch.int32)
+    block_sizes = torch.full((nkv,), blk, device=device, dtype=torch.int32)
+
+    ref_out, ref_lse = bsa_attn_fwd_blk64(
+        q_bhsd, k_bhsd, v_bhsd, q2k_compact, block_sizes, empty_nums)
+    for kv_splits in (1, 2, 4):
+        out, lse = bsa_attn_fwd_blk64(
+            q_bhsd,
+            k_bhsd,
+            v_bhsd,
+            q2k_padded,
+            block_sizes,
+            empty_nums,
+            kv_splits=kv_splits,
+            block_sparse_num=topk,
+        )
+        torch.testing.assert_close(out, ref_out, rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(lse, ref_lse, rtol=5e-3, atol=3e-2)
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10),
+                    reason="SM100+ required")
+@pytest.mark.skipif(not HAS_BLK64, reason="bsa_fwd_blk64_ext not built")
+def test_sm100_blk64_auto_kv_splits_api():
+    bs, h, sq, sk, d = 1, 4, 128, 512, 128
+    blk = 64
+    nq = sq // blk
+    nkv = sk // blk
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    torch.manual_seed(2028)
+    q_bhsd = torch.randn(bs, h, sq, d, device=device, dtype=dtype)
+    k_bhsd = torch.randn(bs, h, sk, d, device=device, dtype=dtype)
+    v_bhsd = torch.randn(bs, h, sk, d, device=device, dtype=dtype)
+
+    q2k_block_index = torch.arange(nkv, device=device, dtype=torch.int32) \
+        .view(1, 1, 1, nkv).expand(bs, h, nq, nkv).contiguous()
+    empty_nums = torch.empty(0, device=device, dtype=torch.int32)
+    block_sizes = torch.full((nkv,), blk, device=device, dtype=torch.int32)
+
+    ref_out, ref_lse = bsa_attn_fwd_blk64(
+        q_bhsd, k_bhsd, v_bhsd, q2k_block_index, block_sizes, empty_nums)
+    out, lse = bsa_attn_fwd_blk64(
+        q_bhsd,
+        k_bhsd,
+        v_bhsd,
+        q2k_block_index,
+        block_sizes,
+        empty_nums,
+        kv_splits="auto",
+        block_sparse_num=nkv,
+    )
+    torch.testing.assert_close(out, ref_out, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(lse, ref_lse, rtol=5e-3, atol=3e-2)
+
+
 # ============== Kernel dispatch helper ==============
 
 def _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n,

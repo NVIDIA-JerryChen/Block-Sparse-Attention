@@ -42,9 +42,11 @@ __device__ __forceinline__ void warpgroup_reg_set() {
 
 template<typename CollectiveMainloop_, typename CollectiveEpilogue_,
          typename TileScheduler_, bool HasBlockSizes, bool HasVarBlockNums,
-         bool UseClc = false>
+         bool UseClc = false, bool HasKvSplits = true>
 struct FusedAttnFwdSm100 {
     static constexpr bool kUseClc = UseClc;
+    static constexpr bool kHasKvSplits = HasKvSplits;
+    static_assert(!(kUseClc && kHasKvSplits), "KV-bucketed fwd does not support CLC");
     using CollectiveMainloop = CollectiveMainloop_;
     using CollectiveEpilogue = CollectiveEpilogue_;
     using TileScheduler = TileScheduler_;
@@ -149,6 +151,9 @@ struct FusedAttnFwdSm100 {
     static dim3 get_grid_shape(Params const& params) {
         if constexpr (kUseClc) {
             return ClcSched::get_grid_shape(params.fwd.num_m_blocks, params.fwd.h, params.fwd.b);
+        } else if constexpr (kHasKvSplits) {
+            return TileScheduler::get_grid_shape(
+                    params.fwd.num_m_blocks, params.fwd.h, params.fwd.b, params.fwd.kv_splits);
         } else {
             return TileScheduler::get_grid_shape(params.fwd.num_m_blocks, params.fwd.h, params.fwd.b);
         }
@@ -165,27 +170,62 @@ struct FusedAttnFwdSm100 {
     static dim3 get_block_shape() { return dim3(kThreads, 1, 1); }
 
     // Per-tile helper to compute tile_bi pointer from (batch, head, m_block).
+    template<bool SplitMode = kHasKvSplits>
     CUTLASS_DEVICE static int const* compute_tile_bi(
-            Params const& params, int batch, int head, int m_block) {
+            Params const& params, int batch, int head, int m_block, int split) {
         if (params.fwd.block_indices_ptr == nullptr) return nullptr;
         int64_t tile_idx = (int64_t(batch) * params.fwd.h + head) * params.fwd.num_m_blocks + m_block;
-        return params.fwd.block_indices_ptr + tile_idx * params.fwd.block_indices_stride;
+        int split_offset = 0;
+        if constexpr (SplitMode) {
+            split_offset = params.fwd.split_offsets_ptr[
+                    tile_idx * int64_t(params.fwd.kv_splits + 1) + split];
+        }
+        return params.fwd.block_indices_ptr + tile_idx * params.fwd.block_indices_stride + split_offset;
     }
 
-    // LSE tile pointer: base + (batch*h + head)*seqlen_q + m_block*kRows.
+    // LSE tile pointer: generic strided B/H/S plus optional split dimension.
     // lse_valid_rows: how many rows in this tile are within actual seqlen_q
     // (per-row bounds check in the correction warp so LSE can be sized at
     // seqlen_q, not num_m_blocks*kRows).
+    template<bool SplitMode = kHasKvSplits>
     CUTLASS_DEVICE static void compute_lse_tile_ptr(
-            Params const& params, int batch, int head, int m_block,
+            Params const& params, int batch, int head, int m_block, int split,
             float*& ptr_LSE_tile, int& lse_valid_rows) {
         float* ptr_LSE_base = static_cast<float*>(params.fwd.softmax_lse_ptr);
-        ptr_LSE_tile = (ptr_LSE_base != nullptr)
-            ? ptr_LSE_base + (batch * params.fwd.h + head) * int64_t(params.fwd.seqlen_q)
-                           + m_block * CollectiveMainloop::kRows
-            : nullptr;
+        if constexpr (SplitMode) {
+            ptr_LSE_tile = (ptr_LSE_base != nullptr)
+                ? ptr_LSE_base
+                        + split * params.fwd.lse_split_stride
+                        + batch * params.fwd.lse_batch_stride
+                        + head * params.fwd.lse_head_stride
+                        + m_block * CollectiveMainloop::kRows * params.fwd.lse_row_stride
+                : nullptr;
+        } else {
+            ptr_LSE_tile = (ptr_LSE_base != nullptr)
+                ? ptr_LSE_base + (batch * params.fwd.h + head) * int64_t(params.fwd.seqlen_q)
+                               + m_block * CollectiveMainloop::kRows
+                : nullptr;
+        }
         lse_valid_rows = params.fwd.seqlen_q - m_block * CollectiveMainloop::kRows;
         if (lse_valid_rows < 0) lse_valid_rows = 0;
+    }
+
+    CUTLASS_DEVICE static void mark_empty_split(
+            Params const& params, int batch, int head, int m_block, int split) {
+        float* ptr_LSE = static_cast<float*>(params.fwd.softmax_lse_ptr);
+        int valid_rows = params.fwd.seqlen_q - m_block * kRows;
+        if (valid_rows < 0) valid_rows = 0;
+        if (valid_rows > kRows) valid_rows = kRows;
+
+        int tid = int(threadIdx.x);
+
+        int64_t lse_base = split * params.fwd.lse_split_stride
+                         + batch * params.fwd.lse_batch_stride
+                         + head * params.fwd.lse_head_stride
+                         + int64_t(m_block) * kRows * params.fwd.lse_row_stride;
+        for (int row = tid; row < valid_rows; row += kThreads) {
+            ptr_LSE[lse_base + row * params.fwd.lse_row_stride] = -CUDART_INF_F;
+        }
     }
 
     // ---- operator(): pipeline init, warp dispatch ----
@@ -367,16 +407,35 @@ struct FusedAttnFwdSm100 {
         using cutlass::arch::NamedBarrier;
 
         TileScheduler tile_sched;
-        auto work = tile_sched.get_initial_work();
 
         using TmemAllocator = TMEM::Allocator1Sm;
         TmemAllocator tmem_alloc{};
         CollectiveMainloop mainloop;
         CollectiveEpilogue epilogue;
 
-        if (warp_idx >= 15) {
-            return;
+        auto work = [&] {
+            if constexpr (kHasKvSplits) {
+                return tile_sched.get_initial_work(params.fwd);
+            } else {
+                return tile_sched.get_initial_work();
+            }
+        }();
+
+        if constexpr (!kHasKvSplits) {
+            if (warp_idx >= 15) {
+                return;
+            }
         }
+
+        if constexpr (kHasKvSplits) {
+            int tile_nkv_for_tile = CollectiveMainloop::template get_tile_num_kv_blocks<HasVarBlockNums, true>(
+                    params.fwd, work.batch, work.head, work.m_block, work.split);
+            if (tile_nkv_for_tile <= 0) {
+                mark_empty_split(params, work.batch, work.head, work.m_block, work.split);
+                return;
+            }
+        }
+
         if (warp_idx == kMmaWarp) {
             tmem_alloc.allocate(TmemAllocator::Sm100TmemCapacityColumns,
                                                     &shared_storage.tmem_base_ptr);
@@ -386,34 +445,35 @@ struct FusedAttnFwdSm100 {
 
             const uint32_t tmem_base = shared_storage.tmem_base_ptr;
             typename CollectiveMainloop::MmaState mma_state;
-            int tile_nkv = CollectiveMainloop::template get_tile_num_kv_blocks<HasVarBlockNums>(
-                    params.fwd, work.batch, work.head, work.m_block);
+            int tile_nkv = CollectiveMainloop::template get_tile_num_kv_blocks<HasVarBlockNums, kHasKvSplits>(
+                    params.fwd, work.batch, work.head, work.m_block, work.split);
             mma_state = mainloop.mma(pipeline_kv, pipeline_s_p_o, pipeline_o_acc, pipeline_p_lastsplit,
                                       shared_storage, tmem_base, tile_nkv, mma_state);
-
-            tmem_alloc.free(shared_storage.tmem_base_ptr, TmemAllocator::Sm100TmemCapacityColumns);
+            tmem_alloc.free(tmem_base, TmemAllocator::Sm100TmemCapacityColumns);
         }
         else if (warp_idx == kEpiWarp) {
             // Epilogue warp does not touch tmem — skip the tmem_ready spin so it
             // can race ahead and block only on pipeline_o_epi.consumer_wait.
             typename CollectiveEpilogue::EpiState epi_state;
-            epi_state = epilogue.tma_store(
+            epi_state = epilogue.template tma_store<kHasKvSplits>(
                     params, pipeline_o_epi, shared_storage,
-                    work.head, work.m_block, work.batch, params.fwd.num_m_blocks, epi_state);
+                    work.head, work.m_block, work.batch, work.split, params.fwd.num_m_blocks, epi_state);
         }
         else if (warp_idx == kLoadWarp) {
             // Load warp only drives TMA into SMEM (smem_q, smem_kv); it never
             // reads tmem_base_ptr. Skipping the tmem_ready spin lets Q + first
             // KV TMAs overlap with MMA warp's tmem_alloc.allocate (~580 ns).
             typename CollectiveMainloop::LoadState load_state;
-            int tile_nkv = CollectiveMainloop::template get_tile_num_kv_blocks<HasVarBlockNums>(
-                    params.fwd, work.batch, work.head, work.m_block);
-            int raw_bc = CollectiveMainloop::template get_tile_raw_block_count<HasVarBlockNums>(
-                    params.fwd, work.batch, work.head, work.m_block);
-            load_state = mainloop.load(
+            int raw_bc = CollectiveMainloop::template get_tile_raw_block_count<HasVarBlockNums, kHasKvSplits>(
+                    params.fwd, work.batch, work.head, work.m_block, work.split);
+            int tile_nkv = CollectiveMainloop::get_tile_num_kv_blocks_from_raw_count(raw_bc);
+            load_state = mainloop.template load<kHasKvSplits>(
                     params, pipeline_kv, shared_storage,
-                    work.head, work.m_block, work.batch, params.fwd.num_m_blocks, tile_nkv,
+                    work.head, work.m_block, work.batch, work.split, params.fwd.num_m_blocks, tile_nkv,
                     raw_bc, load_state);
+        }
+        else if (warp_idx >= 15) {
+            return;
         }
         else if (warp_idx >= 8) {
             cutlass::arch::warpgroup_reg_dealloc<kRegsCorrection>();
@@ -422,17 +482,17 @@ struct FusedAttnFwdSm100 {
             const uint32_t tmem_base = shared_storage.tmem_base_ptr;
             typename CollectiveMainloop::CorrState corr_state;
 
-            int tile_nkv = CollectiveMainloop::template get_tile_num_kv_blocks<HasVarBlockNums>(
-                    params.fwd, work.batch, work.head, work.m_block);
+            int tile_nkv = CollectiveMainloop::template get_tile_num_kv_blocks<HasVarBlockNums, kHasKvSplits>(
+                    params.fwd, work.batch, work.head, work.m_block, work.split);
             float* ptr_LSE_tile; int lse_valid_rows;
-            compute_lse_tile_ptr(params, work.batch, work.head, work.m_block,
+            compute_lse_tile_ptr<kHasKvSplits>(params, work.batch, work.head, work.m_block, work.split,
                                  ptr_LSE_tile, lse_valid_rows);
-            corr_state = mainloop.template correction<SharedStorage, NamedBarriers>(
+            corr_state = mainloop.template correction<kHasKvSplits, SharedStorage, NamedBarriers>(
                     params.fwd.scale_softmax_log2,
                     pipeline_s_p_o, pipeline_sm_stats, pipeline_o_acc, pipeline_o_epi,
                     shared_storage,
                     tmem_base, tile_nkv, corr_state,
-                    ptr_LSE_tile, lse_valid_rows);
+                    ptr_LSE_tile, lse_valid_rows, params.fwd.lse_row_stride);
             pipeline_o_epi.producer_acquire(corr_state.o_epi_state);
         }
         else if (warp_idx >= 4) {
@@ -445,15 +505,15 @@ struct FusedAttnFwdSm100 {
             softmax1_state.spo_state = PipeState(1, 0, 0);
             softmax1_state.sm_stats_state = PipeState(1, 1, 0);
 
-            int tile_nkv = CollectiveMainloop::template get_tile_num_kv_blocks<HasVarBlockNums>(
-                    params.fwd, work.batch, work.head, work.m_block);
-            int const* tile_bi = compute_tile_bi(params, work.batch, work.head, work.m_block);
+            int raw_bc = CollectiveMainloop::template get_tile_raw_block_count<HasVarBlockNums, kHasKvSplits>(
+                    params.fwd, work.batch, work.head, work.m_block, work.split);
+            int tile_nkv = CollectiveMainloop::get_tile_num_kv_blocks_from_raw_count(raw_bc);
+            int const* tile_bi = compute_tile_bi<kHasKvSplits>(
+                    params, work.batch, work.head, work.m_block, work.split);
             softmax1_state = mainloop.template softmax</*Stage=*/1, HasBlockSizes, SharedStorage, NamedBarriers>(
                     pipeline_s_p_o, pipeline_sm_stats, pipeline_p_lastsplit,
                     shared_storage, tmem_base, params.fwd.scale_softmax_log2, tile_nkv, softmax1_state,
-                    tile_bi, params.fwd.block_sizes_ptr,
-                    CollectiveMainloop::template get_tile_raw_block_count<HasVarBlockNums>(
-                        params.fwd, work.batch, work.head, work.m_block));
+                    tile_bi, params.fwd.block_sizes_ptr, raw_bc);
         }
         else {
             warpgroup_reg_set<kRegsSoftmax>();
@@ -464,16 +524,17 @@ struct FusedAttnFwdSm100 {
             typename CollectiveMainloop::SoftmaxState softmax0_state;
             softmax0_state.sm_stats_state = PipeState(0, 1, 0);
 
-            int tile_nkv = CollectiveMainloop::template get_tile_num_kv_blocks<HasVarBlockNums>(
-                    params.fwd, work.batch, work.head, work.m_block);
-            int const* tile_bi = compute_tile_bi(params, work.batch, work.head, work.m_block);
+            int raw_bc = CollectiveMainloop::template get_tile_raw_block_count<HasVarBlockNums, kHasKvSplits>(
+                    params.fwd, work.batch, work.head, work.m_block, work.split);
+            int tile_nkv = CollectiveMainloop::get_tile_num_kv_blocks_from_raw_count(raw_bc);
+            int const* tile_bi = compute_tile_bi<kHasKvSplits>(
+                    params, work.batch, work.head, work.m_block, work.split);
             softmax0_state = mainloop.template softmax</*Stage=*/0, HasBlockSizes, SharedStorage, NamedBarriers>(
                     pipeline_s_p_o, pipeline_sm_stats, pipeline_p_lastsplit,
                     shared_storage, tmem_base, params.fwd.scale_softmax_log2, tile_nkv, softmax0_state,
-                    tile_bi, params.fwd.block_sizes_ptr,
-                    CollectiveMainloop::template get_tile_raw_block_count<HasVarBlockNums>(
-                        params.fwd, work.batch, work.head, work.m_block));
+                    tile_bi, params.fwd.block_sizes_ptr, raw_bc);
         }
+
     }
 
     // ------------------------------------------------------------------
@@ -530,14 +591,14 @@ struct FusedAttnFwdSm100 {
             auto work = ClcSched::get_initial_work();
             while (work.is_valid_tile) {
                 int tile_nkv = CollectiveMainloop::template get_tile_num_kv_blocks<HasVarBlockNums>(
-                        params.fwd, work.batch, work.head, work.m_block);
+                        params.fwd, work.batch, work.head, work.m_block, work.split);
                 mma_state = mainloop.mma(
                         pipeline_kv, pipeline_s_p_o, pipeline_o_acc, pipeline_p_lastsplit,
                         shared_storage, tmem_base, tile_nkv, mma_state);
                 work = ClcSched::consumer_advance(clc_pipeline, clc_consumer_state, clc_response_ptr);
             }
+            tmem_alloc.free(tmem_base, TmemAllocator::Sm100TmemCapacityColumns);
 
-            tmem_alloc.free(shared_storage.tmem_base_ptr, TmemAllocator::Sm100TmemCapacityColumns);
         }
         else if (warp_idx == kEpiWarp) {
             // Epilogue warp does not touch tmem — skip the tmem_ready spin.
@@ -545,9 +606,9 @@ struct FusedAttnFwdSm100 {
 
             auto work = ClcSched::get_initial_work();
             while (work.is_valid_tile) {
-                epi_state = epilogue.tma_store(
+                epi_state = epilogue.template tma_store<false>(
                         params, pipeline_o_epi, shared_storage,
-                        work.head, work.m_block, work.batch, params.fwd.num_m_blocks, epi_state);
+                        work.head, work.m_block, work.batch, work.split, params.fwd.num_m_blocks, epi_state);
                 work = ClcSched::consumer_advance(clc_pipeline, clc_consumer_state, clc_response_ptr);
             }
         }
@@ -559,11 +620,11 @@ struct FusedAttnFwdSm100 {
             auto work = ClcSched::get_initial_work();
             while (work.is_valid_tile) {
                 int tile_nkv = CollectiveMainloop::template get_tile_num_kv_blocks<HasVarBlockNums>(
-                        params.fwd, work.batch, work.head, work.m_block);
+                        params.fwd, work.batch, work.head, work.m_block, work.split);
                 int raw_bc = CollectiveMainloop::template get_tile_raw_block_count<HasVarBlockNums>(
-                        params.fwd, work.batch, work.head, work.m_block);
-                load_state = mainloop.load(params, pipeline_kv, shared_storage,
-                        work.head, work.m_block, work.batch, params.fwd.num_m_blocks, tile_nkv,
+                        params.fwd, work.batch, work.head, work.m_block, work.split);
+                load_state = mainloop.template load<false>(params, pipeline_kv, shared_storage,
+                        work.head, work.m_block, work.batch, work.split, params.fwd.num_m_blocks, tile_nkv,
                         raw_bc, load_state);
                 work = ClcSched::consumer_advance(clc_pipeline, clc_consumer_state, clc_response_ptr);
             }
@@ -578,16 +639,16 @@ struct FusedAttnFwdSm100 {
             auto work = ClcSched::get_initial_work();
             while (work.is_valid_tile) {
                 int tile_nkv = CollectiveMainloop::template get_tile_num_kv_blocks<HasVarBlockNums>(
-                        params.fwd, work.batch, work.head, work.m_block);
+                        params.fwd, work.batch, work.head, work.m_block, work.split);
                 float* ptr_LSE_tile; int lse_valid_rows;
-                compute_lse_tile_ptr(params, work.batch, work.head, work.m_block,
+                compute_lse_tile_ptr(params, work.batch, work.head, work.m_block, work.split,
                                      ptr_LSE_tile, lse_valid_rows);
-                corr_state = mainloop.template correction<SharedStorage, NamedBarriers>(
+                corr_state = mainloop.template correction<false, SharedStorage, NamedBarriers>(
                         params.fwd.scale_softmax_log2,
                         pipeline_s_p_o, pipeline_sm_stats, pipeline_o_acc, pipeline_o_epi,
                         shared_storage,
                         tmem_base, tile_nkv, corr_state,
-                        ptr_LSE_tile, lse_valid_rows);
+                        ptr_LSE_tile, lse_valid_rows, params.fwd.lse_row_stride);
                 work = ClcSched::consumer_advance(clc_pipeline, clc_consumer_state, clc_response_ptr);
             }
             pipeline_o_epi.producer_acquire(corr_state.o_epi_state);
@@ -605,14 +666,14 @@ struct FusedAttnFwdSm100 {
             auto work = ClcSched::get_initial_work();
             while (work.is_valid_tile) {
                 int tile_nkv = CollectiveMainloop::template get_tile_num_kv_blocks<HasVarBlockNums>(
-                        params.fwd, work.batch, work.head, work.m_block);
-                int const* tile_bi = compute_tile_bi(params, work.batch, work.head, work.m_block);
+                        params.fwd, work.batch, work.head, work.m_block, work.split);
+                int const* tile_bi = compute_tile_bi(params, work.batch, work.head, work.m_block, work.split);
                 softmax1_state = mainloop.template softmax</*Stage=*/1, HasBlockSizes, SharedStorage, NamedBarriers>(
                         pipeline_s_p_o, pipeline_sm_stats, pipeline_p_lastsplit,
                         shared_storage, tmem_base, params.fwd.scale_softmax_log2, tile_nkv, softmax1_state,
                         tile_bi, params.fwd.block_sizes_ptr,
                         CollectiveMainloop::template get_tile_raw_block_count<HasVarBlockNums>(
-                            params.fwd, work.batch, work.head, work.m_block));
+                            params.fwd, work.batch, work.head, work.m_block, work.split));
                 work = ClcSched::consumer_advance(clc_pipeline, clc_consumer_state, clc_response_ptr);
             }
         }
@@ -628,14 +689,14 @@ struct FusedAttnFwdSm100 {
             auto work = ClcSched::get_initial_work();
             while (work.is_valid_tile) {
                 int tile_nkv = CollectiveMainloop::template get_tile_num_kv_blocks<HasVarBlockNums>(
-                        params.fwd, work.batch, work.head, work.m_block);
-                int const* tile_bi = compute_tile_bi(params, work.batch, work.head, work.m_block);
+                        params.fwd, work.batch, work.head, work.m_block, work.split);
+                int const* tile_bi = compute_tile_bi(params, work.batch, work.head, work.m_block, work.split);
                 softmax0_state = mainloop.template softmax</*Stage=*/0, HasBlockSizes, SharedStorage, NamedBarriers>(
                         pipeline_s_p_o, pipeline_sm_stats, pipeline_p_lastsplit,
                         shared_storage, tmem_base, params.fwd.scale_softmax_log2, tile_nkv, softmax0_state,
                         tile_bi, params.fwd.block_sizes_ptr,
                         CollectiveMainloop::template get_tile_raw_block_count<HasVarBlockNums>(
-                            params.fwd, work.batch, work.head, work.m_block));
+                            params.fwd, work.batch, work.head, work.m_block, work.split));
                 work = ClcSched::consumer_advance(clc_pipeline, clc_consumer_state, clc_response_ptr);
             }
         }
@@ -652,10 +713,11 @@ fused_attn_device(
     kernel(params, shared_memory);
 }
 
-template<int kHeadDim, bool HasBlockSizes, bool HasVarBlockNums, bool UseClc = false>
+template<int kHeadDim, bool HasBlockSizes, bool HasVarBlockNums,
+         bool UseClc = false, bool HasKvSplits = true>
 using FusedAttnKernel = FusedAttnFwdSm100<CollectiveMainloopFwd<kHeadDim>,
                                           CollectiveEpilogueFwd<kHeadDim>,
                                           SingleTileScheduler, HasBlockSizes, HasVarBlockNums,
-                                          UseClc>;
+                                          UseClc, HasKvSplits>;
 
 } // namespace flash

@@ -23,15 +23,17 @@ struct bsa_fwd_params {
     index_t q_batch_stride, q_row_stride, q_head_stride;
     index_t k_batch_stride, k_row_stride, k_head_stride;
     index_t v_batch_stride, v_row_stride, v_head_stride;
-    index_t o_batch_stride, o_row_stride, o_head_stride;
+    index_t o_batch_stride, o_row_stride, o_head_stride, o_split_stride;
 
     // The pointer to the softmax log-sum-exp.
     void* __restrict__ softmax_lse_ptr;
+    index_t lse_batch_stride, lse_row_stride, lse_head_stride, lse_split_stride;
 
     // Block-sparse indices.
     int const* __restrict__ block_indices_ptr;
     int const* __restrict__ block_sizes_ptr;
     int const* __restrict__ q2k_block_nums_ptr;
+    int const* __restrict__ split_offsets_ptr;
 
     // The dimensions.
     int b, seqlen_q, seqlen_k, d;
@@ -44,6 +46,7 @@ struct bsa_fwd_params {
     // Sparse config.
     int block_indices_stride;
     int uniform_block_sparse_num;  // per-tile raw block count when HasVarBlockNums=false
+    int kv_splits;                 // 1 for the legacy fwd path.
 
     // The scaling factors for the kernel.
     float scale_softmax;

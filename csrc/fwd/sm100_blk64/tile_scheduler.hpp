@@ -32,6 +32,7 @@ struct SingleTileScheduler {
         int m_block;
         int head;
         int batch;
+        int split;
         bool is_valid_tile;
     };
 
@@ -39,16 +40,41 @@ struct SingleTileScheduler {
     WorkTileInfo get_initial_work() const {
         return {static_cast<int>(blockIdx.x),
                 static_cast<int>(blockIdx.y),
-                static_cast<int>(blockIdx.z), true};
+                static_cast<int>(blockIdx.z),
+                0,
+                true};
+    }
+
+    template <typename FwdParams>
+    CUTLASS_DEVICE
+    WorkTileInfo get_initial_work(FwdParams const& fwd) const {
+        if (fwd.kv_splits > 1) {
+            int bh = static_cast<int>(blockIdx.z);
+            return {static_cast<int>(blockIdx.x),
+                    bh % fwd.h,
+                    bh / fwd.h,
+                    static_cast<int>(blockIdx.y),
+                    true};
+        }
+        return get_initial_work();
     }
 
     CUTLASS_DEVICE
     WorkTileInfo get_next_work(WorkTileInfo const&) const {
-        return {0, 0, 0, false};
+        return {0, 0, 0, 0, false};
     }
 
     static dim3 get_grid_shape(int num_m_blocks, int num_heads, int batch) {
         return dim3(num_m_blocks, num_heads, batch);
+    }
+
+    static dim3 get_grid_shape(int num_m_blocks, int num_heads, int batch, int kv_splits) {
+        if (kv_splits > 1) {
+            return dim3(static_cast<unsigned>(num_m_blocks),
+                        static_cast<unsigned>(kv_splits),
+                        static_cast<unsigned>(num_heads * batch));
+        }
+        return get_grid_shape(num_m_blocks, num_heads, batch);
     }
 };
 
@@ -83,11 +109,12 @@ struct ClcPersistentTileScheduler {
         int m_block;
         int head;
         int batch;
+        int split;
         bool is_valid_tile;
     };
 
     CUTLASS_DEVICE static WorkInfo to_work_info(WorkTileInfo const& w) {
-        return {w.M_idx, w.N_idx, w.L_idx, w.is_valid_tile};
+        return {w.M_idx, w.N_idx, w.L_idx, 0, w.is_valid_tile};
     }
 
     // Initial tile = this CTA's blockIdx, marked valid. Subsequent tiles come
@@ -95,7 +122,9 @@ struct ClcPersistentTileScheduler {
     CUTLASS_DEVICE static WorkInfo get_initial_work() {
         return {static_cast<int>(blockIdx.x),
                 static_cast<int>(blockIdx.y),
-                static_cast<int>(blockIdx.z), true};
+                static_cast<int>(blockIdx.z),
+                0,
+                true};
     }
 
     // Producer side (runs on scheduler warp). One thread per cluster issues

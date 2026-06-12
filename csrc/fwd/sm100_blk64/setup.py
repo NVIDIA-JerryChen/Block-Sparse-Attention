@@ -39,6 +39,7 @@ setup(
             name="bsa_fwd_blk64_ext",
             sources=[
                 str(SRC_DIR / "bsa_api.cpp"),
+                str(SRC_DIR / "bsa_kv_bucketed.cu"),
             ] + instantiation_sources,
             include_dirs=[
                 str(SRC_DIR),

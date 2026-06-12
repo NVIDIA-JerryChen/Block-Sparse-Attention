@@ -269,16 +269,15 @@ struct CollectiveMainloopFwd {
     // raw_count: actual sparse blocks (for index clamping and phantom detection).
     // HasVarBlockNums=true  → per-tile raw count from q2k_block_nums_ptr[tile_flat]
     // HasVarBlockNums=false → uniform raw count from fwd.uniform_block_sparse_num (kernel-param scalar)
-    template<bool HasVarBlockNums>
+    template<bool HasVarBlockNums, bool HasKvSplits = false>
     CUTLASS_DEVICE static int get_tile_num_kv_blocks(
-            bsa_fwd_params const& fwd, int batch, int head, int row_tile) {
-        int raw_count;
-        if constexpr (HasVarBlockNums) {
-            int tile_flat = (batch * fwd.h + head) * fwd.num_m_blocks + row_tile;
-            raw_count = fwd.q2k_block_nums_ptr[tile_flat];
-        } else {
-            raw_count = fwd.uniform_block_sparse_num;
-        }
+            bsa_fwd_params const& fwd, int batch, int head, int row_tile, int split) {
+        int raw_count = get_tile_raw_block_count<HasVarBlockNums, HasKvSplits>(
+                fwd, batch, head, row_tile, split);
+        return get_tile_num_kv_blocks_from_raw_count(raw_count);
+    }
+
+    CUTLASS_DEVICE static int get_tile_num_kv_blocks_from_raw_count(int raw_count) {
         if (raw_count <= 0) return 0;  // empty tile
         // Round up to multiple of 8 (kSparseBlocksPerKV * 2), then /4 → even kv_iters
         constexpr int kAlign = kSparseBlocksPerKV * 2;  // 8
@@ -287,15 +286,30 @@ struct CollectiveMainloopFwd {
     }
 
     // Get the raw (unpadded) block count for a tile — used for index clamping and phantom detection.
-    template<bool HasVarBlockNums>
+    template<bool HasVarBlockNums, bool HasKvSplits = false>
     CUTLASS_DEVICE static int get_tile_raw_block_count(
-            bsa_fwd_params const& fwd, int batch, int head, int row_tile) {
+            bsa_fwd_params const& fwd, int batch, int head, int row_tile, int split) {
+        if constexpr (HasKvSplits) {
+            int64_t tile_flat = (int64_t(batch) * fwd.h + head) * fwd.num_m_blocks + row_tile;
+            int64_t base = tile_flat * int64_t(fwd.kv_splits + 1) + split;
+            return fwd.split_offsets_ptr[base + 1] - fwd.split_offsets_ptr[base];
+        }
         if constexpr (HasVarBlockNums) {
             int tile_flat = (batch * fwd.h + head) * fwd.num_m_blocks + row_tile;
             return fwd.q2k_block_nums_ptr[tile_flat];
         } else {
             return fwd.uniform_block_sparse_num;
         }
+    }
+
+    template<bool HasKvSplits = false>
+    CUTLASS_DEVICE static int get_tile_split_offset(
+            bsa_fwd_params const& fwd, int batch, int head, int row_tile, int split) {
+        if constexpr (!HasKvSplits) {
+            return 0;
+        }
+        int64_t tile_flat = (int64_t(batch) * fwd.h + head) * fwd.num_m_blocks + row_tile;
+        return fwd.split_offsets_ptr[tile_flat * int64_t(fwd.kv_splits + 1) + split];
     }
 
     // ===========================================================================
@@ -469,11 +483,11 @@ struct CollectiveMainloopFwd {
         return kv_st;
     }
 
-    template<typename KernelParams, typename SharedStorage>
+    template<bool HasKvSplits, typename KernelParams, typename SharedStorage>
     CUTLASS_DEVICE LoadState load(
             KernelParams const& params, PipelineKV& pipeline_kv,
             SharedStorage& shared_storage,
-            int head, int row_tile, int batch, int num_row_tiles, int num_kv_blocks,
+            int head, int row_tile, int batch, int split, int num_row_tiles, int num_kv_blocks,
             int raw_block_count,  // actual sparse block count (for phantom clamping)
             LoadState state)
     {
@@ -493,7 +507,10 @@ struct CollectiveMainloopFwd {
             int const* tile_block_indices = nullptr;
             if (params.fwd.block_indices_ptr != nullptr) {
                 int64_t tile_idx_flat = (int64_t(batch) * params.fwd.h + head) * num_row_tiles + row_tile;
-                tile_block_indices = params.fwd.block_indices_ptr + tile_idx_flat * params.fwd.block_indices_stride;
+                int split_offset = get_tile_split_offset<HasKvSplits>(
+                        params.fwd, batch, head, row_tile, split);
+                tile_block_indices = params.fwd.block_indices_ptr
+                        + tile_idx_flat * params.fwd.block_indices_stride + split_offset;
             }
 
             // Load Q (one-shot TMA into persistent smem_q)
@@ -1214,11 +1231,11 @@ struct CollectiveMainloopFwd {
         }
     }
 
-    // ptr_LSE_tile: base pointer for this tile's LSE output (caller pre-computes
-    //   ptr_LSE + (batch*h + head)*seqlen_q + m_block*kRows).
+    // ptr_LSE_tile: base pointer for this tile's LSE output. The caller
+    // pre-computes the batch/head/split/m_block offset and passes row stride.
     // lse_valid_rows: number of rows to write (= seqlen_q - m_block*kRows, clamped to [0, kRows]).
     //   Writes are guarded so tensor can be allocated at actual seqlen_q (not rounded).
-    template<typename SharedStorage, typename NamedBarriers>
+    template<bool HasKvSplits, typename SharedStorage, typename NamedBarriers>
     CUTLASS_DEVICE CorrState correction(
             float sm_scale_log2,
             PipelineSPO& pipeline_s_p_o, PipelineSmStats& pipeline_sm_stats,
@@ -1227,7 +1244,8 @@ struct CollectiveMainloopFwd {
             SharedStorage& shared_storage,
             uint32_t tmem_base, int num_kv_blocks,
             CorrState corr_state,
-            float* ptr_LSE_tile = nullptr, int lse_valid_rows = 0)
+            float* ptr_LSE_tile = nullptr, int lse_valid_rows = 0,
+            int64_t lse_row_stride = 1)
     {
         using namespace cute;
         using cutlass::arch::NamedBarrier;
@@ -1345,7 +1363,11 @@ struct CollectiveMainloopFwd {
                     } else {
                         lse = -CUDART_INF_F;
                     }
-                    ptr_LSE_tile[out_row] = lse;
+                    if constexpr (HasKvSplits) {
+                        ptr_LSE_tile[int64_t(out_row) * lse_row_stride] = lse;
+                    } else {
+                        ptr_LSE_tile[out_row] = lse;
+                    }
                 }
             }
         }
