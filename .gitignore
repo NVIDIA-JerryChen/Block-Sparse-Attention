@@ -1,11 +1,21 @@
+# Agent workspace
+/agent/
+
 # Local outputs and scratch space
 /artifacts/
 /scratch/
 /design/dev_docs/
 /tools/perfsim
 
-/tests/temp
-/benchmarks/temp
+/tests/temp/
+/benchmarks/temp/
+
+# Generated profiling / benchmark artifacts
+BENCHMARK*.log
+pytest*.log
+*.ncu-rep
+*.qdrep
+*.nsys-rep
 
 # Python / build artifacts
 __pycache__/

@@ -176,12 +176,8 @@ def _sm100_blk64_auto_kv_splits(
     fixed_block_sparse_num: int,
     max_kv_splits: int = 16,
 ) -> int:
-    """Choose KV splits so the active K/V bucket fits a conservative L2 budget."""
+    """Choose KV splits for the SM100 blk64 KV-bucketed target cases."""
     if is_fake_mode() or not q.is_cuda:
-        return 1
-    props = torch.cuda.get_device_properties(q.device)
-    l2_bytes = int(getattr(props, "L2_cache_size", 0))
-    if l2_bytes <= 0:
         return 1
 
     kv_blocks = int(fixed_block_sparse_num)
@@ -190,19 +186,14 @@ def _sm100_blk64_auto_kv_splits(
     if kv_blocks <= 1:
         return 1
 
-    batch, num_heads, _seqlen_q, head_dim = q.shape
-    kv_block_tokens = 64
-    kv_bytes_per_block_per_head = 2 * kv_block_tokens * head_dim * q.element_size()
-    active_head_slots = int(batch) * int(num_heads)
-    working_set_bytes = kv_blocks * kv_bytes_per_block_per_head * active_head_slots
-
-    # Leave room for Q/O, q2k metadata, unrelated CTAs, and L2 set conflicts.
-    l2_budget_bytes = max(1, l2_bytes // 2)
-    required_splits = _ceil_div_int(working_set_bytes, l2_budget_bytes)
-    if required_splits <= 1:
-        return 1
-
-    splits = 1 << _ceil_log2_int(required_splits)
+    if kv_blocks >= 900:
+        splits = 8
+    elif kv_blocks >= 450:
+        splits = 4
+    elif kv_blocks >= 256:
+        splits = 2
+    else:
+        splits = 1
     return max(1, min(int(splits), int(max_kv_splits), kv_blocks))
 
 
@@ -462,10 +453,10 @@ def _bsa_attn_fwd_blk64_kv_bucketed(
     o_partial = o_partial_phys.as_strided(
         (kv_splits, batch, seqlen_q, num_heads, head_dim),
         (
-            num_heads * head_dim,
+            num_heads * seqlen_q * head_dim,
             seqlen_q * split_heads * head_dim,
-            split_heads * head_dim,
             head_dim,
+            seqlen_q * head_dim,
             1,
         ),
     )
@@ -488,57 +479,76 @@ def _bsa_attn_fwd_blk64_kv_bucketed(
         dtype=torch.float32,
         device=q.device,
     )
-    # Combine writes its native BSHD/BSH layout. Return BHSD/BHS views without D2D.
-    out = out_bshd.transpose(1, 2)
-    lse = lse_bsh.transpose(1, 2)
-
     dtype = torch2cute_dtype_map[q.dtype]
     log_max_splits = _ceil_log2_int(kv_splits)
     max_splits = 1 << log_max_splits
-    # The copied combine kernel is validated for tile_m=16 in split-attention
-    # identity cases; larger tile_m values can mix LSE rows incorrectly.
+    # Baseline combine geometry; a single configuration is easier to maintain.
     combine_tile_m = 16
-    combine_kernel = FlashAttentionForwardCombine(
-        dtype=dtype,
-        dtype_partial=dtype,
-        head_dim=head_dim,
-        tile_m=combine_tile_m,
-        k_block_size=64,
-        log_max_splits=log_max_splits,
-        num_threads=128,
-    )
+    combine_k_block_size = 64
+    combine_num_threads = 128
+    combine_stages = 4
 
     current_stream = (
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         if is_fake_mode()
         else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     )
+    o_partial_shape = (kv_splits, batch, seqlen_q, num_heads, head_dim)
+    o_partial_stride = (
+        num_heads * seqlen_q * head_dim,
+        seqlen_q * split_heads * head_dim,
+        head_dim,
+        seqlen_q * head_dim,
+        1,
+    )
+    lse_partial_shape = (kv_splits, batch, seqlen_q, num_heads)
+    lse_partial_stride = (
+        num_heads * seqlen_q,
+        seqlen_q * split_heads,
+        1,
+        seqlen_q,
+    )
+    out_bshd_shape = (batch, seqlen_q, num_heads, head_dim)
+    out_bshd_stride = (seqlen_q * num_heads * head_dim, num_heads * head_dim, head_dim, 1)
+    lse_bsh_shape = (batch, seqlen_q, num_heads)
+    lse_bsh_stride = (seqlen_q * num_heads, num_heads, 1)
     compile_key = (
         dtype,
         head_dim,
         kv_splits,
-        combine_kernel.tile_m,
-        combine_kernel.k_block_size,
-        combine_kernel.max_splits,
-        combine_kernel.num_threads,
-        _tensor_compile_key(o_partial),
-        _tensor_compile_key(lse_partial),
-        _tensor_compile_key(out_bshd),
-        _tensor_compile_key(lse_bsh),
-    )
-    args = (
-        _to_cute_tensor(o_partial),
-        _to_cute_tensor(lse_partial, assumed_align=4, leading_dim=2),
-        _to_cute_tensor(out_bshd),
-        _to_cute_tensor(lse_bsh, assumed_align=4),
-        None,
-        None,
-        None,
-        None,
-        None,
-        current_stream,
+        combine_tile_m,
+        combine_k_block_size,
+        max_splits,
+        combine_num_threads,
+        combine_stages,
+        (o_partial_shape, o_partial_stride, q.dtype),
+        (lse_partial_shape, lse_partial_stride, torch.float32),
+        (out_bshd_shape, out_bshd_stride, q.dtype),
+        (lse_bsh_shape, lse_bsh_stride, torch.float32),
     )
     if compile_key not in _bsa_attn_fwd_blk64_kv_bucketed.compile_cache:
+        combine_kernel = FlashAttentionForwardCombine(
+            dtype=dtype,
+            dtype_partial=dtype,
+            head_dim=head_dim,
+            tile_m=combine_tile_m,
+            k_block_size=combine_k_block_size,
+            log_max_splits=log_max_splits,
+            num_threads=combine_num_threads,
+            stages=combine_stages,
+        )
+        args = (
+            _to_cute_tensor(o_partial),
+            _to_cute_tensor(lse_partial, assumed_align=4, leading_dim=2),
+            _to_cute_tensor(out_bshd),
+            _to_cute_tensor(lse_bsh, assumed_align=4),
+            None,
+            None,
+            None,
+            None,
+            None,
+            current_stream,
+        )
         t0 = time.time()
         _bsa_attn_fwd_blk64_kv_bucketed.compile_cache[compile_key] = cute.compile(
             combine_kernel,
@@ -548,22 +558,24 @@ def _bsa_attn_fwd_blk64_kv_bucketed(
         print(f"Compiled kv-bucketed fwd combine in {time.time() - t0:.1f}s")
 
     if not is_fake_mode():
-        with torch.cuda.nvtx.range("bsa_attn_fwd_blk64_kv_bucketed_combine"):
-            _bsa_attn_fwd_blk64_kv_bucketed.compile_cache[compile_key](
-                o_partial,
-                lse_partial,
-                out_bshd,
-                lse_bsh,
-                None,
-                None,
-                None,
-                None,
-                None,
-                current_stream,
-            )
+        _bsa_attn_fwd_blk64_kv_bucketed.compile_cache[compile_key](
+            o_partial,
+            lse_partial,
+            out_bshd,
+            lse_bsh,
+            None,
+            None,
+            None,
+            None,
+            None,
+            current_stream,
+        )
 
     # Keep split_offsets alive through the combine launch on the same stream.
     _ = split_offsets
+    # Combine writes its native BSHD/BSH layout. Return BHSD/BHS views without D2D.
+    out = out_bshd.transpose(1, 2)
+    lse = lse_bsh.transpose(1, 2)
     return out, lse
 
 
@@ -725,6 +737,7 @@ def bsa_attn_fwd_blk64(
             out = out.transpose(1, 2)
         return out, lse
 
+    single_tile_use_clc = False if auto_kv_splits else use_clc
     out, lse = torch.ops.bsa_blk64.fwd(
         q,
         k,
@@ -734,7 +747,7 @@ def bsa_attn_fwd_blk64(
         block_sizes,
         softmax_scale,
         q2k_block_nums,
-        use_clc,
+        single_tile_use_clc,
     )
 
     assert out.size(2) == seqlen_q and lse.size(2) == seqlen_q

@@ -349,6 +349,28 @@ struct CollectiveMainloopFwd {
         return (sub == 0) ? 0 : (sub == 1) ? 2 : (sub == 2) ? 1 : 3;
     }
 
+    struct SparseIdxPack {
+        int idx0;
+        int idx1;
+        int idx2;
+        int idx3;
+
+        CUTLASS_DEVICE int get(int sub) const {
+            return (sub == 0) ? idx0 : (sub == 1) ? idx1 : (sub == 2) ? idx2 : idx3;
+        }
+    };
+
+    CUTLASS_DEVICE static SparseIdxPack make_sparse_idx_pack(
+            int kv_block_idx, int raw_block_count, int const* tile_block_indices) {
+        return SparseIdxPack{
+            get_sparse_idx(kv_block_idx, 0, raw_block_count, tile_block_indices),
+            get_sparse_idx(kv_block_idx, 1, raw_block_count, tile_block_indices),
+            get_sparse_idx(kv_block_idx, 2, raw_block_count, tile_block_indices),
+            get_sparse_idx(kv_block_idx, 3, raw_block_count, tile_block_indices),
+        };
+    }
+
+
     CUTLASS_DEVICE static int get_v_smem_offset(int stage_base, int sub, int h) {
         using namespace cute;
         // Linearize (sub, h) into a 2D tile coordinate inside SmemLayoutVDual
@@ -390,13 +412,13 @@ struct CollectiveMainloopFwd {
             TmaBarrier* tma_bar, auto const& params,
             ThrTmaK& thr_tma_k, GKFull& gK_full,
             MainloopStorage& ml,
-            int head, int batch, int raw_block_count,
-            int const* tile_block_indices) {
+            int head, int batch, SparseIdxPack const& sparse_idxs) {
         using namespace cute;
+        (void)kv_block_idx;
         auto& tma_mbar = reinterpret_cast<uint64_t&>(*tma_bar);
         CUTLASS_PRAGMA_UNROLL
         for (int sub = 0; sub < kSparseBlocksPerKV; ++sub) {
-            int sparse_idx = get_sparse_idx(kv_block_idx, sub, raw_block_count, tile_block_indices);
+            int sparse_idx = sparse_idxs.get(sub);
             int slot = get_interleaved_k_slot(sub);
             CUTLASS_PRAGMA_UNROLL
             for (int h = 0; h < kDimHalves; ++h) {
@@ -416,8 +438,7 @@ struct CollectiveMainloopFwd {
             PipelineKV& pipeline_kv, auto const& params,
             ThrTmaK& thr_tma_k, GKFull& gK_full,
             MainloopStorage& ml,
-            int head, int batch, int raw_block_count,
-            int const* tile_block_indices) {
+            int head, int batch, SparseIdxPack const& sparse_idxs) {
         using namespace cute;
         // K interleave map: sub-block -> SMEM slot. Keeps warp-col distribution balanced:
         // {0->0, 1->2, 2->1, 3->3}.
@@ -427,7 +448,7 @@ struct CollectiveMainloopFwd {
         issue_K_tmas(
                 kv_block_idx, stage_base, tma_bar, params,
                 thr_tma_k, gK_full, ml,
-                head, batch, raw_block_count, tile_block_indices);
+                head, batch, sparse_idxs);
         ++kv_st;
         return kv_st;
     }
@@ -439,12 +460,11 @@ struct CollectiveMainloopFwd {
             TmaBarrier* tma_bar, auto const& params,
             ThrTmaV& thr_tma_v, GVFull& gV_full,
             MainloopStorage& ml,
-            int head, int batch, int raw_block_count,
-            int const* tile_block_indices) {
+            int head, int batch, SparseIdxPack const& sparse_idxs) {
         using namespace cute;
         CUTLASS_PRAGMA_UNROLL
         for (int sub = 0; sub < kSparseBlocksPerKV; ++sub) {
-            int sparse_idx = get_sparse_idx(kv_block_idx, sub, raw_block_count, tile_block_indices);
+            int sparse_idx = sparse_idxs.get(sub);
             CUTLASS_PRAGMA_UNROLL
             for (int h = 0; h < kVDimParts; ++h) {
                 int smem_offset = get_v_smem_offset(stage_base, sub, h);
@@ -469,8 +489,7 @@ struct CollectiveMainloopFwd {
             PipelineKV& pipeline_kv, auto const& params,
             ThrTmaV& thr_tma_v, GVFull& gV_full,
             MainloopStorage& ml,
-            int head, int batch, int raw_block_count,
-            int const* tile_block_indices) {
+            int head, int batch, SparseIdxPack const& sparse_idxs) {
         using namespace cute;
         pipeline_kv.producer_acquire(kv_st);
         auto* tma_bar = pipeline_kv.producer_get_barrier(kv_st);
@@ -478,7 +497,7 @@ struct CollectiveMainloopFwd {
         issue_V_tmas(
                 kv_block_idx, stage_base, tma_bar, params,
                 thr_tma_v, gV_full, ml,
-                head, batch, raw_block_count, tile_block_indices);
+                head, batch, sparse_idxs);
         ++kv_st;
         return kv_st;
     }
@@ -526,32 +545,52 @@ struct CollectiveMainloopFwd {
             auto kv_state = state.kv_state;
 
             // BSA reverse order: K[N-1], K[N-2], {V[N-1-i], K[N-3-i]}x(N-2), V[1], V[0]
+            SparseIdxPack cached_sparse_idx0 = make_sparse_idx_pack(
+                    num_kv_blocks - 1, raw_block_count, tile_block_indices);
+            SparseIdxPack cached_sparse_idx1 = make_sparse_idx_pack(
+                    num_kv_blocks - 2, raw_block_count, tile_block_indices);
             kv_state = load_K(
                     num_kv_blocks - 1, kv_state,
                     pipeline_kv, params, thr_tma_k, gK_full, ml,
-                    head, batch, raw_block_count, tile_block_indices);
+                    head, batch, cached_sparse_idx0);
             kv_state = load_K(
                     num_kv_blocks - 2, kv_state,
                     pipeline_kv, params, thr_tma_k, gK_full, ml,
-                    head, batch, raw_block_count, tile_block_indices);
+                    head, batch, cached_sparse_idx1);
 
             CUTE_NO_UNROLL
             for (int i = 0; i < num_kv_blocks - 2; ++i) {
-                kv_state = load_V(num_kv_blocks - 1 - i, kv_state,
-                        pipeline_kv, params, thr_tma_v, gV_full, ml,
-                        head, batch, raw_block_count, tile_block_indices);
-                kv_state = load_K(
-                        num_kv_blocks - 3 - i, kv_state,
-                        pipeline_kv, params, thr_tma_k, gK_full, ml,
-                        head, batch, raw_block_count, tile_block_indices);
+                int v_kv_block_idx = num_kv_blocks - 1 - i;
+                int next_kv_block_idx = num_kv_blocks - 3 - i;
+                if ((i & 1) == 0) {
+                    kv_state = load_V(v_kv_block_idx, kv_state,
+                            pipeline_kv, params, thr_tma_v, gV_full, ml,
+                            head, batch, cached_sparse_idx0);
+                    cached_sparse_idx0 = make_sparse_idx_pack(
+                            next_kv_block_idx, raw_block_count, tile_block_indices);
+                    kv_state = load_K(
+                            next_kv_block_idx, kv_state,
+                            pipeline_kv, params, thr_tma_k, gK_full, ml,
+                            head, batch, cached_sparse_idx0);
+                } else {
+                    kv_state = load_V(v_kv_block_idx, kv_state,
+                            pipeline_kv, params, thr_tma_v, gV_full, ml,
+                            head, batch, cached_sparse_idx1);
+                    cached_sparse_idx1 = make_sparse_idx_pack(
+                            next_kv_block_idx, raw_block_count, tile_block_indices);
+                    kv_state = load_K(
+                            next_kv_block_idx, kv_state,
+                            pipeline_kv, params, thr_tma_k, gK_full, ml,
+                            head, batch, cached_sparse_idx1);
+                }
             }
 
             kv_state = load_V(1, kv_state,
                     pipeline_kv, params, thr_tma_v, gV_full, ml,
-                    head, batch, raw_block_count, tile_block_indices);
+                    head, batch, cached_sparse_idx0);
             kv_state = load_V(0, kv_state,
                     pipeline_kv, params, thr_tma_v, gV_full, ml,
-                    head, batch, raw_block_count, tile_block_indices);
+                    head, batch, cached_sparse_idx1);
 
             state.kv_state = kv_state;
         }
@@ -1029,6 +1068,7 @@ struct CollectiveMainloopFwd {
         const uint32_t tmem_s_cur = tmem_base + kTmemS;
         const int sm_idx = threadIdx.x - Stage * kSoftmaxWarps * 32;
         const int warp_in_wg = sm_idx / 32;
+        const int lane_idx = sm_idx & 31;
         const int sm_stats_bar = NamedBarriers::SmStatsNotify + Stage * kSoftmaxWarps + warp_in_wg;
 
         float row_max = -CUDART_INF_F;
@@ -1051,12 +1091,22 @@ struct CollectiveMainloopFwd {
             int logical_lo = kv_block * kSparseBlocksPerKV + warp_col;
             int logical_hi = kv_block * kSparseBlocksPerKV + warp_col + 2;
             if constexpr (HasBlockSizes) {
-                int clamped_lo = (logical_lo < raw_block_count) ? logical_lo : max(raw_block_count - 1, 0);
-                int clamped_hi = (logical_hi < raw_block_count) ? logical_hi : max(raw_block_count - 1, 0);
-                int bi_lo = tile_block_indices[clamped_lo];
-                int bi_hi = tile_block_indices[clamped_hi];
-                bs_lo = (logical_lo < raw_block_count) ? ptr_block_sizes[bi_lo] : 0;
-                bs_hi = (logical_hi < raw_block_count) ? ptr_block_sizes[bi_hi] : 0;
+                int bs_lo_lane0 = 0;
+                int bs_hi_lane16 = 0;
+                if (lane_idx == 0) {
+                    if (logical_lo < raw_block_count) {
+                        int bi_lo = tile_block_indices[logical_lo];
+                        bs_lo_lane0 = ptr_block_sizes[bi_lo];
+                    }
+                }
+                if (lane_idx == 16) {
+                    if (logical_hi < raw_block_count) {
+                        int bi_hi = tile_block_indices[logical_hi];
+                        bs_hi_lane16 = ptr_block_sizes[bi_hi];
+                    }
+                }
+                bs_lo = __shfl_sync(0xFFFFFFFF, bs_lo_lane0, 0);
+                bs_hi = __shfl_sync(0xFFFFFFFF, bs_hi_lane16, 16);
             } else {
                 bs_lo = (logical_lo < raw_block_count) ? kSparseBlockSize : 0;
                 bs_hi = (logical_hi < raw_block_count) ? kSparseBlockSize : 0;

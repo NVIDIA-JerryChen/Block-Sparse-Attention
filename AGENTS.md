@@ -32,8 +32,13 @@
 
 除非用户明确指定路径，agent 创建的临时文件必须按以下约定存放：
 
-- **测试文件**：`/home/scratch.cjerry_sw/BSA/tests/temp/`
-- **Benchmark 文件**：`/home/scratch.cjerry_sw/BSA/benchmarks/temp/`
+- **测试/复现文件**：`/home/scratch.cjerry_sw/BSA/agent/agent_tests/`
+- **Benchmark 文件与结果**：`/home/scratch.cjerry_sw/BSA/agent/agent_benchmark/`
+- **Profile/NCU/NSYS/Perfsim 文件**：`/home/scratch.cjerry_sw/BSA/agent/agent_profiles/`
+- **临时工作区、构建缓存、调试数据**：`/home/scratch.cjerry_sw/BSA/agent/agent_space/`
+
+`/home/scratch.cjerry_sw/BSA/agent/` 整体不被 git 追踪；不要再向
+`tests/temp/` 或 `benchmarks/temp/` 新增 agent 临时文件。
 
 ## 工作流程
 

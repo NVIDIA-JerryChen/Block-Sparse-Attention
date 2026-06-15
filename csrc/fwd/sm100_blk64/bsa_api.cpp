@@ -70,13 +70,13 @@ void set_params_fprop(bsa_fwd_params &params,
     params.k_batch_stride = k.stride(0);   params.k_head_stride = k.stride(1);   params.k_row_stride = k.stride(2);
     params.v_batch_stride = v.stride(0);   params.v_head_stride = v.stride(1);   params.v_row_stride = v.stride(2);
     if (kv_splits > 1) {
-        // KV-bucketed partial layout: (B, S, Split * H, D). Folding split into
-        // the inner head mode keeps split/head contiguous for the copied combine
-        // kernel while preserving a 4D TMA store descriptor.
+        // KV-bucketed partial layout: (B, Split * H, S, D). Keeping rows
+        // contiguous for each folded split/head improves the combine load path
+        // while preserving a 4D TMA store descriptor.
         params.o_batch_stride = out.stride(0);
-        params.o_row_stride = out.stride(1);
-        params.o_head_stride = out.stride(2);
-        params.o_split_stride = h * out.stride(2);
+        params.o_head_stride = out.stride(1);
+        params.o_row_stride = out.stride(2);
+        params.o_split_stride = h * out.stride(1);
 
         // KV-bucketed partial LSE layout: (B, S, Split * H).
         params.lse_batch_stride = lse.stride(0);
@@ -321,7 +321,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_kv_b
         {b, h, num_m_blocks, kv_splits_i + 1},
         q2k_block_index.options());
     auto o_partial = torch::empty(
-        {b, seqlen_q, kv_splits_i * h, kOutputCols},
+        {b, kv_splits_i * h, seqlen_q, kOutputCols},
         q.options());
     auto lse_partial = torch::empty_strided(
         {b, seqlen_q, kv_splits_i * h},

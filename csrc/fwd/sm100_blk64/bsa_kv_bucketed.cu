@@ -29,8 +29,29 @@ __global__ void build_kv_split_offsets_kernel(
     }
 
     int base = tile * (kv_splits + 1);
-    for (int split = 0; split <= kv_splits; ++split) {
-        split_offsets[base + split] = (valid_kv * split + kv_splits - 1) / kv_splits;
+    constexpr int kAlignBlocks = 8;
+    int avg_blocks = valid_kv / kv_splits;
+    int aligned_base = (avg_blocks / kAlignBlocks) * kAlignBlocks;
+
+    if (aligned_base == 0) {
+        for (int split = 0; split <= kv_splits; ++split) {
+            split_offsets[base + split] = (valid_kv * split + kv_splits - 1) / kv_splits;
+        }
+        return;
+    }
+
+    int offset = 0;
+    int remainder = valid_kv - aligned_base * kv_splits;
+    split_offsets[base] = 0;
+    for (int split = 0; split < kv_splits; ++split) {
+        int count = aligned_base;
+        if (remainder > 0) {
+            int extra = remainder < kAlignBlocks ? remainder : kAlignBlocks;
+            count += extra;
+            remainder -= extra;
+        }
+        offset += count;
+        split_offsets[base + split + 1] = offset < valid_kv ? offset : valid_kv;
     }
 }
 
