@@ -716,7 +716,9 @@ fused_attn_device(
 template<int kHeadDim, bool HasBlockSizes, bool HasVarBlockNums,
          bool UseClc = false, bool HasKvSplits = true>
 using FusedAttnKernel = FusedAttnFwdSm100<CollectiveMainloopFwd<kHeadDim>,
-                                          CollectiveEpilogueFwd<kHeadDim>,
+                                          CollectiveEpilogueFwd<
+                                                  kHeadDim,
+                                                  std::conditional_t<HasKvSplits, float, cutlass::bfloat16_t>>,
                                           SingleTileScheduler, HasBlockSizes, HasVarBlockNums,
                                           UseClc, HasKvSplits>;
 

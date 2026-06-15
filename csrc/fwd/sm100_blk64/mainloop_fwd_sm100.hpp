@@ -1,7 +1,7 @@
 /******************************************************************************
   * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
   ******************************************************************************/
-// CollectiveMainloopFwd — load, mma, softmax for fused attention (Step 2: BSA-aligned)
+// CollectiveMainloopFwd: load, mma, softmax, and correction for fused attention.
 #pragma once
 
 #include <math_constants.h>
@@ -1152,12 +1152,13 @@ struct CollectiveMainloopFwd {
 
     // ===========================================================================
     // Correction: indexed rescale + final combine (Correction warps 8-11)
-    // Moved from epilogue_fwd.hpp — accesses both ml.* and el.* via SharedStorage union.
+    // Correction consumes mainloop stats and writes the epilogue O smem tile.
     // ===========================================================================
 
     // ---- SMEM layout for O (used by correction_combine for sO writes) ----
-    using SmemLayoutO = decltype(cute::coalesce(cute::tile_to_shape(
-            cute::UMMA::Layout_K_SW128_Atom<ElementA>{},
+    template <typename ElementO>
+    using SmemLayoutOFor = decltype(cute::coalesce(cute::tile_to_shape(
+            cute::UMMA::Layout_K_SW128_Atom<ElementO>{},
             cute::Shape<cute::Int<kRows>, cute::Int<kOutputCols>>{},
             cute::Step<cute::_1, cute::_2>{}), cute::Shape<cute::_1, cute::_1>{}));
 
@@ -1167,13 +1168,13 @@ struct CollectiveMainloopFwd {
     static constexpr int kNumChunks = kOSpan / kChunk;
 
     struct CorrState {
-        PipeState o_acc_state_0;                   // {0, 0, 0} default — OAcc consumer_wait stage 0
+        PipeState o_acc_state_0;                      // {0, 0, 0}: OAcc consumer_wait stage 0
         PipeState o_acc_state_1 = PipeState(1, 0, 0); // OAcc consumer_wait stage 1
-        PipeState o_epi_state = PipeState(0, 1, 0); // producer start: phase=1 (no prefill, matches blk128)
+        PipeState o_epi_state = PipeState(0, 1, 0); // producer start: phase=1, no prefill
     };
 
     CUTLASS_DEVICE static void correction_rescale(
-            uint32_t tmem_o, float rescale, int corr_idx)
+            uint32_t tmem_o, float rescale)
     {
         using namespace cute;
         unsigned should_rescale = __ballot_sync(0xFFFFFFFF, rescale < 1.0f);
@@ -1194,7 +1195,7 @@ struct CollectiveMainloopFwd {
         }
     }
 
-    template<typename SmemTensorO, typename EpiStorage, typename NamedBarriers>
+    template<typename SmemTensorO, typename EpiStorage>
     CUTLASS_DEVICE static void correction_combine(
             uint32_t tmem_o0, uint32_t tmem_o1,
             float my_scale0, float my_scale1,
@@ -1203,8 +1204,10 @@ struct CollectiveMainloopFwd {
             EpiStorage& el, SmemTensorO& sO)
     {
         using namespace cute;
+        using ElementO = typename std::remove_reference_t<SmemTensorO>::value_type;
+        static constexpr bool kStoreFp32O = std::is_same_v<ElementO, float>;
 
-        // Pass 1: each warp computes weighted O and writes ALL chunks to OWN slot
+        // Pass 1: each warp computes weighted O and writes all chunks to its exchange slot.
         CUTLASS_PRAGMA_UNROLL
         for (int c = 0; c < kNumChunks; ++c) {
             auto tOrO0 = make_tensor<float>(Shape<Int<kChunk>>{});
@@ -1224,22 +1227,27 @@ struct CollectiveMainloopFwd {
                 tOrO_combined(j + 1) = scaled_o1;
             }
 
-            // Write to OWN exchange slot
             CUTLASS_PRAGMA_UNROLL
             for (int i = 0; i < kChunk / 4; ++i) {
-                flash::smem_store_float4(
-                        &el.o_exchange[corr_warp][c * 32 * kChunk + i * 32 * 4 + lane_idx * 4],
-                        *reinterpret_cast<float4*>(&tOrO_combined(i * 4)));
+                if constexpr (kStoreFp32O) {
+                    const int exchange_offset = c * 32 * kChunk + i * 32 * 4 + lane_idx * 2;
+                    float2 const* src = reinterpret_cast<float2 const*>(&tOrO_combined(i * 4));
+                    flash::smem_store_float2(&el.o_exchange[corr_warp][exchange_offset], src[0]);
+                    flash::smem_store_float2(&el.o_exchange[corr_warp][exchange_offset + 64], src[1]);
+                } else {
+                    const int exchange_offset = c * 32 * kChunk + i * 32 * 4 + lane_idx * 4;
+                    flash::smem_store_float4(
+                            &el.o_exchange[corr_warp][exchange_offset],
+                            *reinterpret_cast<float4*>(&tOrO_combined(i * 4)));
+                }
             }
         }
 
         // Single barrier: all warps' exchange writes visible.
-        // mbarrier instead of NamedBarrier — avoids the Reduce_02/Reduce_13
-        // hw-id collision with SmStatsNotify; see reduce_mbar comment in
-        // bsa_fwd_kernel_sm100.h.
+        // Use mbarrier instead of NamedBarrier to avoid id overlap with SmStatsNotify.
         flash::mbar_arrive_and_wait(reduce_mbar_addr, reduce_mbar_phase);
 
-        // Pass 2: warps 0,1 read own + partner exchange data → add → bf16 → sO
+        // Pass 2: warps 0,1 read own + partner exchange data, then write sO.
         {
             const int out_row = (corr_warp & 1) * 32 + lane_idx;
             const int partner_warp = corr_warp ^ 2;
@@ -1250,31 +1258,50 @@ struct CollectiveMainloopFwd {
                     auto tOrO_final = make_tensor<float>(Shape<Int<kChunk>>{});
                     CUTLASS_PRAGMA_UNROLL
                     for (int i = 0; i < kChunk / 4; ++i) {
-                        const int off = c * 32 * kChunk + i * 32 * 4 + lane_idx * 4;
-                        float4 own = flash::smem_load_float4(&el.o_exchange[corr_warp][off]);
-                        float4 partner = flash::smem_load_float4(&el.o_exchange[partner_warp][off]);
                         float2* dst = reinterpret_cast<float2*>(&tOrO_final(i * 4));
-                        float2 const* a = reinterpret_cast<float2 const*>(&own);
-                        float2 const* b = reinterpret_cast<float2 const*>(&partner);
-                        dst[0] = flash::float2_add(a[0], b[0]);
-                        dst[1] = flash::float2_add(a[1], b[1]);
+                        if constexpr (kStoreFp32O) {
+                            const int exchange_offset = c * 32 * kChunk + i * 32 * 4 + lane_idx * 2;
+                            float2 own0 = flash::smem_load_float2(&el.o_exchange[corr_warp][exchange_offset]);
+                            float2 own1 = flash::smem_load_float2(&el.o_exchange[corr_warp][exchange_offset + 64]);
+                            float2 partner0 = flash::smem_load_float2(&el.o_exchange[partner_warp][exchange_offset]);
+                            float2 partner1 = flash::smem_load_float2(&el.o_exchange[partner_warp][exchange_offset + 64]);
+                            dst[0] = flash::float2_add(own0, partner0);
+                            dst[1] = flash::float2_add(own1, partner1);
+                        } else {
+                            const int exchange_offset = c * 32 * kChunk + i * 32 * 4 + lane_idx * 4;
+                            float4 own = flash::smem_load_float4(&el.o_exchange[corr_warp][exchange_offset]);
+                            float4 partner = flash::smem_load_float4(&el.o_exchange[partner_warp][exchange_offset]);
+                            float2 const* a = reinterpret_cast<float2 const*>(&own);
+                            float2 const* b = reinterpret_cast<float2 const*>(&partner);
+                            dst[0] = flash::float2_add(a[0], b[0]);
+                            dst[1] = flash::float2_add(a[1], b[1]);
+                        }
                     }
 
-                    // Convert fp32 → bf16 and write to sO via STS.128
                     const int out_col_base = c * kChunk;
-                    CUTLASS_PRAGMA_UNROLL
-                    for (int j = 0; j < kChunk; j += 8) {
-                        nv_bfloat162 p0 = __floats2bfloat162_rn(tOrO_final(j + 0), tOrO_final(j + 1));
-                        nv_bfloat162 p1 = __floats2bfloat162_rn(tOrO_final(j + 2), tOrO_final(j + 3));
-                        nv_bfloat162 p2 = __floats2bfloat162_rn(tOrO_final(j + 4), tOrO_final(j + 5));
-                        nv_bfloat162 p3 = __floats2bfloat162_rn(tOrO_final(j + 6), tOrO_final(j + 7));
-                        uint32_t addr = cute::cast_smem_ptr_to_uint(&sO(out_row, out_col_base + j));
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};\n"
-                            : : "r"(addr),
-                                "r"(reinterpret_cast<uint32_t const&>(p0)),
-                                "r"(reinterpret_cast<uint32_t const&>(p1)),
-                                "r"(reinterpret_cast<uint32_t const&>(p2)),
-                                "r"(reinterpret_cast<uint32_t const&>(p3)));
+                    if constexpr (kStoreFp32O) {
+                        CUTLASS_PRAGMA_UNROLL
+                        for (int j = 0; j < kChunk; j += 4) {
+                            flash::smem_store_float4(
+                                    &sO(out_row, out_col_base + j),
+                                    *reinterpret_cast<float4*>(&tOrO_final(j)));
+                        }
+                    } else {
+                        // Convert fp32 -> bf16 and write to sO via STS.128.
+                        CUTLASS_PRAGMA_UNROLL
+                        for (int j = 0; j < kChunk; j += 8) {
+                            nv_bfloat162 p0 = __floats2bfloat162_rn(tOrO_final(j + 0), tOrO_final(j + 1));
+                            nv_bfloat162 p1 = __floats2bfloat162_rn(tOrO_final(j + 2), tOrO_final(j + 3));
+                            nv_bfloat162 p2 = __floats2bfloat162_rn(tOrO_final(j + 4), tOrO_final(j + 5));
+                            nv_bfloat162 p3 = __floats2bfloat162_rn(tOrO_final(j + 6), tOrO_final(j + 7));
+                            uint32_t addr = cute::cast_smem_ptr_to_uint(&sO(out_row, out_col_base + j));
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};\n"
+                                : : "r"(addr),
+                                    "r"(reinterpret_cast<uint32_t const&>(p0)),
+                                    "r"(reinterpret_cast<uint32_t const&>(p1)),
+                                    "r"(reinterpret_cast<uint32_t const&>(p2)),
+                                    "r"(reinterpret_cast<uint32_t const&>(p3)));
+                        }
                     }
                 }
             }
@@ -1320,30 +1347,30 @@ struct CollectiveMainloopFwd {
         pipeline_sm_stats.consumer_release(st0);
         NamedBarrier::arrive_and_wait(kSmStatsNotifyThreads, NamedBarriers::SmStatsNotify + 1 * kCorrWarps + corr_warp);
 
-        // ---- (b) Paired rescale loop (BSA: seqlen_corr_loop_steps) ----
+        // ---- (b) Paired rescale loop ----
         int pair_count = (num_kv_blocks - 2) / 2;
         CUTE_NO_UNROLL
         for (int i = 0; i < pair_count; ++i) {
             // Stage 0: rescale O0
             {
                 NamedBarrier::arrive_and_wait(kSmStatsNotifyThreads, NamedBarriers::SmStatsNotify + 0 * kCorrWarps + corr_warp);
-                correction_rescale(tmem_o0, ml.corr_scale[0][corr_idx], corr_idx);
+                correction_rescale(tmem_o0, ml.corr_scale[0][corr_idx]);
                 pipeline_s_p_o.consumer_release(st0);
                 pipeline_sm_stats.consumer_release(st1);
             }
             // Stage 1: rescale O1
             {
                 NamedBarrier::arrive_and_wait(kSmStatsNotifyThreads, NamedBarriers::SmStatsNotify + 1 * kCorrWarps + corr_warp);
-                correction_rescale(tmem_o1, ml.corr_scale[1][corr_idx], corr_idx);
+                correction_rescale(tmem_o1, ml.corr_scale[1][corr_idx]);
                 pipeline_s_p_o.consumer_release(st1);
                 pipeline_sm_stats.consumer_release(st0);
             }
         }
 
-        // BSA: post-loop release for stage 1
+        // Release the final sm-stats stage after the paired loop drains.
         pipeline_sm_stats.consumer_release(st1);
 
-        // ---- (c) Read final stats (BSA: sm_stats_barrier for both stages) ----
+        // ---- (c) Read final stats from both stages ----
         NamedBarrier::arrive_and_wait(kSmStatsNotifyThreads, NamedBarriers::SmStatsNotify + 0 * kCorrWarps + corr_warp);
         float row_sum0 = ml.smem_sum[0 * 128 + corr_idx];
         float row_max0 = ml.smem_max[0 * 128 + corr_idx];
@@ -1374,11 +1401,10 @@ struct CollectiveMainloopFwd {
         ++corr_state.o_acc_state_1; ++corr_state.o_acc_state_1;
 
         // ---- (f) Warp-pair stats exchange + combine weight ----
-        auto sO = make_tensor(make_smem_ptr(el.sO.begin()), SmemLayoutO{});
-        // mbarrier slot 0 ↔ warp pair (0,2), slot 1 ↔ warp pair (1,3).
-        // Replaces the Reduce_02/Reduce_13 NamedBarriers — see
-        // SharedStorage::reduce_mbar comment for the hw-id collision
-        // those NamedBarriers had with SmStatsNotify.
+        using ElementO = typename std::remove_reference_t<decltype(el.sO)>::value_type;
+        auto sO = make_tensor(make_smem_ptr(el.sO.begin()), SmemLayoutOFor<ElementO>{});
+        // mbarrier slot 0 maps to warp pair (0,2), slot 1 maps to warp pair (1,3).
+        // This avoids reusing NamedBarrier ids that overlap with SmStatsNotify.
         const int reduce_mbar_idx = corr_warp & 1;
         const uint32_t reduce_mbar_addr = cute::cast_smem_ptr_to_uint(
                 &shared_storage.reduce_mbar[reduce_mbar_idx]);
@@ -1397,12 +1423,12 @@ struct CollectiveMainloopFwd {
             float my_rescale = (my_sum > 0.0f) ? exp2f((my_max - max_total_safe) * sm_scale_log2) : 0.0f;
             float partner_rescale = (partner_sum > 0.0f) ? exp2f((partner_max - max_total_safe) * sm_scale_log2) : 0.0f;
             float sum_total = my_sum * my_rescale + partner_sum * partner_rescale;
-            float inv_sum_total = (sum_total > 0.0f) ? __frcp_rn(sum_total) : 0.0f;  // BSA: rcp_approx
+            float inv_sum_total = (sum_total > 0.0f) ? __frcp_rn(sum_total) : 0.0f;
             my_weight = my_rescale * inv_sum_total;
 
             // ---- Write LSE to global memory (one warp per warp-pair) ----
             // Bounded by lse_valid_rows so LSE tensor can be sized at actual seqlen_q
-            // (not rounded). Matches blk128's pattern in flash_fwd_sm100.py:1942.
+            // instead of the rounded row count.
             if (ptr_LSE_tile != nullptr && corr_warp < 2) {
                 int out_row = (corr_warp & 1) * 32 + lane_idx;
                 if (out_row < kRows && out_row < lse_valid_rows) {
@@ -1422,11 +1448,11 @@ struct CollectiveMainloopFwd {
             }
         }
 
-        // ---- (g) Wait for sO slot free, then combine (blk128: producer_acquire before combine) ----
+        // ---- (g) Wait for sO slot free, then combine ----
         pipeline_o_epi.producer_acquire(corr_state.o_epi_state);
         float my_scale0 = scale0 * my_weight;
         float my_scale1 = scale1 * my_weight;
-        correction_combine<decltype(sO), decltype(el), NamedBarriers>(
+        correction_combine<decltype(sO), decltype(el)>(
                 tmem_o0, tmem_o1, my_scale0, my_scale1,
                 corr_warp, lane_idx,
                 reduce_mbar_addr, /*reduce_mbar_phase=*/1,

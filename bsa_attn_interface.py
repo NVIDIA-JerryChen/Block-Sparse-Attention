@@ -449,6 +449,9 @@ def _bsa_attn_fwd_blk64_kv_bucketed(
     )
 
     batch, num_heads, seqlen_q, head_dim = q.shape
+    if o_partial_phys.dtype != torch.float32:
+        raise TypeError("KV-bucketed blk64 fwd requires fp32 O partial")
+
     split_heads = kv_splits * num_heads
     o_partial = o_partial_phys.as_strided(
         (kv_splits, batch, seqlen_q, num_heads, head_dim),
@@ -521,7 +524,7 @@ def _bsa_attn_fwd_blk64_kv_bucketed(
         max_splits,
         combine_num_threads,
         combine_stages,
-        (o_partial_shape, o_partial_stride, q.dtype),
+        (o_partial_shape, o_partial_stride, torch.float32),
         (lse_partial_shape, lse_partial_stride, torch.float32),
         (out_bshd_shape, out_bshd_stride, q.dtype),
         (lse_bsh_shape, lse_bsh_stride, torch.float32),
@@ -529,7 +532,6 @@ def _bsa_attn_fwd_blk64_kv_bucketed(
     if compile_key not in _bsa_attn_fwd_blk64_kv_bucketed.compile_cache:
         combine_kernel = FlashAttentionForwardCombine(
             dtype=dtype,
-            dtype_partial=dtype,
             head_dim=head_dim,
             tile_m=combine_tile_m,
             k_block_size=combine_k_block_size,

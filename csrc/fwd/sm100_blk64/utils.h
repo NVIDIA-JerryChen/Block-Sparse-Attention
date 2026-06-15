@@ -2,7 +2,7 @@
  * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
  ******************************************************************************/
 // Self-contained SM100 PTX utility helpers for fused attention kernel.
-// All functions inlined — no external dependencies beyond CUTLASS/CuTe headers.
+// All functions are inlined and only depend on CUTLASS/CuTe headers.
 #pragma once
 
 #include <cutlass/arch/barrier.h>
@@ -186,6 +186,19 @@ __device__ __forceinline__ float4 smem_load_float4(const float* addr) {
     asm volatile("ld.shared.b128 %0, [%1];"
         : "=q"(temp) : "l"(__cvta_generic_to_shared(addr)));
     return *reinterpret_cast<float4*>(&temp);
+}
+
+__device__ __forceinline__ void smem_store_float2(float* addr, float2 val) {
+    uint64_t bits = *reinterpret_cast<uint64_t*>(&val);
+    asm volatile("st.shared.b64 [%0], %1;"
+        : : "l"(__cvta_generic_to_shared(addr)), "l"(bits));
+}
+
+__device__ __forceinline__ float2 smem_load_float2(const float* addr) {
+    uint64_t bits;
+    asm volatile("ld.shared.b64 %0, [%1];"
+        : "=l"(bits) : "l"(__cvta_generic_to_shared(addr)));
+    return *reinterpret_cast<float2*>(&bits);
 }
 
 // ---- Arithmetic ----

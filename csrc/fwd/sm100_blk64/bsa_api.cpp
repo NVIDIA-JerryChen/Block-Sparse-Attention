@@ -71,8 +71,8 @@ void set_params_fprop(bsa_fwd_params &params,
     params.v_batch_stride = v.stride(0);   params.v_head_stride = v.stride(1);   params.v_row_stride = v.stride(2);
     if (kv_splits > 1) {
         // KV-bucketed partial layout: (B, Split * H, S, D). Keeping rows
-        // contiguous for each folded split/head improves the combine load path
-        // while preserving a 4D TMA store descriptor.
+        // contiguous for each folded split/head improves the attention TMA store
+        // path while preserving a 4D TMA store descriptor.
         params.o_batch_stride = out.stride(0);
         params.o_head_stride = out.stride(1);
         params.o_row_stride = out.stride(2);
@@ -322,9 +322,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> bsa_fused_fwd_blk64_kv_b
         q2k_block_index.options());
     auto o_partial = torch::empty(
         {b, kv_splits_i * h, seqlen_q, kOutputCols},
-        q.options());
+        q.options().dtype(torch::kFloat32));
     auto lse_partial = torch::empty_strided(
-        {b, seqlen_q, kv_splits_i * h},
+        {b, seqlen_q, h * kv_splits_i},
         {seqlen_q * kv_splits_i * h, 1, seqlen_q},
         torch::dtype(torch::kFloat32).device(q.device()));
 

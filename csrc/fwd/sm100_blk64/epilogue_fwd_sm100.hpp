@@ -1,9 +1,9 @@
 /******************************************************************************
   * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
   ******************************************************************************/
-// CollectiveEpilogueFwd — TMA store for output O.
+// CollectiveEpilogueFwd: TMA store for output O.
 // Correction logic is in CollectiveMainloopFwd (mainloop_fwd_sm100.hpp).
-// This file retains TensorStorage (o_exchange, o_staging, sO) and TMA store.
+// TensorStorage owns correction staging and the O smem tile consumed by TMA store.
 #pragma once
 
 #include "cutlass/arch/barrier.h"
@@ -19,14 +19,13 @@ namespace flash {
 namespace cute = ::cute;
 
 
-template <int kHeadDim_>
+template <int kHeadDim_, typename ElementO_ = cutlass::bfloat16_t>
 struct CollectiveEpilogueFwd {
     static constexpr int kHeadDim = kHeadDim_;
     static_assert(kHeadDim == 128,
                   "sm100 blk64 fwd only supports head_dim = 128 "
                   "(kHeadDim template kept for future D=64 redesign)");
-    // ---- Element types ----
-    using ElementA = cutlass::bfloat16_t;
+    using ElementO = ElementO_;
 
     // ---- Tile sizes ----
     static constexpr int kRows = 64;
@@ -34,10 +33,10 @@ struct CollectiveEpilogueFwd {
 
     // ---- SMEM layout for O ----
     using SmemLayoutO = decltype(cute::coalesce(cute::tile_to_shape(
-            cute::UMMA::Layout_K_SW128_Atom<ElementA>{},
+            cute::UMMA::Layout_K_SW128_Atom<ElementO>{},
             cute::Shape<cute::Int<kRows>, cute::Int<kOutputCols>>{},
             cute::Step<cute::_1, cute::_2>{}), cute::Shape<cute::_1, cute::_1>{}));
-    static constexpr int kOBytes = kRows * kOutputCols * sizeof(ElementA);
+    static constexpr int kOBytes = kRows * kOutputCols * sizeof(ElementO);
 
     // ---- TMA type aliases (4D BHSD / folded split-head partial layout) ----
     // KV-bucketed partial output folds (split, head) into the TMA head mode so
@@ -48,8 +47,8 @@ struct CollectiveEpilogueFwd {
     using StrideO4 = cute::Stride<int, cute::_1, int, int64_t>;
 
     using TMA_O = decltype(cute::make_tma_copy(cute::SM90_TMA_STORE{},
-            cute::make_tensor(cute::make_gmem_ptr(static_cast<ElementA*>(nullptr)),
-                                                cute::make_layout(ShapeO4{}, StrideO4{})),
+            cute::make_tensor(cute::make_gmem_ptr(static_cast<ElementO*>(nullptr)),
+                              cute::make_layout(ShapeO4{}, StrideO4{})),
             SmemLayoutO{}));
 
     // ---- TensorStorage ----
@@ -59,7 +58,7 @@ struct CollectiveEpilogueFwd {
     struct TensorStorage {
         alignas(16) float o_exchange[4][kExchangePerWarp];
         alignas(16) float o_staging[4][64];
-        alignas(128) cute::ArrayEngine<ElementA, cute::cosize_v<SmemLayoutO>> sO;
+        alignas(128) cute::ArrayEngine<ElementO, cute::cosize_v<SmemLayoutO>> sO;
     };
 
     // ---- Static TMA construction (called from run_bsa_fwd) ----
@@ -70,7 +69,7 @@ struct CollectiveEpilogueFwd {
         auto stride_o = make_stride(int(p.o_row_stride), _1{}, int(p.o_head_stride),
                                     p.o_batch_stride);
         return make_tma_copy(SM90_TMA_STORE{},
-                make_tensor(make_gmem_ptr(static_cast<ElementA*>(p.o_ptr)),
+                make_tensor(make_gmem_ptr(static_cast<ElementO*>(p.o_ptr)),
                             make_layout(shape_o, stride_o)),
                 SmemLayoutO{});
     }
@@ -112,7 +111,7 @@ struct CollectiveEpilogueFwd {
             auto sO = make_tensor(make_smem_ptr(el.sO.begin()), SmemLayoutO{});
             Tensor gO_full = params.tma_store_O.get_tma_tensor(params.shape_O);
             // 4D indexing: gO_full shape (seqlen_q, kOutputCols, H_or_SplitH, B).
-            // Slice (folded head, batch), then local_tile at row_tile — last partial tile
+            // Slice (folded head, batch), then local_tile at row_tile. Last partial tile
             // (rows past seqlen_q) is OOB-dropped by TMA store.
             int folded_head = head;
             if constexpr (HasKvSplits) {

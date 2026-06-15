@@ -22,7 +22,6 @@ class FlashAttentionForwardCombine:
     def __init__(
         self,
         dtype: Type[cutlass.Numeric],
-        dtype_partial: Type[cutlass.Numeric],
         head_dim: int,
         tile_m: int = 8,
         k_block_size: int = 64,
@@ -34,7 +33,6 @@ class FlashAttentionForwardCombine:
         Forward combine kernel for split attention computation.
 
         :param dtype: output data type
-        :param dtype_partial: partial accumulation data type
         :param head_dim: head dimension
         :param tile_m: m block size
         :param k_block_size: k block size
@@ -44,7 +42,7 @@ class FlashAttentionForwardCombine:
         :param stages: number of pipeline stages
         """
         self.dtype = dtype
-        self.dtype_partial = dtype_partial
+        self.partial_dtype = Float32
         self.head_dim = head_dim
         self.tile_m = tile_m
         self.k_block_size = k_block_size
@@ -56,7 +54,6 @@ class FlashAttentionForwardCombine:
     @staticmethod
     def can_implement(
         dtype,
-        dtype_partial,
         head_dim,
         tile_m,
         k_block_size,
@@ -65,8 +62,6 @@ class FlashAttentionForwardCombine:
     ) -> bool:
         """Check if the kernel can be implemented with the given parameters."""
         if dtype not in [cutlass.Float16, cutlass.BFloat16, cutlass.Float32]:
-            return False
-        if dtype_partial not in [cutlass.Float16, cutlass.BFloat16, Float32]:
             return False
         if head_dim % 8 != 0:
             return False
@@ -84,7 +79,7 @@ class FlashAttentionForwardCombine:
     def _setup_attributes(self):
         # GMEM copy setup for O partial
         universal_copy_bits = 128
-        async_copy_elems = universal_copy_bits // self.dtype_partial.width
+        async_copy_elems = universal_copy_bits // self.partial_dtype.width
         assert self.k_block_size % async_copy_elems == 0
 
         k_block_gmem = (
@@ -96,7 +91,7 @@ class FlashAttentionForwardCombine:
         # Async copy atom for O partial load
         atom_async_copy_partial = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-            self.dtype_partial,
+            self.partial_dtype,
             num_bits_per_copy=universal_copy_bits,
         )
         tOpartial_layout = cute.make_ordered_layout(
@@ -203,8 +198,8 @@ class FlashAttentionForwardCombine:
         stream: cuda.CUstream = None,
     ):
         # Type checking
-        if const_expr(not (mO_partial.element_type == self.dtype_partial)):
-            raise TypeError("O partial tensor must match dtype_partial")
+        if const_expr(not (mO_partial.element_type == self.partial_dtype)):
+            raise TypeError("O partial tensor must be Float32")
         if const_expr(not (mO.element_type == self.dtype)):
             raise TypeError("O tensor must match dtype")
         if const_expr(mLSE_partial.element_type not in [Float32]):
@@ -269,7 +264,7 @@ class FlashAttentionForwardCombine:
             ]
             sMaxValidSplit: cute.struct.Align[cute.struct.MemRange[Int32, self.tile_m], 128]
             sO: cute.struct.Align[
-                cute.struct.MemRange[self.dtype_partial, cute.cosize(self.smem_layout_o)], 128
+                cute.struct.MemRange[self.partial_dtype, cute.cosize(self.smem_layout_o)], 128
             ]
 
         smem_size = SharedStorage.size_in_bytes()
@@ -363,7 +358,7 @@ class FlashAttentionForwardCombine:
         sMaxValidSplit = storage.sMaxValidSplit.get_tensor((self.tile_m,))
         sO = storage.sO.get_tensor(smem_layout_o)
 
-        # Handle semaphore reset — wait for dependent grids first
+        # Handle semaphore reset after dependent grids complete.
         if const_expr(semaphore_to_reset is not None):
             if (
                 tidx == 0
