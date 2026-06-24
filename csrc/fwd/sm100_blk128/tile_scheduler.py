@@ -126,8 +126,8 @@ class SingleTileScheduler:
         )
 
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
-        block_idx, head_idx, batch_idx = self._blk_coord
-        split_idx = Int32(0)
+        block_idx, head_split_idx, batch_idx = self._blk_coord
+        head_idx, split_idx = divmod(head_split_idx, self.params.num_splits_divmod)
         return WorkTileInfo(
             (block_idx, head_idx, batch_idx, split_idx),
             self._is_first_block,

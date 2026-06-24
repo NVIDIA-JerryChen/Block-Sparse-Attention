@@ -564,6 +564,73 @@ def smem_exchange_reduce_store_bf16x32(
 
 
 @cute.jit
+def smem_exchange_reduce_store_f32x32(
+    own_exchange_smem_addr: Int32,
+    partner_exchange_smem_addr: Int32,
+    sO_smem_addr0a: Int32,
+    sO_smem_addr0b: Int32,
+    sO_smem_addr1a: Int32,
+    sO_smem_addr1b: Int32,
+    sO_smem_addr2a: Int32,
+    sO_smem_addr2b: Int32,
+    sO_smem_addr3a: Int32,
+    sO_smem_addr3b: Int32,
+) -> None:
+    load_ops = "\n\t".join(
+        f"add.u32 addr_own, own, {group * 32 * 4 * 4};\n\t"
+        f"add.u32 addr_partner, partner, {group * 32 * 4 * 4};\n\t"
+        f"ld.shared.v4.b32 {{a{group * 4 + 0}, a{group * 4 + 1}, a{group * 4 + 2}, a{group * 4 + 3}}}, [addr_own];\n\t"
+        f"ld.shared.v4.b32 {{b{group * 4 + 0}, b{group * 4 + 1}, b{group * 4 + 2}, b{group * 4 + 3}}}, [addr_partner];"
+        for group in range(8)
+    )
+    add_ops = "\n\t".join(
+        f"mov.b64 la, {{a{i}, a{i + 1}}};\n\t"
+        f"mov.b64 lb, {{b{i}, b{i + 1}}};\n\t"
+        "add.rn.f32x2 la, la, lb;\n\t"
+        f"mov.b64 {{a{i}, a{i + 1}}}, la;"
+        for i in range(0, 32, 2)
+    )
+    store_ops = "\n\t".join(
+        f"st.shared.v4.b32 [${2 + j // 4}], {{a{j + 0}, a{j + 1}, a{j + 2}, a{j + 3}}};"
+        for j in range(0, 32, 4)
+    )
+    llvm.inline_asm(
+        None,
+        [
+            Int32(own_exchange_smem_addr).ir_value(),
+            Int32(partner_exchange_smem_addr).ir_value(),
+            Int32(sO_smem_addr0a).ir_value(),
+            Int32(sO_smem_addr0b).ir_value(),
+            Int32(sO_smem_addr1a).ir_value(),
+            Int32(sO_smem_addr1b).ir_value(),
+            Int32(sO_smem_addr2a).ir_value(),
+            Int32(sO_smem_addr2b).ir_value(),
+            Int32(sO_smem_addr3a).ir_value(),
+            Int32(sO_smem_addr3b).ir_value(),
+        ],
+        "{\n\t"
+        ".reg .b32 own;\n\t"
+        ".reg .b32 partner;\n\t"
+        ".reg .b32 addr_own;\n\t"
+        ".reg .b32 addr_partner;\n\t"
+        ".reg .b32 a<32>;\n\t"
+        ".reg .b32 b<32>;\n\t"
+        ".reg .b64 la;\n\t"
+        ".reg .b64 lb;\n\t"
+        "mov.b32 own, $0;\n\t"
+        "mov.b32 partner, $1;\n\t"
+        f"{load_ops}\n\t"
+        f"{add_ops}\n\t"
+        f"{store_ops}\n\t"
+        "}\n",
+        "r,r,r,r,r,r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
 def gemm_ptx_partial(
     op: cute.nvgpu.tcgen05.mma.MmaOp,
     acc_tmem_addr: Int32,

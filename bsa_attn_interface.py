@@ -43,12 +43,30 @@ from csrc.bwd.sm100_blk64.flash_bwd_sm100 import (
     sm100_bwd_auto_bucketed_k2q_size_blocks,
     sm100_bwd_default_bucketed_k2q_size_blocks,
 )
-from csrc.bwd.sm100_blk128.flash_bwd_sm100 import (
-    SM100_BWD_HEAD_DIM as SM100_BLK128_BWD_HEAD_DIM,
-    SM100_BLK128_BWD_SPARSE_BLOCK_SIZE,
-    bsa_sm100_blk128_bwd_bucketed_k2q_csr,
-    sm100_blk128_bwd_default_bucketed_k2q_size_blocks,
-)
+try:
+    from csrc.bwd.sm100_blk128.flash_bwd_sm100 import (
+        SM100_BWD_HEAD_DIM as SM100_BLK128_BWD_HEAD_DIM,
+        SM100_BLK128_BWD_SPARSE_BLOCK_SIZE,
+        bsa_sm100_blk128_bwd_bucketed_k2q_csr,
+        sm100_blk128_bwd_default_bucketed_k2q_size_blocks,
+    )
+    _SM100_BLK128_BWD_IMPORT_ERROR = None
+except ImportError as exc:
+    _SM100_BLK128_BWD_IMPORT_ERROR = exc
+    SM100_BLK128_BWD_HEAD_DIM = 128
+    SM100_BLK128_BWD_SPARSE_BLOCK_SIZE = 128
+
+    def bsa_sm100_blk128_bwd_bucketed_k2q_csr(*args, **kwargs):
+        raise ImportError(
+            "SM100 blk128 backward is unavailable because its optional "
+            "CuTe dependencies failed to import."
+        ) from _SM100_BLK128_BWD_IMPORT_ERROR
+
+    def sm100_blk128_bwd_default_bucketed_k2q_size_blocks(*args, **kwargs):
+        raise ImportError(
+            "SM100 blk128 backward is unavailable because its optional "
+            "CuTe dependencies failed to import."
+        ) from _SM100_BLK128_BWD_IMPORT_ERROR
 from csrc.bwd.sm90_blk64.flash_bwd_sm90 import (
     BlockSparseAttnBackwardSm90Blk64,
     SM90_BWD_HEAD_DIM,
@@ -286,6 +304,57 @@ def _sm100_blk64_auto_kv_splits(
     else:
         splits = 1
     return max(1, min(int(splits), int(max_kv_splits), kv_blocks))
+
+
+def _build_sm100_blk64_kv_split_offsets(
+    q2k_block_nums: Optional[torch.Tensor],
+    uniform_block_sparse_num: int,
+    batch_size: int,
+    num_heads: int,
+    num_q_blocks: int,
+    kv_splits: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build split offsets matching csrc/fwd/sm100_blk64/bsa_kv_bucketed.cu."""
+    assert 1 <= kv_splits <= 256, "kv_splits must be in [1, 256]"
+    if q2k_block_nums is not None and q2k_block_nums.numel() > 0:
+        valid_kv = q2k_block_nums.to(torch.int32).contiguous().clamp_min(0)
+    else:
+        valid_kv = torch.full(
+            (batch_size, num_heads, num_q_blocks),
+            int(uniform_block_sparse_num),
+            dtype=torch.int32,
+            device=device,
+        )
+
+    split_offsets = torch.empty(
+        (batch_size, num_heads, num_q_blocks, kv_splits + 1),
+        dtype=torch.int32,
+        device=device,
+    )
+    avg_blocks = valid_kv // kv_splits
+    aligned_base = (avg_blocks // 8) * 8
+    use_even_split = aligned_base == 0
+
+    for split in range(kv_splits + 1):
+        even_offset = (valid_kv * split + kv_splits - 1) // kv_splits
+        split_offsets[..., split] = even_offset
+
+    offset = torch.zeros_like(valid_kv)
+    remainder = valid_kv - aligned_base * kv_splits
+    split_offsets[..., 0] = 0
+    for split in range(kv_splits):
+        extra = torch.clamp(remainder, min=0, max=8)
+        count = aligned_base + extra
+        offset = torch.minimum(offset + count, valid_kv)
+        split_offsets[..., split + 1] = torch.where(
+            use_even_split,
+            split_offsets[..., split + 1],
+            offset,
+        )
+        remainder = remainder - extra
+
+    return split_offsets.contiguous()
 
 
 def _infer_sm100_bwd_sparse_block_size(
@@ -655,19 +724,13 @@ def _bsa_attn_fwd_sm120_blk64(
     return out, lse
 
 
-def _bsa_attn_fwd_blk64_kv_bucketed(
+def _combine_blk64_kv_bucketed_partials(
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    q2k_block_index: torch.Tensor,
-    fixed_block_sparse_num: int,
-    block_sizes: torch.Tensor,
-    q2k_block_nums: torch.Tensor,
-    softmax_scale: float,
+    o_partial_phys: torch.Tensor,
+    lse_partial_phys: torch.Tensor,
     kv_splits: int,
-    use_clc: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Launch KV-bucketed SM100 blk64 fwd and combine partial outputs."""
+    """Combine KV-bucketed partial outputs using the shared CuTeDSL combine kernel."""
     if FlashAttentionForwardCombine is None:
         raise ImportError(
             "FlashAttentionForwardCombine is unavailable. Ensure local fa_cute "
@@ -676,19 +739,6 @@ def _bsa_attn_fwd_blk64_kv_bucketed(
 
     kv_splits = int(kv_splits)
     assert 1 <= kv_splits <= 256, "kv_splits must be in [1, 256]"
-
-    o_partial_phys, lse_partial_phys, split_offsets = torch.ops.bsa_blk64.fwd_kv_bucketed(
-        q,
-        k,
-        v,
-        q2k_block_index,
-        fixed_block_sparse_num,
-        block_sizes,
-        softmax_scale,
-        q2k_block_nums,
-        kv_splits,
-        use_clc,
-    )
 
     batch, num_heads, seqlen_q, head_dim = q.shape
     if o_partial_phys.dtype != torch.float32:
@@ -746,7 +796,7 @@ def _bsa_attn_fwd_blk64_kv_bucketed(
         combine_num_threads,
         combine_stages,
     )
-    if compile_key not in _bsa_attn_fwd_blk64_kv_bucketed.compile_cache:
+    if compile_key not in _combine_blk64_kv_bucketed_partials.compile_cache:
         combine_kernel = FlashAttentionForwardCombine(
             dtype=dtype,
             head_dim=head_dim,
@@ -788,7 +838,7 @@ def _bsa_attn_fwd_blk64_kv_bucketed(
             current_stream,
         )
         t0 = time.time()
-        _bsa_attn_fwd_blk64_kv_bucketed.compile_cache[compile_key] = cute.compile(
+        _combine_blk64_kv_bucketed_partials.compile_cache[compile_key] = cute.compile(
             combine_kernel,
             *args,
             options="--enable-tvm-ffi",
@@ -796,7 +846,7 @@ def _bsa_attn_fwd_blk64_kv_bucketed(
         print(f"Compiled kv-bucketed fwd combine in {time.time() - t0:.1f}s")
 
     if not is_fake_mode():
-        _bsa_attn_fwd_blk64_kv_bucketed.compile_cache[compile_key](
+        _combine_blk64_kv_bucketed_partials.compile_cache[compile_key](
             o_partial,
             lse_partial,
             out_bshd,
@@ -809,17 +859,54 @@ def _bsa_attn_fwd_blk64_kv_bucketed(
             current_stream,
         )
 
-    # Keep split_offsets alive through the combine launch on the same stream.
-    _ = split_offsets
     # Combine writes its native BSHD/BSH layout. Return BHSD/BHS views without D2D.
     out = out_bshd.transpose(1, 2)
     lse = lse_bsh.transpose(1, 2)
     return out, lse
 
 
-_bsa_attn_fwd_blk64_kv_bucketed.compile_cache = get_jit_cache(
+_combine_blk64_kv_bucketed_partials.compile_cache = get_jit_cache(
     "bsa_fwd_blk64_kv_bucket_combine"
 )
+
+
+def _bsa_attn_fwd_blk64_kv_bucketed(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    fixed_block_sparse_num: int,
+    block_sizes: torch.Tensor,
+    q2k_block_nums: torch.Tensor,
+    softmax_scale: float,
+    kv_splits: int,
+    use_clc: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Launch KV-bucketed SM100 blk64 fwd and combine partial outputs."""
+    kv_splits = int(kv_splits)
+    assert 1 <= kv_splits <= 256, "kv_splits must be in [1, 256]"
+
+    o_partial_phys, lse_partial_phys, split_offsets = torch.ops.bsa_blk64.fwd_kv_bucketed(
+        q,
+        k,
+        v,
+        q2k_block_index,
+        fixed_block_sparse_num,
+        block_sizes,
+        softmax_scale,
+        q2k_block_nums,
+        kv_splits,
+        use_clc,
+    )
+    out, lse = _combine_blk64_kv_bucketed_partials(
+        q,
+        o_partial_phys,
+        lse_partial_phys,
+        kv_splits,
+    )
+    # Keep split_offsets alive through the combine launch on the same stream.
+    _ = split_offsets
+    return out, lse
 
 
 def choose_blk64_use_clc(
@@ -1094,11 +1181,19 @@ def bsa_attn_fwd_blk64_cutedsl(
     layout: str = "bhsd",
     block_sparse_num: int = 0,
     use_clc: Optional[bool] = None,
+    kv_splits: int | str = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """BSA forward attention through an independent blk64 CuTeDSL kernel class."""
     assert q.dtype == torch.bfloat16, "blk64 CuTeDSL requires bf16"
     assert q.is_cuda and k.is_cuda and v.is_cuda
     assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
+    auto_kv_splits = isinstance(kv_splits, str)
+    if auto_kv_splits:
+        assert kv_splits == "auto", "kv_splits string value must be 'auto'"
+        kv_splits_i = 1
+    else:
+        kv_splits_i = int(kv_splits)
+        assert kv_splits_i >= 1, "kv_splits must be >= 1"
 
     if layout == "bhsd":
         q_bhsd, k_bhsd, v_bhsd = [maybe_contiguous(t) for t in (q, k, v)]
@@ -1148,15 +1243,18 @@ def bsa_attn_fwd_blk64_cutedsl(
         uniform_block_sparse_num = int(block_sparse_num)
         q2k_block_nums = None
 
+    _validate_sm100_blk64_int32_bounds(
+        q_bhsd,
+        k_bhsd,
+        v_bhsd,
+        q2k_block_index,
+        uniform_block_sparse_num,
+        block_sizes,
+        q2k_block_nums,
+    )
+
     if softmax_scale is None:
         softmax_scale = head_dim ** -0.5
-
-    out_bhsd = torch.empty(
-        (batch_size, num_head, seqlen_q, head_dim_v),
-        dtype=q_bhsd.dtype,
-        device=q_bhsd.device,
-    )
-    lse = torch.empty((batch_size, num_head, seqlen_q), dtype=torch.float32, device=q.device)
 
     dtype = torch2cute_dtype_map[q_bhsd.dtype]
     arch = _get_device_arch()
@@ -1166,18 +1264,63 @@ def bsa_attn_fwd_blk64_cutedsl(
     tile_m = 64
     tile_n = 256
     use_2cta_instrs = False
-    if use_clc is None:
-        use_clc_scheduler = choose_blk64_cutedsl_use_clc(
+    if auto_kv_splits:
+        kv_splits_i = _sm100_blk64_auto_kv_splits(
             q_bhsd,
+            q2k_block_index,
             uniform_block_sparse_num,
-            q2k_block_nums if has_variable_block_nums else None,
-            layout="bhsd",
         )
+    if use_clc is None:
+        if kv_splits_i > 1:
+            use_clc_scheduler = False
+        else:
+            use_clc_scheduler = choose_blk64_cutedsl_use_clc(
+                q_bhsd,
+                uniform_block_sparse_num,
+                q2k_block_nums if has_variable_block_nums else None,
+                layout="bhsd",
+            )
     else:
         use_clc_scheduler = bool(use_clc)
+    assert not (kv_splits_i > 1 and use_clc_scheduler), (
+        "blk64 CuTeDSL kv_splits>1 does not support use_clc=True"
+    )
     is_persistent = use_clc_scheduler
     pack_gqa = False
     input_layout = "bhsd_native"
+
+    split_offsets = None
+    if kv_splits_i > 1:
+        split_offsets = _build_sm100_blk64_kv_split_offsets(
+            q2k_block_nums,
+            uniform_block_sparse_num,
+            batch_size,
+            num_head,
+            num_q_blocks,
+            kv_splits_i,
+            q_bhsd.device,
+        )
+        out_bhsd = torch.empty(
+            (batch_size, kv_splits_i * num_head, seqlen_q, head_dim_v),
+            dtype=torch.float32,
+            device=q_bhsd.device,
+        )
+        lse = torch.empty(
+            (batch_size, kv_splits_i * num_head, seqlen_q),
+            dtype=torch.float32,
+            device=q_bhsd.device,
+        )
+    else:
+        out_bhsd = torch.empty(
+            (batch_size, num_head, seqlen_q, head_dim_v),
+            dtype=q_bhsd.dtype,
+            device=q_bhsd.device,
+        )
+        lse = torch.empty(
+            (batch_size, num_head, seqlen_q),
+            dtype=torch.float32,
+            device=q_bhsd.device,
+        )
 
     current_stream = (
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -1199,6 +1342,12 @@ def bsa_attn_fwd_blk64_cutedsl(
         has_variable_block_nums,
         allow_empty_block_nums,
         has_block_sizes,
+        kv_splits_i,
+        out_bhsd.dtype,
+        tuple(out_bhsd.shape),
+        tuple(out_bhsd.stride()),
+        tuple(lse.shape),
+        tuple(lse.stride()),
         is_persistent,
         use_clc_scheduler,
         input_layout,
@@ -1215,6 +1364,9 @@ def bsa_attn_fwd_blk64_cutedsl(
         block_nums_tensor = (
             _to_cute_tensor(q2k_block_nums) if has_variable_block_nums else None
         )
+        split_offsets_tensor = (
+            _to_cute_tensor(split_offsets) if split_offsets is not None else None
+        )
 
         fa_fwd = FlashAttentionForwardSm100Blk64(
             head_dim,
@@ -1229,6 +1381,8 @@ def bsa_attn_fwd_blk64_cutedsl(
             use_clc_scheduler=use_clc_scheduler,
             allow_empty_block_nums=allow_empty_block_nums,
             has_block_sizes=has_block_sizes,
+            num_splits=kv_splits_i,
+            use_raw_ws_epilogue=True,
         )
 
         t0 = time.time()
@@ -1244,6 +1398,7 @@ def bsa_attn_fwd_blk64_cutedsl(
             block_sizes_tensor,
             uniform_block_sparse_num,
             block_nums_tensor,
+            split_offsets_tensor,
             current_stream,
             options="--enable-tvm-ffi",
         )
@@ -1262,8 +1417,19 @@ def bsa_attn_fwd_blk64_cutedsl(
                 block_sizes.detach() if has_block_sizes else None,
                 uniform_block_sparse_num,
                 q2k_block_nums.detach() if has_variable_block_nums else None,
+                split_offsets.detach() if split_offsets is not None else None,
                 current_stream,
             )
+
+    if kv_splits_i > 1:
+        out_bhsd, lse = _combine_blk64_kv_bucketed_partials(
+            q_bhsd,
+            out_bhsd,
+            lse,
+            kv_splits_i,
+        )
+        # Keep split_offsets alive through the combine launch on the same stream.
+        _ = split_offsets
 
     out = out_bhsd if layout == "bhsd" else out_bhsd.transpose(1, 2).contiguous()
     return out, lse

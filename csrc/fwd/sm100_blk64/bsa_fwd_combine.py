@@ -375,15 +375,16 @@ class FlashAttentionForwardCombine:
             if const_expr(num_splits_dynamic_ptr is not None)
             else mLSE_partial.shape[1]
         )
-        # Handle variable length sequences using SeqlenInfo
-        seqlen_info = SeqlenInfo.create(
-            batch_idx=batch_idx,
-            seqlen_static=mO_partial.shape[0],
-            cu_seqlens=cu_seqlens,
-            seqused=seqused,
-            # Don't need to pass in tile size since we won't use offset_padded
-        )
-        seqlen, offset = seqlen_info.seqlen, seqlen_info.offset
+        if const_expr(cu_seqlens is None):
+            seqlen = mO_partial.shape[0]
+            offset = Int32(0)
+        else:
+            offset = cu_seqlens[batch_idx]
+            seqlen = (
+                seqused[batch_idx]
+                if const_expr(seqused is not None)
+                else cu_seqlens[batch_idx + 1] - offset
+            )
 
         # Extract number of heads (head index will be determined dynamically)
         num_head = mO_partial.shape[3]
@@ -402,7 +403,10 @@ class FlashAttentionForwardCombine:
             # Step 1: Load LSE_partial from gmem to shared memory
             # ===============================
 
-            mLSE_partial_cur = seqlen_info.offset_batch(mLSE_partial, batch_idx, dim=3)
+            if const_expr(cu_seqlens is None):
+                mLSE_partial_cur = mLSE_partial[None, None, None, batch_idx]
+            else:
+                mLSE_partial_cur = cute.domain_offset((offset, 0, 0), mLSE_partial)
             mLSE_partial_copy = cute.tiled_divide(mLSE_partial_cur, (1,))
             gmem_thr_copy_LSE = gmem_tiled_copy_LSE.get_slice(tidx)
             tLSEsLSE = gmem_thr_copy_LSE.partition_D(sLSE)
@@ -443,7 +447,10 @@ class FlashAttentionForwardCombine:
             cO = cute.make_identity_tensor((self.tile_m, self.k_block_size))
             tOcO = gmem_thr_copy_O_partial.partition_D(cO)
             tOsO_partial = gmem_thr_copy_O_partial.partition_D(sO)
-            mO_partial_cur = seqlen_info.offset_batch(mO_partial, batch_idx, dim=4)
+            if const_expr(cu_seqlens is None):
+                mO_partial_cur = mO_partial[None, None, None, None, batch_idx]
+            else:
+                mO_partial_cur = cute.domain_offset((offset, 0, 0, 0), mO_partial)
 
             # Precompute these values to avoid recomputing them in the loop
             num_rows = const_expr(cute.size(tOcO, mode=[1]))
@@ -641,7 +648,6 @@ class FlashAttentionForwardCombine:
 
             rO = cute.make_rmem_tensor_like(tOrO, self.dtype)
             rO.store(tOrO.load().to(self.dtype))
-            mO_cur = seqlen_info.offset_batch(mO, batch_idx, dim=3)
             if const_expr(cu_seqlens is None):
                 mO_cur = mO[None, None, None, batch_idx]
             else:
