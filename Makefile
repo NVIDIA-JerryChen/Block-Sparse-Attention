@@ -18,8 +18,6 @@ PYTHON := python
 PYTEST := python -m pytest
 TEST_FILE := tests/test_flash_fwd.py
 BWD_TEST_FILE := tests/test_flash_bwd.py
-FA_DIR := /home/scratch.cjerry_sw/next-dsa/flash-attention
-FA_TEST := flash_attn/cute/test_flash_fwd_sm100.py
 
 # BLK: 64, 128, or "64,128" (default: both)
 # BLK ?= 64,128
@@ -37,7 +35,7 @@ AGENT_PROFILES := agent/agent_profiles
 WHEEL_DIR := $(AGENT_SPACE)/wheels/dist
 NCU_DIR := $(AGENT_PROFILES)/ncu
 
-.PHONY: setup tt vt ttb vtb bb bbb profile bm bm-cli clean compare help
+.PHONY: setup tt vt ttb vtb bb bbb profile bm bm-cli clean help
 
 setup:
 	@if [ ! -f third_party/cutlass/include/cutlass/cutlass.h ]; then \
@@ -98,17 +96,6 @@ bm-cli:
 	@echo "Registers:    launch__registers_per_thread"
 	@echo "Local spills: local_op_ld/st sectors = 0 → no spills"
 	@echo "Smem banks:   bank_conflicts = 0 → no conflicts"
-
-compare:
-	@echo "================================================================"
-	@echo "  BSA benchmark"
-	@echo "================================================================"
-	$(PYTHON) -u $(TEST_FILE) benchmark
-	@echo ""
-	@echo "================================================================"
-	@echo "  FA4 benchmark (q_stage=1)"
-	@echo "================================================================"
-	cd $(FA_DIR) && FA_Q_STAGE=1 $(PYTHON) -u $(FA_TEST) benchmark
 
 clean:
 	rm -rf /tmp/$$(USER)/flash_attention_cute_dsl_cache/

@@ -60,26 +60,35 @@ def _compute_source_fingerprint() -> str:
     Hash all CuTe Python sources plus runtime ABI stamps into a short fingerprint.
 
     The fingerprint changes whenever:
-    - Any .py file under flash_attn/cute is added, removed, renamed, or modified.
+    - Any local CuTe helper .py file is added, removed, renamed, or modified.
     - The Python minor version changes (e.g. 3.13 -> 3.14).
     - The cutlass or tvm_ffi package version changes.
 
     Computed once per process and cached.
     """
-    cute_root = Path(__file__).resolve().parent
+    repo_root = Path(__file__).resolve().parents[1]
+    source_roots = (
+        repo_root / "utils",
+        repo_root / "csrc" / "common" / "fa_cute",
+        repo_root / "csrc" / "fwd",
+        repo_root / "csrc" / "bwd",
+    )
     h = hashlib.sha256()
 
     h.update(f"py{sys.version_info.major}.{sys.version_info.minor}".encode())
     h.update(f"cutlass={cutlass.__version__}".encode())
     h.update(f"tvm_ffi={tvm_ffi.__version__}".encode())
 
-    for src in sorted(cute_root.rglob("*.py")):
-        if not src.is_file():
+    for source_root in source_roots:
+        if not source_root.exists():
             continue
-        h.update(src.relative_to(cute_root).as_posix().encode())
-        content = src.read_bytes()
-        h.update(len(content).to_bytes(8, "little"))
-        h.update(content)
+        for src in sorted(source_root.rglob("*.py")):
+            if not src.is_file():
+                continue
+            h.update(src.relative_to(repo_root).as_posix().encode())
+            content = src.read_bytes()
+            h.update(len(content).to_bytes(8, "little"))
+            h.update(content)
 
     return h.hexdigest()
 

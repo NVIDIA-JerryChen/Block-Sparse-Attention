@@ -17,31 +17,31 @@ from cutlass.pipeline import PipelineAsync
 
 import quack.activation
 from quack import layout_utils
-from flash_attn.cute import utils
-from flash_attn.cute.cute_dsl_utils import (
+from csrc.common.fa_cute import utils
+from csrc.common.fa_cute.cute_dsl_utils import (
     assume_tensor_aligned,
     get_broadcast_dims,
     to_cute_tensor,
 )
-from flash_attn.cute import copy_utils
-from flash_attn.cute import pipeline
-from flash_attn.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx
-from flash_attn.cute.seqlen_info import SeqlenInfoQK
-from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute.interface import (
+from csrc.common.fa_cute import copy_utils
+from csrc.common.fa_cute import pipeline
+from csrc.common.fa_cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx
+from csrc.common.fa_cute.seqlen_info import SeqlenInfoQK
+from csrc.common.fa_cute.block_info import BlockInfo
+from csrc.common.fa_cute.interface import (
     _bwd_postprocess_convert,
     _bwd_preprocess,
     _get_device_arch,
     torch2cute_dtype_map,
 )
-from flash_attn.cute.testing import is_fake_mode
+from utils.testing import is_fake_mode
 from quack.cute_dsl_utils import ParamsBase
-from flash_attn.cute.tile_scheduler import (
+from csrc.common.fa_cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
 )
 
-from flash_attn.cute.named_barrier import NamedBarrierBwdSm100
+from csrc.common.fa_cute.named_barrier import NamedBarrierBwdSm100
 from utils.cache_utils import get_jit_cache
 
 
@@ -1264,9 +1264,9 @@ class BlockSparseAttnBackwardSm100Blk128:
     @cute.jit
     def load(
         self,
-        thr_mma_S: cute.core.ThrMma,
-        thr_mma_dP: cute.core.ThrMma,
-        thr_mma_dV: cute.core.ThrMma,
+        thr_mma_S: cute.ThrMma,
+        thr_mma_dP: cute.ThrMma,
+        thr_mma_dV: cute.ThrMma,
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
@@ -1729,10 +1729,10 @@ class BlockSparseAttnBackwardSm100Blk128:
     @cute.jit
     def compute_loop(
         self,
-        thr_mma_S: cute.core.ThrMma,
-        thr_mma_dP: cute.core.ThrMma,
-        thr_mma_dV: cute.core.ThrMma,
-        thr_mma_dK: cute.core.ThrMma,
+        thr_mma_S: cute.ThrMma,
+        thr_mma_dP: cute.ThrMma,
+        thr_mma_dV: cute.ThrMma,
+        thr_mma_dK: cute.ThrMma,
         tStS: cute.Tensor,
         tdPtdP: cute.Tensor,
         tdVtdV: cute.Tensor,
@@ -1884,15 +1884,15 @@ class BlockSparseAttnBackwardSm100Blk128:
             for iter_idx in cutlass.range(loop_count, unroll=1):
                 m_block = get_m_block_from_iter_bwd(iter_idx, curr_q_cnt, curr_q_idx)
                 pipeline_LSE.consumer_wait(consumer_state_LSE)
-                tSrLSE_s2r = cute.make_fragment(tScS_t2r[None, 0, 0, 0].shape, Float32)
+                tSrLSE_s2r = cute.make_rmem_tensor(tScS_t2r[None, 0, 0, 0].shape, Float32)
 
                 pipeline_S_P.consumer_wait(consumer_state_S_P_dP)
-                tSrS_t2r = cute.make_fragment(tScS_t2r.shape, Float32)
+                tSrS_t2r = cute.make_rmem_tensor(tScS_t2r.shape, Float32)
                 cute.copy(thr_copy_t2r, tStS_t2r, tSrS_t2r)
 
                 self.apply_seqlen_k_mask(tSrS_t2r, tScS_t2r, n_block_for_cluster, seqlen)
                 num_stages = cute.size(tScS_t2r, mode=[1])
-                tSrP_r2t_f32 = cute.make_fragment(tScP_r2t.shape, Float32)  # 64
+                tSrP_r2t_f32 = cute.make_rmem_tensor(tScP_r2t.shape, Float32)  # 64
                 tSrP_r2t = cute.recast_tensor(tSrP_r2t_f32, self.q_dtype)
                 for stage in cutlass.range_constexpr(num_stages):
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
@@ -1933,7 +1933,7 @@ class BlockSparseAttnBackwardSm100Blk128:
                 pipeline_dP.consumer_wait(consumer_state_S_P_dP)
 
                 for stage in cutlass.range_constexpr(num_stages):
-                    tdPrdP_t2r = cute.make_fragment(tScS_t2r[None, 0, None, None].shape, Float32)
+                    tdPrdP_t2r = cute.make_rmem_tensor(tScS_t2r[None, 0, None, None].shape, Float32)
                     cute.copy(thr_copy_t2r, tdPtdP_t2r[None, stage, None, None], tdPrdP_t2r)
                     cute.arch.fence_view_async_tmem_load()
                     self.compute_sync_barrier.arrive_and_wait()
@@ -2072,7 +2072,7 @@ class BlockSparseAttnBackwardSm100Blk128:
         self,
         mdQaccum: cute.Tensor,
         sdQaccum: cute.Tensor,
-        thr_mma_dQ: cute.core.ThrMma,
+        thr_mma_dQ: cute.ThrMma,
         tdQtdQ: cute.Tensor,
         pipeline_dQ: PipelineAsync,
         block_info: BlockInfo,
@@ -2144,7 +2144,7 @@ class BlockSparseAttnBackwardSm100Blk128:
                     m_block = cutlass.min(m_block, m_block_max - 1)
                 pipeline_dQ.consumer_wait(dQ_consumer_state)
                 # TMEM -> RMEM
-                tdQrdQ_t2r = cute.make_fragment(tdQrdQ_t2r_shape, Float32)
+                tdQrdQ_t2r = cute.make_rmem_tensor(tdQrdQ_t2r_shape, Float32)
                 cute.copy(thr_copy_t2r, tdQtdQ_t2r, tdQrdQ_t2r)
                 cute.arch.fence_view_async_tmem_load()
                 cute.arch.sync_warp()
@@ -2198,7 +2198,7 @@ class BlockSparseAttnBackwardSm100Blk128:
         head_idx: Int32,
         n_block: Int32,
         seqlen,
-        thr_mma: cute.core.ThrMma,
+        thr_mma: cute.ThrMma,
         tdKVtdKV: cute.Tensor,
         mdKV: cute.Tensor,
         sdKV: cute.Tensor,
@@ -2294,7 +2294,7 @@ class BlockSparseAttnBackwardSm100Blk128:
             if const_expr(num_epi_stages > 1):
                 tdKVcdKV_t2r = tdKVcdKV_t2r[None, epi_stage]
 
-            tdKVrdKV_t2r = cute.make_fragment(tdKVcdKV_t2r.shape, Float32)
+            tdKVrdKV_t2r = cute.make_rmem_tensor(tdKVcdKV_t2r.shape, Float32)
 
             assert cute.size(tdKVrdKV_t2r) == cute.size(tdKVtdKV_t2r) // cute.arch.WARP_SIZE, (
                 "RMEM<->TMEM fragment size mismatch"
@@ -2310,7 +2310,7 @@ class BlockSparseAttnBackwardSm100Blk128:
                     tdKVrdKV_t2r[2 * i], tdKVrdKV_t2r[2 * i + 1] = cute.arch.mul_packed_f32x2(
                         (tdKVrdKV_t2r[2 * i], tdKVrdKV_t2r[2 * i + 1]), (scale, scale)
                     )
-            tdKVrdKV = cute.make_fragment(tdKVrdKV_t2r.shape, dtype)  # (32 columns)
+            tdKVrdKV = cute.make_rmem_tensor(tdKVrdKV_t2r.shape, dtype)  # (32 columns)
             tdKVrdKV.store(tdKVrdKV_t2r.load().to(dtype))
 
             # RMEM -> SMEM -- copy, fence and barrier

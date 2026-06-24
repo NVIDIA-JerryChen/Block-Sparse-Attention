@@ -8,6 +8,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
 
 import enum
+import inspect
 import math
 import operator
 import types
@@ -48,6 +49,15 @@ import cutlass.utils.blackwell_helpers as sm100_utils_basic
 import quack.activation
 from quack import copy_utils, layout_utils
 from quack.cute_dsl_utils import ParamsBase
+
+_NVVM_FMAX_REQUIRES_RESULT_TYPE = (
+    sum(
+        1
+        for p in inspect.signature(nvvm.fmax).parameters.values()
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    )
+    > 2
+)
 
 # =============================================================================
 # Public Kernel Class
@@ -1089,8 +1099,8 @@ class BlockSparseAttnForwardSm100Blk128:
     @cute.jit
     def load(
         self,
-        thr_mma_qk: cute.core.ThrMma,
-        thr_mma_pv: cute.core.ThrMma,
+        thr_mma_qk: cute.ThrMma,
+        thr_mma_pv: cute.ThrMma,
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
@@ -1233,8 +1243,8 @@ class BlockSparseAttnForwardSm100Blk128:
     @cute.jit
     def mma(
         self,
-        tiled_mma_qk: cute.core.ThrMma,
-        tiled_mma_pv: cute.core.ThrMma,
+        tiled_mma_qk: cute.ThrMma,
+        tiled_mma_pv: cute.ThrMma,
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
@@ -1463,7 +1473,7 @@ class BlockSparseAttnForwardSm100Blk128:
         stage: int | Int32,
         softmax_scale_log2: Float32,
         softmax_scale: Float32,
-        thr_mma_qk: cute.core.ThrMma,
+        thr_mma_qk: cute.ThrMma,
         tStS: cute.Tensor,  # ((TILE_M, TILE_N), 1, 1, q_stage)
         sScale: cute.Tensor,
         mLSE: Optional[cute.Tensor],
@@ -1648,7 +1658,7 @@ class BlockSparseAttnForwardSm100Blk128:
         sm_stats_producer_phase: Int32,
         s0_s1_sequence_phase: Int32,
         softmax: "SoftmaxSm100",
-        thr_mma_qk: cute.core.ThrMma,
+        thr_mma_qk: cute.ThrMma,
         pipeline_s_p_o: pipeline.PipelineAsync,
         pipeline_p_lastsplit: pipeline.PipelineAsync,
         pipeline_sm_stats: pipeline.PipelineAsync,
@@ -1740,8 +1750,8 @@ class BlockSparseAttnForwardSm100Blk128:
     @cute.jit
     def correction_loop(
         self,
-        thr_mma_qk: cute.core.ThrMma,
-        thr_mma_pv: cute.core.ThrMma,
+        thr_mma_qk: cute.ThrMma,
+        thr_mma_pv: cute.ThrMma,
         tStS: cute.Tensor,
         tOtO: cute.Tensor,
         sScale: cute.Tensor,
@@ -1980,7 +1990,7 @@ class BlockSparseAttnForwardSm100Blk128:
     @cute.jit
     def correction_rescale(
         self,
-        thr_mma: cute.core.ThrMma,
+        thr_mma: cute.ThrMma,
         tOtO: cute.Tensor,
         tidx: Int32,
         scale: Float32,
@@ -2031,7 +2041,7 @@ class BlockSparseAttnForwardSm100Blk128:
     @cute.jit
     def correction_epilogue(
         self,
-        thr_mma: cute.core.ThrMma,
+        thr_mma: cute.ThrMma,
         tOtO: cute.Tensor,
         tidx: Int32,
         stage: Int32,
@@ -2099,7 +2109,7 @@ class BlockSparseAttnForwardSm100Blk128:
     @cute.jit
     def correction_epilogue_combine(
         self,
-        thr_mma: cute.core.ThrMma,
+        thr_mma: cute.ThrMma,
         tOtO0: cute.Tensor,
         tOtO1: cute.Tensor,
         tidx: Int32,
@@ -2445,11 +2455,7 @@ def warp_reduce(
 def fmax(
     a: float | Float32, b: float | Float32, c: float | Float32 | None = None, *, loc=None, ip=None
 ) -> Float32:
-    from cutlass import CUDA_VERSION
-
-    # * NVVM call based on nvvm version
-    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
-        # Old API: requires explicit result type as first positional argument
+    if const_expr(_NVVM_FMAX_REQUIRES_RESULT_TYPE):
         return Float32(
             nvvm.fmax(
                 T.f32(),
@@ -2461,7 +2467,6 @@ def fmax(
             )
         )
     else:
-        # New API: infers result type automatically
         return Float32(
             nvvm.fmax(
                 Float32(a).ir_value(loc=loc, ip=ip),

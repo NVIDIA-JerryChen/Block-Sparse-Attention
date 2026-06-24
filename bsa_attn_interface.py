@@ -491,8 +491,8 @@ def _bsa_attn_fwd_blk64_kv_bucketed(
     """Launch KV-bucketed SM100 blk64 fwd and combine partial outputs."""
     if FlashAttentionForwardCombine is None:
         raise ImportError(
-            "FlashAttentionForwardCombine is unavailable. Ensure flash_attn.cute "
-            "dependencies are on PYTHONPATH."
+            "FlashAttentionForwardCombine is unavailable. Ensure local fa_cute "
+            "helpers are importable."
         )
 
     kv_splits = int(kv_splits)
