@@ -268,7 +268,7 @@ class FlashAttentionForwardSm100Blk64:
         mLSE: Optional[cute.Tensor],
         softmax_scale: Float32,
         mBlockIndex: cute.Tensor,  # (batch, heads, num_q_blocks, max_kv_blocks), int32
-        mBlockSizes: cute.Tensor,  # (num_kv_blocks,), int32
+        mBlockSizes: Optional[cute.Tensor],  # (num_kv_blocks,), int32 or None
         block_sparse_num: Int32,   # runtime scalar, even, >= 2
         mBlockNums: Optional[cute.Tensor],  # (batch, heads, num_q_blocks), int32 or None
         stream: cuda.CUstream,
@@ -728,7 +728,7 @@ class FlashAttentionForwardSm100Blk64:
         tiled_mma_pv: cute.TiledMma,
         tile_sched_params: ParamsBase,
         mBlockIndex: cute.Tensor,
-        mBlockSizes: cute.Tensor,
+        mBlockSizes: Optional[cute.Tensor],
         block_sparse_num: Int32,
         mBlockNums: Optional[cute.Tensor],
     ):
@@ -1655,7 +1655,7 @@ class FlashAttentionForwardSm100Blk64:
         sm_stats_barrier: pipeline.NamedBarrier,
         tile_scheduler: TileSchedulerProtocol,
         mBlockIndex: cute.Tensor,
-        mBlockSizes: cute.Tensor,
+        mBlockSizes: Optional[cute.Tensor],
         block_sparse_num: Int32,
         mBlockNums: Optional[cute.Tensor],
     ):
@@ -1785,7 +1785,7 @@ class FlashAttentionForwardSm100Blk64:
         block_iter_count: Int32,
         raw_block_count: Int32,
         n_block: Callable,
-        mBlockSizes: cute.Tensor,
+        mBlockSizes: Optional[cute.Tensor],
     ) -> Tuple[Int32, Int32]:
         kv_block = block_iter_count - 1 - (self.s_stage * kv_iter + Int32(stage))
         logical_lo = kv_block * self.sparse_blocks_per_kv + warp_col

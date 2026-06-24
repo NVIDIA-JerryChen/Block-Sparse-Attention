@@ -864,19 +864,8 @@ def choose_blk64_cutedsl_use_clc(
     q2k_block_nums: Optional[torch.Tensor] = None,
     layout: str = "bhsd",
 ) -> bool:
-    """Select the measured-fastest scheduler for the blk64 CuTeDSL backend."""
-    if q2k_block_nums is not None and q2k_block_nums.numel() > 0:
-        return True
-
-    if layout == "bshd":
-        batch, seqlen_q, h, _ = q.shape
-    else:
-        assert layout == "bhsd", f"layout must be 'bhsd' or 'bshd', got {layout!r}"
-        batch, h, seqlen_q, _ = q.shape
-
-    num_m_blocks = (seqlen_q + 63) // 64
-    total_tiles = batch * h * num_m_blocks
-    return num_m_blocks >= 128 and total_tiles >= 512
+    """Select the same scheduler policy as the AOT SM100 blk64 wrapper."""
+    return choose_blk64_use_clc(q, block_sparse_num, q2k_block_nums, layout)
 
 
 def bsa_attn_fwd_blk64(
@@ -1099,7 +1088,7 @@ def bsa_attn_fwd_blk64_cutedsl(
     k: torch.Tensor,
     v: torch.Tensor,
     q2k_block_index: torch.Tensor,
-    block_sizes: torch.Tensor,
+    block_sizes: Optional[torch.Tensor],
     q2k_block_nums: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     layout: str = "bhsd",
@@ -1129,7 +1118,12 @@ def bsa_attn_fwd_blk64_cutedsl(
     assert k_bhsd.shape == (batch_size, num_head_kv, seqlen_k, head_dim)
     assert v_bhsd.shape == (batch_size, num_head_kv, seqlen_k, head_dim_v)
     assert q2k_block_index.dtype == torch.int32
-    assert block_sizes.dtype == torch.int32
+    has_block_sizes = block_sizes is not None and block_sizes.numel() > 0
+    if has_block_sizes:
+        block_sizes = maybe_contiguous(block_sizes)
+        assert block_sizes.dtype == torch.int32
+    else:
+        block_sizes = None
     num_q_blocks = (seqlen_q + 63) // 64
     has_variable_block_nums = q2k_block_nums is not None and q2k_block_nums.numel() > 0
     if has_variable_block_nums:
@@ -1145,9 +1139,8 @@ def bsa_attn_fwd_blk64_cutedsl(
         )
         uniform_block_sparse_num = 0
     else:
-        assert block_sparse_num > 0, (
-            "block_sparse_num must be provided when q2k_block_nums is None or empty"
-        )
+        if block_sparse_num <= 0:
+            block_sparse_num = int(q2k_block_index.shape[-1])
         assert q2k_block_index.shape[-1] >= block_sparse_num, (
             f"q2k_block_index last dim ({q2k_block_index.shape[-1]}) must be "
             f">= block_sparse_num ({block_sparse_num})"
@@ -1167,7 +1160,6 @@ def bsa_attn_fwd_blk64_cutedsl(
 
     dtype = torch2cute_dtype_map[q_bhsd.dtype]
     arch = _get_device_arch()
-    has_block_sizes = True
     allow_empty_block_nums = has_variable_block_nums
     sparse_block_size = 64
     qhead_per_kvhead = 1
@@ -1219,7 +1211,7 @@ def bsa_attn_fwd_blk64_cutedsl(
         ]
         lse_tensor = _to_cute_tensor(lse, assumed_align=4)
         block_index_tensor = _to_cute_tensor(q2k_block_index)
-        block_sizes_tensor = _to_cute_tensor(block_sizes)
+        block_sizes_tensor = _to_cute_tensor(block_sizes) if has_block_sizes else None
         block_nums_tensor = (
             _to_cute_tensor(q2k_block_nums) if has_variable_block_nums else None
         )
@@ -1267,7 +1259,7 @@ def bsa_attn_fwd_blk64_cutedsl(
                 lse,
                 softmax_scale,
                 q2k_block_index.detach(),
-                block_sizes.detach(),
+                block_sizes.detach() if has_block_sizes else None,
                 uniform_block_sparse_num,
                 q2k_block_nums.detach() if has_variable_block_nums else None,
                 current_stream,
