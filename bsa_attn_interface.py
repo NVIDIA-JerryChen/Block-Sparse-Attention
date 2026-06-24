@@ -86,6 +86,27 @@ def _to_cute_tensor(
     return tensor.mark_layout_dynamic(leading_dim=leading_dim)
 
 
+def _to_cute_tensor_dynamic_compact_shape(
+    t: torch.Tensor,
+    mode: int | tuple[int, ...],
+    assumed_align: int = 16,
+    leading_dim: int = -1,
+    divisibility: int = 1,
+    stride_order: tuple[int, ...] | None = None,
+) -> cute.Tensor:
+    tensor = _to_cute_tensor(t, assumed_align=assumed_align, leading_dim=leading_dim)
+    if isinstance(mode, int):
+        mode = (mode,)
+    stride_order = t.dim_order() if stride_order is None else stride_order
+    for mode_i in mode:
+        tensor = tensor.mark_compact_shape_dynamic(
+            mode=mode_i,
+            stride_order=stride_order,
+            divisibility=divisibility,
+        )
+    return tensor
+
+
 def _to_sm90_bwd_cute_tensor(
     t: torch.Tensor, assumed_align: int = 16, enable_tvm_ffi: bool = True
 ) -> cute.Tensor:
@@ -160,6 +181,10 @@ def _tensor_compile_key(t: torch.Tensor):
     return (tuple(t.shape), tuple(t.stride()), t.dtype)
 
 
+def _tensor_layout_compile_key(t: torch.Tensor):
+    return (tuple(t.dim_order()), tuple(s == 0 for s in t.stride()))
+
+
 def _ceil_div_int(a: int, b: int) -> int:
     return (int(a) + int(b) - 1) // int(b)
 
@@ -168,6 +193,44 @@ def _ceil_log2_int(x: int) -> int:
     x = int(x)
     assert x >= 1
     return (x - 1).bit_length()
+
+
+def _bsa_fwd_blk64_kv_bucketed_combine_compile_key(
+    dtype,
+    head_dim: int,
+    combine_tile_m: int,
+    combine_k_block_size: int,
+    log_max_splits: int,
+    combine_num_threads: int,
+    combine_stages: int,
+):
+    return (
+        dtype,
+        cutlass.Float32,
+        int(head_dim),
+        int(combine_tile_m),
+        int(combine_k_block_size),
+        int(log_max_splits),
+        int(combine_num_threads),
+        int(combine_stages),
+        "bshd_nonvarlen_seqlen_dynamic",
+    )
+
+
+def _to_cute_tensor_with_dynamic_modes(
+    t: torch.Tensor,
+    dynamic_modes: int | tuple[int, ...],
+    assumed_align: int = 16,
+    leading_dim: int = -1,
+    divisibility: int = 1,
+) -> cute.Tensor:
+    return _to_cute_tensor_dynamic_compact_shape(
+        t,
+        mode=dynamic_modes,
+        assumed_align=assumed_align,
+        leading_dim=leading_dim,
+        divisibility=divisibility,
+    )
 
 
 def _sm100_blk64_auto_kv_splits(
@@ -484,7 +547,6 @@ def _bsa_attn_fwd_blk64_kv_bucketed(
     )
     dtype = torch2cute_dtype_map[q.dtype]
     log_max_splits = _ceil_log2_int(kv_splits)
-    max_splits = 1 << log_max_splits
     # Baseline combine geometry; a single configuration is easier to maintain.
     combine_tile_m = 16
     combine_k_block_size = 64
@@ -496,38 +558,14 @@ def _bsa_attn_fwd_blk64_kv_bucketed(
         if is_fake_mode()
         else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     )
-    o_partial_shape = (kv_splits, batch, seqlen_q, num_heads, head_dim)
-    o_partial_stride = (
-        num_heads * seqlen_q * head_dim,
-        seqlen_q * split_heads * head_dim,
-        head_dim,
-        seqlen_q * head_dim,
-        1,
-    )
-    lse_partial_shape = (kv_splits, batch, seqlen_q, num_heads)
-    lse_partial_stride = (
-        num_heads * seqlen_q,
-        seqlen_q * split_heads,
-        1,
-        seqlen_q,
-    )
-    out_bshd_shape = (batch, seqlen_q, num_heads, head_dim)
-    out_bshd_stride = (seqlen_q * num_heads * head_dim, num_heads * head_dim, head_dim, 1)
-    lse_bsh_shape = (batch, seqlen_q, num_heads)
-    lse_bsh_stride = (seqlen_q * num_heads, num_heads, 1)
-    compile_key = (
+    compile_key = _bsa_fwd_blk64_kv_bucketed_combine_compile_key(
         dtype,
         head_dim,
-        kv_splits,
         combine_tile_m,
         combine_k_block_size,
-        max_splits,
+        log_max_splits,
         combine_num_threads,
         combine_stages,
-        (o_partial_shape, o_partial_stride, torch.float32),
-        (lse_partial_shape, lse_partial_stride, torch.float32),
-        (out_bshd_shape, out_bshd_stride, q.dtype),
-        (lse_bsh_shape, lse_bsh_stride, torch.float32),
     )
     if compile_key not in _bsa_attn_fwd_blk64_kv_bucketed.compile_cache:
         combine_kernel = FlashAttentionForwardCombine(
@@ -540,10 +578,29 @@ def _bsa_attn_fwd_blk64_kv_bucketed(
             stages=combine_stages,
         )
         args = (
-            _to_cute_tensor(o_partial),
-            _to_cute_tensor(lse_partial, assumed_align=4, leading_dim=2),
-            _to_cute_tensor(out_bshd),
-            _to_cute_tensor(lse_bsh, assumed_align=4),
+            _to_cute_tensor_dynamic_compact_shape(
+                o_partial,
+                mode=(0, 1, 2, 3),
+                stride_order=(1, 0, 3, 2, 4),
+            ),
+            _to_cute_tensor_dynamic_compact_shape(
+                lse_partial,
+                mode=(0, 1, 2, 3),
+                assumed_align=4,
+                leading_dim=2,
+                stride_order=(1, 0, 3, 2),
+            ),
+            _to_cute_tensor_dynamic_compact_shape(
+                out_bshd,
+                mode=(0, 1, 2),
+                stride_order=(0, 1, 2, 3),
+            ),
+            _to_cute_tensor_dynamic_compact_shape(
+                lse_bsh,
+                mode=(0, 1, 2),
+                assumed_align=4,
+                stride_order=(0, 1, 2),
+            ),
             None,
             None,
             None,
@@ -977,20 +1034,36 @@ def bsa_attn_fwd(
         allow_empty_block_nums and has_variable_block_nums,
         has_block_sizes,
         "bhsd_kernel_boundary",
-        _tensor_compile_key(q_kernel),
-        _tensor_compile_key(k_kernel),
-        _tensor_compile_key(v_kernel),
-        _tensor_compile_key(out_kernel),
     )
 
     if compile_key not in bsa_attn_fwd.compile_cache:
         q_tensor, k_tensor, v_tensor, o_tensor = [
-            _to_cute_tensor(t) for t in (q_kernel, k_kernel, v_kernel, out_kernel)
+            _to_cute_tensor_with_dynamic_modes(t, dynamic_modes=(0, 1, 2))
+            for t in (q_kernel, k_kernel, v_kernel, out_kernel)
         ]
-        lse_tensor = _to_cute_tensor(lse, assumed_align=4) if lse is not None else None
-        block_index_tensor = _to_cute_tensor(q2k_block_index)
-        block_sizes_tensor = _to_cute_tensor(block_sizes) if has_block_sizes else None
-        block_nums_tensor = _to_cute_tensor(q2k_block_nums) if has_variable_block_nums else None
+        lse_tensor = (
+            _to_cute_tensor_with_dynamic_modes(
+                lse,
+                dynamic_modes=(0, 1, 2),
+                assumed_align=4,
+            )
+            if lse is not None
+            else None
+        )
+        block_index_tensor = _to_cute_tensor_with_dynamic_modes(
+            q2k_block_index,
+            dynamic_modes=(0, 1, 2, 3),
+        )
+        block_sizes_tensor = (
+            _to_cute_tensor_with_dynamic_modes(block_sizes, dynamic_modes=0)
+            if has_block_sizes
+            else None
+        )
+        block_nums_tensor = (
+            _to_cute_tensor_with_dynamic_modes(q2k_block_nums, dynamic_modes=(0, 1, 2))
+            if has_variable_block_nums
+            else None
+        )
 
         bsa_attn_fwd.compile_cache[compile_key] = cute.compile(
             bsa_fwd_kernel,
@@ -1889,30 +1962,23 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     )
 
-    full_kv_blocks = (
-        seqlen_k % sparse_block_size == 0
-        and head_dim == SM100_BWD_HEAD_DIM
-    )
-
     compile_key = (
         "sm100_bucketed_k2q",
         q.dtype,
         head_dim,
-        num_heads,
         sparse_block_size,
         arch,
         has_block_sizes,
-        full_kv_blocks,
         fa_logging.get_fa_log_level(),
-        _tensor_compile_key(dout),
-        _tensor_compile_key(out),
-        _tensor_compile_key(q),
-        _tensor_compile_key(k),
-        _tensor_compile_key(v),
-        _tensor_compile_key(dq),
-        _tensor_compile_key(dk),
-        _tensor_compile_key(dv),
-        _tensor_compile_key(lse),
+        _tensor_layout_compile_key(dout),
+        _tensor_layout_compile_key(out),
+        _tensor_layout_compile_key(q),
+        _tensor_layout_compile_key(k),
+        _tensor_layout_compile_key(v),
+        _tensor_layout_compile_key(dq),
+        _tensor_layout_compile_key(dk),
+        _tensor_layout_compile_key(dv),
+        _tensor_layout_compile_key(lse),
     )
 
     def convert_to_cute_tensor(t: torch.Tensor, enable_tvm_ffi: bool = True) -> cute.Tensor:
@@ -1942,7 +2008,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         bwd_kernel = BlockSparseAttnBackwardSm100Blk64(
             sparse_block_size=sparse_block_size,
             has_block_sizes=has_block_sizes,
-            full_kv_blocks=full_kv_blocks,
+            full_kv_blocks=False,
         )
 
         _bsa_attn_bwd_bucketed_k2q_csr.compile_cache[compile_key] = cute.compile(

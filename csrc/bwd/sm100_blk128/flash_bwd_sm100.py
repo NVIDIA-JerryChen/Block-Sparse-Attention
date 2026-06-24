@@ -2370,10 +2370,6 @@ def _ceil_div(a: int, b: int) -> int:
     return (int(a) + int(b) - 1) // int(b)
 
 
-def _tensor_compile_key(t: torch.Tensor):
-    return (tuple(t.shape), tuple(t.stride()), t.dtype)
-
-
 def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -2496,17 +2492,7 @@ def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
         get_broadcast_dims(k_bshd),
         get_broadcast_dims(v_bshd),
         get_broadcast_dims(dout_bshd),
-        _tensor_compile_key(q_bshd),
-        _tensor_compile_key(k_bshd),
-        _tensor_compile_key(v_bshd),
-        _tensor_compile_key(dout_bshd),
-        _tensor_compile_key(dq_bshd),
-        _tensor_compile_key(dk_bshd),
-        _tensor_compile_key(dv_bshd),
         use_dkv_postprocess,
-        num_q_groups,
-        _tensor_compile_key(bucketed_k2q_offsets),
-        _tensor_compile_key(bucketed_k2q_indices),
     )
     cache = bsa_sm100_blk128_bwd_bucketed_k2q_csr.compile_cache
     if compile_key not in cache:
