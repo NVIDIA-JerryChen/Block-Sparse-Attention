@@ -18,6 +18,11 @@ from . import quack_compat  # noqa: F401
 import quack.activation
 
 _MIXER_ATTRS = ("__vec_size__",)
+_NVVM_FMAX_POSITIONAL_ARGS = sum(
+    1
+    for param in inspect.signature(nvvm.fmax).parameters.values()
+    if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD)
+)
 
 # Obtained from sollya:
 # fpminimax(exp(x * log(2.0)), 1, [|1,24...|],[0;1],relative);
@@ -208,10 +213,7 @@ def warp_reduce(
 def fmax(
     a: float | Float32, b: float | Float32, c: float | Float32 | None = None, *, loc=None, ip=None
 ) -> Float32:
-    from cutlass import CUDA_VERSION
-
-    # * NVVM call based on nvvm version
-    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
+    if const_expr(_NVVM_FMAX_POSITIONAL_ARGS >= 3):
         # Old API: requires explicit result type as first positional argument
         return Float32(
             nvvm.fmax(

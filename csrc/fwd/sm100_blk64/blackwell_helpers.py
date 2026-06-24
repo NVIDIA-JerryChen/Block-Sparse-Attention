@@ -17,7 +17,7 @@ from csrc.fwd.sm100_blk128.blackwell_helpers import (
 
 @cute.jit
 def mbar_arrive_and_wait(mbar_smem_addr: Int32, phase: Int32) -> None:
-    """CTA-scope SMEM mbarrier arrive+wait with a modest polling timeout."""
+    """CTA-scope SMEM mbarrier arrive+wait with a long wait timeout."""
     llvm.inline_asm(
         None,
         [
@@ -28,7 +28,7 @@ def mbar_arrive_and_wait(mbar_smem_addr: Int32, phase: Int32) -> None:
         ".reg .pred p;\n\t"
         "mbarrier.arrive.shared::cta.b64 _, [$0];\n\t"
         "LAB_WAIT:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64 p, [$0], $1, 16;\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64 p, [$0], $1, 0x989680;\n\t"
         "@p bra.uni DONE;\n\t"
         "bra.uni LAB_WAIT;\n\t"
         "DONE:\n\t"
@@ -42,7 +42,7 @@ def mbar_arrive_and_wait(mbar_smem_addr: Int32, phase: Int32) -> None:
 
 @cute.jit
 def mbar_wait(mbar_smem_addr: Int32, phase: Int32) -> None:
-    """CTA-scope SMEM mbarrier wait with a modest polling timeout."""
+    """CTA-scope SMEM mbarrier wait with a long wait timeout."""
     llvm.inline_asm(
         None,
         [
@@ -52,7 +52,7 @@ def mbar_wait(mbar_smem_addr: Int32, phase: Int32) -> None:
         "{\n\t"
         ".reg .pred p;\n\t"
         "LAB_WAIT:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64 p, [$0], $1, 16;\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64 p, [$0], $1, 0x989680;\n\t"
         "@p bra.uni DONE;\n\t"
         "bra.uni LAB_WAIT;\n\t"
         "DONE:\n\t"
@@ -238,24 +238,43 @@ def shr_u32(x: Uint32, shift: Uint32) -> Uint32:
 
 
 @cute.jit
-def mask_f32_by_u32_bit(x: Float32, mask: Uint32, bit: int) -> Float32:
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(x).ir_value(), Uint32(mask).ir_value()],
-            "{\n\t"
-            ".reg .pred p;\n\t"
-            ".reg .u32 tmp;\n\t"
-            f"and.b32 tmp, $2, {hex(1 << bit)};\n\t"
-            "setp.eq.u32 p, tmp, 0;\n\t"
-            "@p mov.f32 $0, 0fFF800000;\n\t"
-            "}\n",
-            "=f,0,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
+def mask_f32x32_by_u32_branch(
+    acc_s: cute.Tensor, mask: Uint32, base: cutlass.Constexpr[int]
+) -> Tuple[Float32, ...]:
+    mask_ops = "\n\t".join(
+        f"and.b32 tmp, $64, {hex(1 << i)};\n\t"
+        "setp.eq.u32 p, tmp, 0;\n\t"
+        f"@p mov.f32 ${i}, neg_inf;"
+        for i in range(32)
     )
+    zero_ops = "\n\t".join(f"mov.f32 ${i}, neg_inf;" for i in range(32))
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 32),
+        [Float32(acc_s[base + i]).ir_value() for i in range(32)]
+        + [Uint32(mask).ir_value()],
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        ".reg .pred full;\n\t"
+        ".reg .pred zero;\n\t"
+        ".reg .u32 tmp;\n\t"
+        ".reg .f32 neg_inf;\n\t"
+        "setp.eq.u32 full, $64, 0xffffffff;\n\t"
+        "@full bra.uni MASK_DONE;\n\t"
+        "mov.f32 neg_inf, 0fFF800000;\n\t"
+        "setp.eq.u32 zero, $64, 0;\n\t"
+        "@!zero bra.uni MASK_PARTIAL;\n\t"
+        f"{zero_ops}\n\t"
+        "bra.uni MASK_DONE;\n\t"
+        "MASK_PARTIAL:\n\t"
+        f"{mask_ops}\n\t"
+        "MASK_DONE:\n\t"
+        "}\n",
+        ",".join(["=f"] * 32 + [str(i) for i in range(32)] + ["r"]),
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(Float32(llvm.extractvalue(T.f32(), out, [i])) for i in range(32))
 
 
 @cute.jit
@@ -264,9 +283,10 @@ def apply_block_size_mask_64(acc_s: cute.Tensor, block_size: Int32) -> None:
         for s in cutlass.range_constexpr(2):
             shift = cutlass.max((s + 1) * 32 - block_size, 0)
             mask = shr_u32(Uint32(0xFFFFFFFF), Uint32(shift))
+            vals = mask_f32x32_by_u32_branch(acc_s, mask, s * 32)
             for i in cutlass.range_constexpr(32):
                 idx = s * 32 + i
-                acc_s[idx] = mask_f32_by_u32_bit(acc_s[idx], mask, i)
+                acc_s[idx] = vals[i]
 
 
 @cute.jit

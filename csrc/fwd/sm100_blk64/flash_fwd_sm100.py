@@ -87,10 +87,8 @@ class FlashAttentionForwardSm100Blk64:
         self.output_cols = 128
         self.kv_elems_per_stage = self.n_block_size * self.kv_mma_k
         self.q_stage = 1
+        self.use_ws_qk_mma = True
         self.use_ws_pv_mma = True
-        assert hasattr(sm100_utils_basic, "make_ws_trivial_tiled_mma"), (
-            "blk64 CuTeDSL fwd requires official WS QK MMA support"
-        )
         self.use_raw_ws_epilogue = True
         self.use_ws_pair_combine = True
         self.use_2cta_instrs = use_2cta_instrs
@@ -397,11 +395,15 @@ class FlashAttentionForwardSm100Blk64:
         # the intermediate tensor p is from tmem & mK-major
         p_source = tcgen05.OperandSource.TMEM
         p_major_mode = cute.nvgpu.OperandMajorMode.K
-        tiled_mma_qk = sm100_utils_basic.make_ws_trivial_tiled_mma(
+        # CUTLASS DSL 4.6 exposes the normal tcgen05 tiled-MMA builder but not
+        # a Python helper for tcgen05.mma.ws. Use this object for CuTe fragment
+        # partitioning and issue the WS instruction in ws_qk_gemm below.
+        tiled_mma_qk = sm100_utils_basic.make_trivial_tiled_mma(
             self.q_dtype,
             q_major_mode,
             k_major_mode,
             self.qk_acc_dtype,
+            cta_group,
             self.mma_tiler_qk[:2],
         )
         tiled_mma_pv = sm100_utils_basic.make_trivial_tiled_mma(
@@ -1372,11 +1374,13 @@ class FlashAttentionForwardSm100Blk64:
         tOrV = tiled_mma_pv.make_fragment_B(sV)
         # q_stage=1: both stages use the same Q (intra-warp overlap across n_blocks)
         tSrQ0 = tSrQ[None, None, None, 0]
+        sQ0 = sQ[None, None, None, 0]
         tStS0 = tStS[None, None, None, 0]
         tStS1 = tStS[None, None, None, 1]
         tOrP0 = tOrP[None, None, None, 0]
         tOrP1 = tOrP[None, None, None, 1]
 
+        qk_mma_op = tiled_mma_qk.op
         pv_mma_op = tiled_mma_pv.op
 
         mma_q_consumer_phase = Int32(0)
@@ -1426,7 +1430,9 @@ class FlashAttentionForwardSm100Blk64:
                 sK_cur = sK[None, None, None, Ki_index]
                 if const_expr(self.uneven_kv_smem):
                     sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
-                self.ws_qk_gemm(tiled_mma_qk, tStS0, tSrQ0, tSrK[None, None, None, Ki_index])
+                self.ws_qk_gemm(
+                    qk_mma_op, 0, tSrQ0, tSrK[None, None, None, Ki_index], sQ0, sK_cur
+                )
                 pipeline_s_p_o.producer_commit_w_index(0)  # signal S0 ready
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 mma_kv_consumer_state.advance()
@@ -1441,7 +1447,9 @@ class FlashAttentionForwardSm100Blk64:
                 sK_cur = sK[None, None, None, Ki_index]
                 if const_expr(self.uneven_kv_smem):
                     sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
-                self.ws_qk_gemm(tiled_mma_qk, tStS1, tSrQ0, tSrK[None, None, None, Ki_index])
+                self.ws_qk_gemm(
+                    qk_mma_op, 1, tSrQ0, tSrK[None, None, None, Ki_index], sQ0, sK_cur
+                )
                 pipeline_s_p_o.producer_commit_w_index(1)  # signal S1 ready
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 mma_kv_consumer_state.advance()
@@ -1473,6 +1481,7 @@ class FlashAttentionForwardSm100Blk64:
                             spo_empty_mbar = spo_empty_mbar1
                             tStS_stage = tStS1
                             tOrP_stage = tOrP1
+                        sm100_utils.mbar_wait(spo_empty_mbar, phase_cur)
                         # Wait V
                         sm100_utils.mbar_wait(
                             Int32(pipeline_kv.sync_object_full.get_barrier(mma_kv_consumer_state.index).toint()),
@@ -1496,7 +1505,6 @@ class FlashAttentionForwardSm100Blk64:
                         sK_cur = sK[None, None, None, Ki_index]
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
-                        sm100_utils.mbar_wait(spo_empty_mbar, phase_cur)
                         self.ws_pv_gemm(
                             pv_mma_op,
                             stage,
@@ -1507,7 +1515,14 @@ class FlashAttentionForwardSm100Blk64:
                             phase_cur,
                             pipeline_p_lastsplit,
                         )
-                        self.ws_qk_gemm(tiled_mma_qk, tStS_stage, tSrQ0, tSrK[None, None, None, Ki_index])
+                        self.ws_qk_gemm(
+                            qk_mma_op,
+                            stage,
+                            tSrQ0,
+                            tSrK[None, None, None, Ki_index],
+                            sQ0,
+                            sK_cur,
+                        )
                         pipeline_s_p_o.producer_commit_w_index(stage)
                         if const_expr(stage == 0):
                             phase_s0 ^= 1
@@ -1533,6 +1548,7 @@ class FlashAttentionForwardSm100Blk64:
                         epi_s, epi_p, epi_zi = 1, phase_s1, not O_acc_s1
                         spo_empty_mbar = spo_empty_mbar1
                         tOrP_epi = tOrP1
+                    sm100_utils.mbar_wait(spo_empty_mbar, epi_p)
                     sm100_utils.mbar_wait(
                         Int32(pipeline_kv.sync_object_full.get_barrier(mma_kv_consumer_state.index).toint()),
                         mma_kv_consumer_state.phase,
@@ -1543,7 +1559,6 @@ class FlashAttentionForwardSm100Blk64:
                     sV_cur = sV[None, None, None, Vi_index]
                     if const_expr(self.uneven_kv_smem):
                         sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
-                    sm100_utils.mbar_wait(spo_empty_mbar, epi_p)
                     self.ws_pv_gemm(
                         pv_mma_op,
                         epi_stage_constexpr,
@@ -1606,12 +1621,24 @@ class FlashAttentionForwardSm100Blk64:
     @cute.jit
     def ws_qk_gemm(
         self,
-        tiled_mma_qk: cute.TiledMma,
-        tCtS: cute.Tensor,
+        qk_mma_op: cute.nvgpu.tcgen05.mma.MmaOp,
+        stage: int,
         tCrQ: cute.Tensor,
         tCrK: cute.Tensor,
-    ):
-        cute.gemm(tiled_mma_qk, tCtS, tCrQ, tCrK, tCtS)
+        sQ: cute.Tensor,
+        sK: cute.Tensor,
+    ) -> None:
+        sm100_utils.gemm_ptx_partial(
+            qk_mma_op,
+            self.tmem_s_offset[stage],
+            tCrQ,
+            tCrK,
+            sA=sQ,
+            sB=sK,
+            zero_init=True,
+            cta_group=self.cta_group_size,
+            use_ws=self.use_ws_qk_mma,
+        )
 
     # for both softmax0 and softmax1 warp group
     @cute.jit

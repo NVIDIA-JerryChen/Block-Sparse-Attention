@@ -858,6 +858,27 @@ def choose_blk64_use_clc(
     return enough_tiles and light_tile
 
 
+def choose_blk64_cutedsl_use_clc(
+    q: torch.Tensor,
+    block_sparse_num: int,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    layout: str = "bhsd",
+) -> bool:
+    """Select the measured-fastest scheduler for the blk64 CuTeDSL backend."""
+    if q2k_block_nums is not None and q2k_block_nums.numel() > 0:
+        return True
+
+    if layout == "bshd":
+        batch, seqlen_q, h, _ = q.shape
+    else:
+        assert layout == "bhsd", f"layout must be 'bhsd' or 'bshd', got {layout!r}"
+        batch, h, seqlen_q, _ = q.shape
+
+    num_m_blocks = (seqlen_q + 63) // 64
+    total_tiles = batch * h * num_m_blocks
+    return num_m_blocks >= 128 and total_tiles >= 512
+
+
 def bsa_attn_fwd_blk64(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1154,7 +1175,7 @@ def bsa_attn_fwd_blk64_cutedsl(
     tile_n = 256
     use_2cta_instrs = False
     if use_clc is None:
-        use_clc_scheduler = choose_blk64_use_clc(
+        use_clc_scheduler = choose_blk64_cutedsl_use_clc(
             q_bhsd,
             uniform_block_sparse_num,
             q2k_block_nums if has_variable_block_nums else None,
