@@ -233,6 +233,7 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
     is_blk64 = (blk_m == 64 and blk_n == 64)
     arch_major = torch.cuda.get_device_capability()[0]
     is_sm90_blk64 = is_blk64 and arch_major == 9
+    is_sm120_blk64 = is_blk64 and arch_major == 12
 
     # blk64 constraints: skip unsupported configurations
     if is_blk64:
@@ -241,6 +242,11 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
                 pytest.skip("SM90 blk64 supports d in {64, 96, 128}")
             if dtype not in (torch.bfloat16, torch.float16):
                 pytest.skip("SM90 blk64 supports bf16/fp16")
+        elif is_sm120_blk64:
+            if d != 128:
+                pytest.skip("SM120 blk64 requires d=128")
+            if dtype not in (torch.bfloat16, torch.float16):
+                pytest.skip("SM120 blk64 supports bf16/fp16")
         else:
             if not HAS_BLK64:
                 pytest.skip("bsa_fwd_blk64_ext not built")
@@ -261,6 +267,7 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
         qhead_per_kvhead > 1
         and (128 % qhead_per_kvhead == 0)
         and not is_sm90_blk64
+        and not is_sm120_blk64
     )
     nheads_q2k = nheads_kv if pack_gqa else nheads
     seqlen_q_q2k = seqlen_q * qhead_per_kvhead if pack_gqa else seqlen_q
@@ -331,7 +338,7 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
         q_bhsd = q.transpose(1, 2).contiguous()
         k_bhsd = k.transpose(1, 2).contiguous()
         v_bhsd = v.transpose(1, 2).contiguous()
-        if is_sm90_blk64:
+        if is_sm90_blk64 or is_sm120_blk64:
             out, lse = bsa_attn_fwd(
                 q,
                 k,
@@ -429,6 +436,8 @@ def test_flash_fwd_sm100(seqlen_q, seqlen_k, d, mha_type, dtype, use_variable_bl
         pytest.skip("SM90 fwd path is blk64 only")
     if arch_major == 9 and use_clc:
         pytest.skip("use_clc only affects SM100 blk64")
+    if arch_major == 12 and use_clc:
+        pytest.skip("use_clc only affects SM100 blk64")
     # use_clc only affects blk64; skip the duplicate blk128 case.
     if blk_n != 64 and use_clc:
         pytest.skip("use_clc only affects blk64")
@@ -457,6 +466,8 @@ def test_flash_fwd_sm100_no_block_sizes(seqlen_q, seqlen_k, dtype, use_variable_
         pytest.skip("SM90 fwd path is blk64 only")
     if arch_major == 9 and use_clc:
         pytest.skip("use_clc only affects SM100 blk64")
+    if arch_major == 12 and use_clc:
+        pytest.skip("use_clc only affects SM100 blk64")
     if blk_n != 64 and use_clc:
         pytest.skip("use_clc only affects blk64")
     batch_size = 2
@@ -466,6 +477,45 @@ def test_flash_fwd_sm100_no_block_sizes(seqlen_q, seqlen_k, dtype, use_variable_
                   use_variable_block_nums=use_variable_block_nums,
                   use_block_sizes=False,
                   blk_m=blk_m, blk_n=blk_n, use_clc=use_clc)
+
+
+def test_sm120_blk64_odd_topk_q_tail_block_sizes():
+    if torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("SM120-only coverage")
+
+    torch.manual_seed(2026)
+    bs, h, sq, sk, d = 1, 2, 96, 256, 128
+    blk = 64
+    device = "cuda"
+    dtype = torch.bfloat16
+    q = torch.randn(bs, h, sq, d, device=device, dtype=dtype)
+    k = torch.randn(bs, h, sk, d, device=device, dtype=dtype)
+    v = torch.randn(bs, h, sk, d, device=device, dtype=dtype)
+
+    qtiles = (sq + blk - 1) // blk
+    indices = torch.tensor([0, 2, 3], device=device, dtype=torch.int32)
+    q2k_block_index = indices.view(1, 1, 1, 3).expand(bs, h, qtiles, 3).contiguous()
+    q2k_block_nums = torch.empty(0, device=device, dtype=torch.int32)
+    block_sizes = torch.tensor([64, 64, 17, 64], device=device, dtype=torch.int32)
+
+    out, lse = bsa_attn_fwd_blk64(
+        q,
+        k,
+        v,
+        q2k_block_index,
+        block_sizes,
+        q2k_block_nums,
+        block_sparse_num=3,
+    )
+
+    cols = list(range(0, 64)) + list(range(128, 145)) + list(range(192, 256))
+    scale = 1.0 / math.sqrt(d)
+    scores = torch.matmul(q.float(), k[:, :, cols, :].float().transpose(-1, -2)) * scale
+    ref_out = torch.matmul(torch.softmax(scores, dim=-1), v[:, :, cols, :].float()).to(dtype)
+    ref_lse = torch.logsumexp(scores, dim=-1)
+
+    torch.testing.assert_close(out, ref_out, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(lse, ref_lse, rtol=2e-3, atol=2e-3)
 
 
 # ============== Quick test (make tt) ==============
