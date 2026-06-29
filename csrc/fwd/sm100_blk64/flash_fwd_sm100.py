@@ -1556,16 +1556,6 @@ class FlashAttentionForwardSm100Blk64:
                         if const_expr(self.uneven_kv_smem):
                             sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
                         mma_kv_consumer_state.advance()
-                        # Wait K
-                        sm100_utils.mbar_wait(
-                            Int32(pipeline_kv.sync_object_full.get_barrier(mma_kv_consumer_state.index).toint()),
-                            mma_kv_consumer_state.phase,
-                        )
-                        sm100_utils.tcgen05_fence_after_thread_sync()
-                        Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
-                        sK_cur = sK[None, None, None, Ki_index]
-                        if const_expr(self.uneven_kv_smem):
-                            sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
                         self.ws_pv_gemm(
                             pv_mma_op,
                             stage,
@@ -1576,6 +1566,17 @@ class FlashAttentionForwardSm100Blk64:
                             phase_cur,
                             pipeline_p_lastsplit,
                         )
+                        pipeline_kv.consumer_release(mma_kv_release_state)
+                        # Overlap the independent K wait with the preceding PV issue.
+                        sm100_utils.mbar_wait(
+                            Int32(pipeline_kv.sync_object_full.get_barrier(mma_kv_consumer_state.index).toint()),
+                            mma_kv_consumer_state.phase,
+                        )
+                        sm100_utils.tcgen05_fence_after_thread_sync()
+                        Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
+                        sK_cur = sK[None, None, None, Ki_index]
+                        if const_expr(self.uneven_kv_smem):
+                            sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
                         self.ws_qk_gemm(
                             qk_mma_op,
                             stage,
@@ -1591,8 +1592,6 @@ class FlashAttentionForwardSm100Blk64:
                         else:
                             phase_s1 ^= 1
                             O_acc_s1 = True
-                        # Release V and K
-                        pipeline_kv.consumer_release(mma_kv_release_state)
                         pipeline_kv.consumer_release(mma_kv_consumer_state)
                         mma_kv_consumer_state.advance()
 
