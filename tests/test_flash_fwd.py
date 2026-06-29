@@ -23,7 +23,12 @@ _BLK_SIZES = [int(x) for x in _BSA_BLK.split(",")]
 from utils.testing import attention_ref
 from utils.bench_utils import flops
 from utils.benchmark import benchmark_forward
-from bsa_attn_interface import bsa_attn_fwd, bsa_attn_fwd_blk64
+from bsa_attn_interface import (
+    _sm100_blk64_requires_int64_kv_strides,
+    bsa_attn_fwd,
+    bsa_attn_fwd_blk64,
+    bsa_attn_fwd_blk64_cutedsl,
+)
 
 # Optional: blk64 C++ AOT kernel (install via `make setup BLK=64`)
 try:
@@ -698,6 +703,117 @@ def test_sm100_blk64_kv_bucketed_matches_legacy():
         )
         torch.testing.assert_close(out, ref_out, rtol=3e-2, atol=3e-2)
         torch.testing.assert_close(lse, ref_lse, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] >= 10
+    ),
+    reason="SM100+ required",
+)
+def test_sm100_blk64_cutedsl_large_kv_batch_stride():
+    batch, heads, seqlen_q, seqlen_k, head_dim = 2, 1, 64, 512, 128
+    kv_batch_stride = 1 << 27
+    kv_head_stride = seqlen_k * head_dim
+    storage_elems = kv_batch_stride + kv_head_stride
+
+    q = torch.zeros(
+        (batch, heads, seqlen_q, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    storage = torch.zeros(storage_elems, device="cuda", dtype=torch.bfloat16)
+    kv_shape = (batch, heads, seqlen_k, head_dim)
+    kv_stride = (kv_batch_stride, kv_head_stride, head_dim, 1)
+    wide = torch.as_strided(storage, kv_shape, kv_stride)
+    compact = torch.zeros(kv_shape, device="cuda", dtype=torch.bfloat16)
+
+    num_kv_blocks = seqlen_k // 64
+    q2k_block_index = (
+        torch.arange(num_kv_blocks, device="cuda", dtype=torch.int32)
+        .view(1, 1, 1, num_kv_blocks)
+        .expand(batch, heads, seqlen_q // 64, num_kv_blocks)
+        .contiguous()
+    )
+    block_sizes = torch.full(
+        (num_kv_blocks,), 64, device="cuda", dtype=torch.int32
+    )
+
+    def run(k, v):
+        return bsa_attn_fwd_blk64_cutedsl(
+            q,
+            k,
+            v,
+            q2k_block_index,
+            block_sizes,
+            block_sparse_num=num_kv_blocks,
+            softmax_scale=1.0,
+            use_clc=False,
+            kv_splits=2,
+        )
+
+    # Verify the wide K stride with two analytically distinct softmaxes.
+    wide[1, :, seqlen_k // 2 :, 0] = 2.0
+    compact[:, :, seqlen_k // 2 :, :].fill_(1.0)
+    q[..., 0] = 1.0
+    out, lse = run(wide, compact)
+    expected_out = torch.tensor(
+        [0.5, math.exp(2.0) / (1.0 + math.exp(2.0))], device="cuda"
+    )
+    expected_lse = torch.tensor(
+        [
+            math.log(seqlen_k),
+            math.log((seqlen_k // 2) * (1.0 + math.exp(2.0))),
+        ],
+        device="cuda",
+    )
+    torch.testing.assert_close(
+        out.float(),
+        expected_out[:, None, None, None].expand_as(out),
+        rtol=0.0,
+        atol=1e-2,
+    )
+    torch.testing.assert_close(
+        lse, expected_lse[:, None, None].expand_as(lse), rtol=0.0, atol=2e-3
+    )
+
+    # Verify the wide V stride with uniform attention and batch-unique values.
+    wide[0].fill_(1.0)
+    wide[1].fill_(2.0)
+    compact.zero_()
+    q.zero_()
+    out, lse = run(compact, wide)
+    expected_out = torch.tensor([1.0, 2.0], device="cuda")
+    torch.testing.assert_close(
+        out.float(),
+        expected_out[:, None, None, None].expand_as(out),
+        rtol=0.0,
+        atol=1e-2,
+    )
+    torch.testing.assert_close(
+        lse, torch.full_like(lse, math.log(seqlen_k)), rtol=0.0, atol=2e-3
+    )
+
+
+def test_sm100_blk64_int64_kv_stride_selection():
+    def make_meta(batch, stride_b, stride_s=128):
+        return torch.empty_strided(
+            (batch, 1, 512, 128),
+            (stride_b, 512 * stride_s, stride_s, 1),
+            dtype=torch.bfloat16,
+            device="meta",
+        )
+
+    below_limit = make_meta(2, (1 << 27) - 1)
+    at_limit = make_meta(2, 1 << 27)
+    inactive_batch = make_meta(1, 1 << 27)
+    block_at_limit = make_meta(1, 1 << 30, stride_s=1 << 21)
+
+    assert not _sm100_blk64_requires_int64_kv_strides(below_limit, below_limit)
+    assert _sm100_blk64_requires_int64_kv_strides(at_limit, at_limit)
+    assert not _sm100_blk64_requires_int64_kv_strides(
+        inactive_batch, inactive_batch
+    )
+    assert _sm100_blk64_requires_int64_kv_strides(block_at_limit, block_at_limit)
 
 
 @pytest.mark.skipif(not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10),

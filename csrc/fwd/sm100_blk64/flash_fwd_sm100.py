@@ -65,6 +65,7 @@ class FlashAttentionForwardSm100Blk64:
         has_block_sizes: cutlass.Constexpr[bool] = True,
         num_splits: cutlass.Constexpr[int] = 1,
         use_raw_ws_epilogue: cutlass.Constexpr[bool] = True,
+        use_int64_kv_strides: cutlass.Constexpr[bool] = False,
     ):
         self.use_tma_KV = True
         # self.dtype = dtype
@@ -149,6 +150,7 @@ class FlashAttentionForwardSm100Blk64:
         self.is_split_kv = num_splits > 1
         self.allow_empty_block_nums = allow_empty_block_nums
         self.has_block_sizes = has_block_sizes
+        self.use_int64_kv_strides = use_int64_kv_strides
         self.is_causal = False
         self.is_local = False
         self.is_varlen_q = False
@@ -316,61 +318,110 @@ class FlashAttentionForwardSm100Blk64:
             if const_expr(mLSE is not None)
             else None
         )
-        # C++ blk64 K/V TMA loads operate on sparse 64-token blocks and two
-        # 64-wide dim halves.  Keep the same 6D logical views so the SMEM
-        # KWide/VWide layouts land exactly in the C++ interleaved slots.
+        # The fast rank-6 view matches the C++ sparse-block layout. CuTe DSL
+        # cannot lower an Int64 basis in that rank-6 TMA view, so layouts with
+        # large active strides use a rank-5 Int64 view and divide it into
+        # sparse blocks in the device kernel instead.
         k_dim_half = self.head_dim_padded // 2
-        k_stride_s = Int32(mK_seq.layout.stride[0])
-        k_stride_d = Int32(mK_seq.layout.stride[1])
-        k_stride_h = Int32(mK_seq.layout.stride[2])
-        k_stride_b = Int32(mK_seq.layout.stride[3])
-        mK = cute.make_tensor(
-            mK_seq.iterator,
-            cute.make_layout(
-                (
-                    self.sparse_block_size,
-                    k_dim_half,
-                    2,
-                    mK_seq.shape[2],
-                    cute.ceil_div(mK_seq.shape[0], self.sparse_block_size),
-                    mK_seq.shape[3],
-                ),
-                stride=(
-                    k_stride_s,
-                    k_stride_d,
-                    k_dim_half * k_stride_d,
-                    k_stride_h,
-                    self.sparse_block_size * k_stride_s,
-                    k_stride_b,
-                ),
-            ),
-        )
         v_dim_part = self.head_dim_v_padded // 2
-        v_stride_s = Int32(mV_seq.layout.stride[0])
-        v_stride_d = Int32(mV_seq.layout.stride[1])
-        v_stride_h = Int32(mV_seq.layout.stride[2])
-        v_stride_b = Int32(mV_seq.layout.stride[3])
-        mV = cute.make_tensor(
-            mV_seq.iterator,
-            cute.make_layout(
-                (
-                    v_dim_part,
-                    self.sparse_block_size,
-                    2,
-                    mV_seq.shape[2],
-                    cute.ceil_div(mV_seq.shape[0], self.sparse_block_size),
-                    mV_seq.shape[3],
+        if const_expr(self.use_int64_kv_strides):
+            k_stride_s = Int64(mK_seq.layout.stride[0])
+            k_stride_d = Int64(mK_seq.layout.stride[1])
+            k_stride_h = Int64(mK_seq.layout.stride[2])
+            k_stride_b = Int64(mK_seq.layout.stride[3])
+            mK = cute.make_tensor(
+                mK_seq.iterator,
+                cute.make_layout(
+                    (
+                        mK_seq.shape[0],
+                        k_dim_half,
+                        2,
+                        mK_seq.shape[2],
+                        mK_seq.shape[3],
+                    ),
+                    stride=(
+                        k_stride_s,
+                        k_stride_d,
+                        k_dim_half * k_stride_d,
+                        k_stride_h,
+                        k_stride_b,
+                    ),
                 ),
-                stride=(
-                    v_stride_d,
-                    v_stride_s,
-                    v_dim_part * v_stride_d,
-                    v_stride_h,
-                    self.sparse_block_size * v_stride_s,
-                    v_stride_b,
+            )
+            v_stride_s = Int64(mV_seq.layout.stride[0])
+            v_stride_d = Int64(mV_seq.layout.stride[1])
+            v_stride_h = Int64(mV_seq.layout.stride[2])
+            v_stride_b = Int64(mV_seq.layout.stride[3])
+            mV = cute.make_tensor(
+                mV_seq.iterator,
+                cute.make_layout(
+                    (
+                        v_dim_part,
+                        mV_seq.shape[0],
+                        2,
+                        mV_seq.shape[2],
+                        mV_seq.shape[3],
+                    ),
+                    stride=(
+                        v_stride_d,
+                        v_stride_s,
+                        v_dim_part * v_stride_d,
+                        v_stride_h,
+                        v_stride_b,
+                    ),
                 ),
-            ),
-        )
+            )
+        else:
+            k_stride_s = Int32(mK_seq.layout.stride[0])
+            k_stride_d = Int32(mK_seq.layout.stride[1])
+            k_stride_h = Int32(mK_seq.layout.stride[2])
+            k_stride_b = Int32(mK_seq.layout.stride[3])
+            mK = cute.make_tensor(
+                mK_seq.iterator,
+                cute.make_layout(
+                    (
+                        self.sparse_block_size,
+                        k_dim_half,
+                        2,
+                        mK_seq.shape[2],
+                        cute.ceil_div(mK_seq.shape[0], self.sparse_block_size),
+                        mK_seq.shape[3],
+                    ),
+                    stride=(
+                        k_stride_s,
+                        k_stride_d,
+                        k_dim_half * k_stride_d,
+                        k_stride_h,
+                        self.sparse_block_size * k_stride_s,
+                        k_stride_b,
+                    ),
+                ),
+            )
+            v_stride_s = Int32(mV_seq.layout.stride[0])
+            v_stride_d = Int32(mV_seq.layout.stride[1])
+            v_stride_h = Int32(mV_seq.layout.stride[2])
+            v_stride_b = Int32(mV_seq.layout.stride[3])
+            mV = cute.make_tensor(
+                mV_seq.iterator,
+                cute.make_layout(
+                    (
+                        v_dim_part,
+                        self.sparse_block_size,
+                        2,
+                        mV_seq.shape[2],
+                        cute.ceil_div(mV_seq.shape[0], self.sparse_block_size),
+                        mV_seq.shape[3],
+                    ),
+                    stride=(
+                        v_stride_d,
+                        v_stride_s,
+                        v_dim_part * v_stride_d,
+                        v_stride_h,
+                        self.sparse_block_size * v_stride_s,
+                        v_stride_b,
+                    ),
+                ),
+            )
 
         # check type consistency
         if const_expr(self.q_dtype != self.k_dtype):
@@ -714,8 +765,8 @@ class FlashAttentionForwardSm100Blk64:
     def kernel(
         self,
         mQ: cute.Tensor,  # (s_q, d, h, b)
-        mK: cute.Tensor,  # (s_k, d, h_k, b_k)
-        mV: cute.Tensor,  # (64_dim_part, 64_tok, 2_dim_halves, h_k, sparse_block, b_k)
+        mK: cute.Tensor,  # Rank-5 Int64 or rank-6 sparse-block view
+        mV: cute.Tensor,  # Rank-5 Int64 or rank-6 sparse-block view
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         tma_atom_Q: cute.CopyAtom,
@@ -1287,12 +1338,20 @@ class FlashAttentionForwardSm100Blk64:
             head_idx_kv = (
                 head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
             )
-            mK_cur = mK[None, None, None, head_idx_kv, None, batch_idx]
-            mV_cur = mV[None, None, None, head_idx_kv, None, batch_idx]
-            gK = mK_cur
-            gV = mV_cur
-            gK_tma = cute.group_modes(gK, 0, 3)
-            gV_tma = cute.group_modes(gV, 0, 3)
+            if const_expr(self.use_int64_kv_strides):
+                mK_cur = mK[None, None, None, head_idx_kv, batch_idx]
+                mV_cur = mV[None, None, None, head_idx_kv, batch_idx]
+                gK_tma = cute.zipped_divide(
+                    mK_cur, (self.sparse_block_size, self.head_dim_padded // 2, 2)
+                )
+                gV_tma = cute.zipped_divide(
+                    mV_cur, (self.head_dim_v_padded // 2, self.sparse_block_size, 2)
+                )
+            else:
+                mK_cur = mK[None, None, None, head_idx_kv, None, batch_idx]
+                mV_cur = mV[None, None, None, head_idx_kv, None, batch_idx]
+                gK_tma = cute.group_modes(mK_cur, 0, 3)
+                gV_tma = cute.group_modes(mV_cur, 0, 3)
             tile_block_indices_base = mBlockIndex[batch_idx, head_idx, m_block, None]
             tSgQ = thr_mma_qk.partition_A(gQ)
             load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(

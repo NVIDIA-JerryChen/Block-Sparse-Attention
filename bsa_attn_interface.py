@@ -223,6 +223,40 @@ def _validate_sm100_blk64_int32_bounds(
         _sm100_blk64_require_int32("q2k_block_nums.numel", q2k_block_nums.numel())
 
 
+def _sm100_blk64_requires_int64_kv_strides(
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> bool:
+    """Return whether the rank-6 Int32 TMA coordinate basis is unsafe."""
+    coord_stride_limit = 1 << 27
+    for tensor in (k, v):
+        batch, heads, seqlen_k, _ = tensor.shape
+        stride_b, stride_h, stride_s, stride_d = map(int, tensor.stride())
+        rank6_shape = (64, 64, 2, heads, (seqlen_k + 63) // 64, batch)
+        rank6_stride = (
+            stride_s,
+            stride_d,
+            64 * stride_d,
+            stride_h,
+            64 * stride_s,
+            stride_b,
+        )
+        if any(
+            stride < 0 or stride > _SM100_BLK64_INT32_MAX
+            for stride in rank6_stride
+        ):
+            return True
+        # Rank-6 to rank-5 TMA lowering groups sparse-block and batch bases.
+        # Its BF16 dynamic scale overflows when either active basis reaches 2^27.
+        block_stride = rank6_stride[4]
+        batch_stride = rank6_stride[5]
+        if rank6_shape[4] > 1 and block_stride >= coord_stride_limit:
+            return True
+        if rank6_shape[5] > 1 and batch_stride >= coord_stride_limit:
+            return True
+    return False
+
+
 def _tensor_compile_key(t: torch.Tensor):
     return (tuple(t.shape), tuple(t.stride()), t.dtype)
 
@@ -1252,6 +1286,7 @@ def bsa_attn_fwd_blk64_cutedsl(
         block_sizes,
         q2k_block_nums,
     )
+    use_int64_kv_strides = _sm100_blk64_requires_int64_kv_strides(k_bhsd, v_bhsd)
 
     if softmax_scale is None:
         softmax_scale = head_dim ** -0.5
@@ -1351,6 +1386,7 @@ def bsa_attn_fwd_blk64_cutedsl(
         is_persistent,
         use_clc_scheduler,
         input_layout,
+        use_int64_kv_strides,
     )
 
     if compile_key not in bsa_attn_fwd_blk64_cutedsl.compile_cache:
@@ -1383,6 +1419,7 @@ def bsa_attn_fwd_blk64_cutedsl(
             has_block_sizes=has_block_sizes,
             num_splits=kv_splits_i,
             use_raw_ws_epilogue=True,
+            use_int64_kv_strides=use_int64_kv_strides,
         )
 
         t0 = time.time()
