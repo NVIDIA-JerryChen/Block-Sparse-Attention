@@ -665,6 +665,252 @@ def _test_blk64_interface_layouts():
     print("  PASS default BHSD and explicit BSHD wrapper paths match")
 
 
+def _make_sm90_split_kv_variable_case():
+    """Create a compact variable-count case with only odd active top-k values."""
+    bs, h, sq, sk, d = 1, 2, 128, 768, 128
+    blk = 64
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    torch.manual_seed(2029)
+    q_bhsd = torch.randn(bs, h, sq, d, device=device, dtype=dtype)
+    k_bhsd = torch.randn(bs, h, sk, d, device=device, dtype=dtype)
+    v_bhsd = torch.randn(bs, h, sk, d, device=device, dtype=dtype)
+    q2k_block_index, q2k_block_nums, block_sizes = (
+        make_random_variable_block_sparse_args(
+            bs,
+            sq,
+            sk,
+            h,
+            blk_m=blk,
+            blk_n=blk,
+            device=device,
+        )
+    )
+
+    num_q_blocks = sq // blk
+    num_kv_blocks = sk // blk
+    max_topk = 7
+    q2k_block_nums.copy_(
+        torch.arange(1, max_topk + 1, 2, device=device, dtype=torch.int32).view(
+            bs, h, num_q_blocks
+        )
+    )
+    for head_idx in range(h):
+        for q_block_idx in range(num_q_blocks):
+            q2k_block_index[0, head_idx, q_block_idx] = torch.randperm(
+                num_kv_blocks, device=device, dtype=torch.int32
+            )
+    q2k_block_index = q2k_block_index[..., :max_topk].contiguous()
+    return q_bhsd, k_bhsd, v_bhsd, q2k_block_index, q2k_block_nums, block_sizes
+
+
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 9
+    ),
+    reason="SM90 required",
+)
+@pytest.mark.parametrize("kv_splits", [2, 4], ids=["splits2", "splits4"])
+def test_sm90_blk64_split_kv_variable_odd_topk(kv_splits):
+    inputs = _make_sm90_split_kv_variable_case()
+    q_bhsd, k_bhsd, v_bhsd, q2k_block_index, q2k_block_nums, block_sizes = inputs
+
+    ref_out, ref_lse = bsa_attn_fwd_blk64(
+        q_bhsd,
+        k_bhsd,
+        v_bhsd,
+        q2k_block_index,
+        block_sizes,
+        q2k_block_nums,
+        kv_splits=1,
+    )
+    out, lse = bsa_attn_fwd_blk64(
+        q_bhsd,
+        k_bhsd,
+        v_bhsd,
+        q2k_block_index,
+        block_sizes,
+        q2k_block_nums,
+        kv_splits=kv_splits,
+    )
+
+    torch.testing.assert_close(out, ref_out, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(lse, ref_lse, rtol=2e-3, atol=2e-3)
+
+    if kv_splits == 2:
+        out_bshd, lse_bshd = bsa_attn_fwd_blk64(
+            q_bhsd.transpose(1, 2).contiguous(),
+            k_bhsd.transpose(1, 2).contiguous(),
+            v_bhsd.transpose(1, 2).contiguous(),
+            q2k_block_index,
+            block_sizes,
+            q2k_block_nums,
+            layout="bshd",
+            kv_splits=kv_splits,
+        )
+        assert out_bshd.is_contiguous()
+        torch.testing.assert_close(
+            out_bshd.transpose(1, 2), out, rtol=0.0, atol=0.0
+        )
+        torch.testing.assert_close(lse_bshd, lse, rtol=0.0, atol=0.0)
+
+        empty_block_sizes = torch.empty(0, device="cuda", dtype=torch.int32)
+        ref_no_bs, ref_lse_no_bs = bsa_attn_fwd_blk64(
+            q_bhsd,
+            k_bhsd,
+            v_bhsd,
+            q2k_block_index,
+            empty_block_sizes,
+            q2k_block_nums,
+            kv_splits=1,
+        )
+        out_no_bs, lse_no_bs = bsa_attn_fwd_blk64(
+            q_bhsd,
+            k_bhsd,
+            v_bhsd,
+            q2k_block_index,
+            empty_block_sizes,
+            q2k_block_nums,
+            kv_splits=kv_splits,
+        )
+        torch.testing.assert_close(out_no_bs, ref_no_bs, rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(
+            lse_no_bs, ref_lse_no_bs, rtol=2e-3, atol=2e-3
+        )
+
+
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 9
+    ),
+    reason="SM90 required",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_sm90_blk64_split_kv_gqa(dtype):
+    bs, q_heads, kv_heads, sq, sk = 2, 4, 2, 128, 512
+    qk_dim, value_dim = 64, 128
+    num_q_blocks = sq // 64
+    num_kv_blocks = sk // 64
+    topk = 5
+    device = "cuda"
+
+    torch.manual_seed(2031)
+    q = torch.randn(
+        bs, q_heads, sq, qk_dim, device=device, dtype=dtype
+    )
+    k = torch.randn(
+        bs, kv_heads, sk, qk_dim, device=device, dtype=dtype
+    )
+    v = torch.randn(
+        bs, kv_heads, sk, value_dim, device=device, dtype=dtype
+    )
+    q2k_block_index = torch.empty(
+        bs,
+        q_heads,
+        num_q_blocks,
+        topk,
+        device=device,
+        dtype=torch.int32,
+    )
+    for batch_idx in range(bs):
+        for head_idx in range(q_heads):
+            for q_block_idx in range(num_q_blocks):
+                q2k_block_index[batch_idx, head_idx, q_block_idx] = torch.randperm(
+                    num_kv_blocks, device=device, dtype=torch.int32
+                )[:topk]
+    q2k_block_nums = torch.full(
+        (bs, q_heads, num_q_blocks),
+        topk,
+        device=device,
+        dtype=torch.int32,
+    )
+    block_sizes = torch.full(
+        (num_kv_blocks,), 64, device=device, dtype=torch.int32
+    )
+
+    ref_out, ref_lse = bsa_attn_fwd_blk64(
+        q, k, v, q2k_block_index, block_sizes, q2k_block_nums, kv_splits=1
+    )
+    out, lse = bsa_attn_fwd_blk64(
+        q, k, v, q2k_block_index, block_sizes, q2k_block_nums, kv_splits=2
+    )
+
+    torch.testing.assert_close(out, ref_out, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(lse, ref_lse, rtol=2e-3, atol=2e-3)
+
+    out_bshd, lse_bshd = bsa_attn_fwd_blk64(
+        q.transpose(1, 2).contiguous(),
+        k.transpose(1, 2).contiguous(),
+        v.transpose(1, 2).contiguous(),
+        q2k_block_index,
+        block_sizes,
+        q2k_block_nums,
+        layout="bshd",
+        kv_splits=2,
+    )
+    assert out_bshd.is_contiguous()
+    torch.testing.assert_close(
+        out_bshd.transpose(1, 2), out, rtol=0.0, atol=0.0
+    )
+    torch.testing.assert_close(lse_bshd, lse, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 9
+    ),
+    reason="SM90 required",
+)
+def test_sm90_blk64_split_kv_auto_api():
+    bs, h, sq, topk, d = 1, 2, 64, 256, 128
+    sk = topk * 64
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    torch.manual_seed(2030)
+    q_bhsd = torch.randn(bs, h, sq, d, device=device, dtype=dtype)
+    k_bhsd = torch.randn(bs, h, sk, d, device=device, dtype=dtype)
+    v_bhsd = torch.randn(bs, h, sk, d, device=device, dtype=dtype)
+    q2k_block_index, block_sparse_num, block_sizes = make_dense_block_sparse_args(
+        bs,
+        sq,
+        sk,
+        h,
+        blk_m=64,
+        blk_n=64,
+        device=device,
+    )
+    q2k_block_nums = torch.empty(0, device=device, dtype=torch.int32)
+
+    explicit_out, explicit_lse = bsa_attn_fwd_blk64(
+        q_bhsd,
+        k_bhsd,
+        v_bhsd,
+        q2k_block_index,
+        block_sizes,
+        q2k_block_nums,
+        kv_splits=2,
+        block_sparse_num=block_sparse_num,
+    )
+    auto_out, auto_lse = bsa_attn_fwd_blk64(
+        q_bhsd,
+        k_bhsd,
+        v_bhsd,
+        q2k_block_index,
+        block_sizes,
+        q2k_block_nums,
+        kv_splits="auto",
+        block_sparse_num=block_sparse_num,
+    )
+
+    torch.testing.assert_close(auto_out, explicit_out, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(auto_lse, explicit_lse, rtol=2e-3, atol=2e-3)
+
+
 def test_sm100_blk64_kv_bucketed_matches_legacy():
     arch_major = torch.cuda.get_device_capability()[0]
     if arch_major != 10:

@@ -340,6 +340,24 @@ def _sm100_blk64_auto_kv_splits(
     return max(1, min(int(splits), int(max_kv_splits), kv_blocks))
 
 
+def _sm90_blk64_auto_kv_splits(
+    q: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    fixed_block_sparse_num: int,
+    max_kv_splits: int = 16,
+) -> int:
+    """Apply the measured SM90 policy without changing SM100 auto tuning."""
+    splits = _sm100_blk64_auto_kv_splits(
+        q,
+        q2k_block_index,
+        fixed_block_sparse_num,
+        max_kv_splits,
+    )
+    # At this working-set size, a single-head SM90 launch already has enough
+    # Q tiles and does not amortize the combine kernel.
+    return 1 if splits == 2 and q.shape[1] == 1 else splits
+
+
 def _build_sm100_blk64_kv_split_offsets(
     q2k_block_nums: Optional[torch.Tensor],
     uniform_block_sparse_num: int,
@@ -349,7 +367,7 @@ def _build_sm100_blk64_kv_split_offsets(
     kv_splits: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Build split offsets matching csrc/fwd/sm100_blk64/bsa_kv_bucketed.cu."""
+    """Build 8-block-aligned split offsets for the blk64 forward kernels."""
     assert 1 <= kv_splits <= 256, "kv_splits must be in [1, 256]"
     if q2k_block_nums is not None and q2k_block_nums.numel() > 0:
         valid_kv = q2k_block_nums.to(torch.int32).contiguous().clamp_min(0)
@@ -361,34 +379,82 @@ def _build_sm100_blk64_kv_split_offsets(
             device=device,
         )
 
-    split_offsets = torch.empty(
-        (batch_size, num_heads, num_q_blocks, kv_splits + 1),
-        dtype=torch.int32,
+    split_ids = torch.arange(
+        kv_splits + 1,
+        dtype=torch.int64,
         device=device,
     )
-    avg_blocks = valid_kv // kv_splits
+    valid_kv_i64 = valid_kv.to(torch.int64)
+    avg_blocks = valid_kv_i64 // kv_splits
     aligned_base = (avg_blocks // 8) * 8
     use_even_split = aligned_base == 0
+    remainder = valid_kv_i64 - aligned_base * kv_splits
 
-    for split in range(kv_splits + 1):
-        even_offset = (valid_kv * split + kv_splits - 1) // kv_splits
-        split_offsets[..., split] = even_offset
+    even_offsets = (
+        valid_kv_i64[..., None] * split_ids + kv_splits - 1
+    ) // kv_splits
+    aligned_offsets = (
+        aligned_base[..., None] * split_ids
+        + torch.minimum(remainder[..., None], split_ids * 8)
+    )
+    aligned_offsets = torch.minimum(aligned_offsets, valid_kv_i64[..., None])
+    return torch.where(
+        use_even_split[..., None],
+        even_offsets,
+        aligned_offsets,
+    ).to(torch.int32).contiguous()
 
-    offset = torch.zeros_like(valid_kv)
-    remainder = valid_kv - aligned_base * kv_splits
-    split_offsets[..., 0] = 0
-    for split in range(kv_splits):
-        extra = torch.clamp(remainder, min=0, max=8)
-        count = aligned_base + extra
-        offset = torch.minimum(offset + count, valid_kv)
-        split_offsets[..., split + 1] = torch.where(
-            use_even_split,
-            split_offsets[..., split + 1],
-            offset,
-        )
-        remainder = remainder - extra
 
-    return split_offsets.contiguous()
+def _blk64_split_workspace_bytes(
+    q: torch.Tensor,
+    value_dim: int,
+    kv_splits: int,
+) -> int:
+    """Estimate live split-KV partial, combine-output, and offset storage."""
+    batch, num_heads, seqlen_q, _ = q.shape
+    num_q_blocks = _ceil_div_int(seqlen_q, 64)
+    rows = batch * num_heads * seqlen_q
+    partial_bytes = kv_splits * rows * (value_dim + 1) * 4
+    final_bytes = rows * (value_dim * q.element_size() + 4)
+    offset_bytes = batch * num_heads * num_q_blocks * (kv_splits + 1) * 4
+    return int(partial_bytes + final_bytes + offset_bytes)
+
+
+def _resolve_blk64_split_workspace(
+    q: torch.Tensor,
+    value_dim: int,
+    kv_splits: int,
+    allow_fallback: bool,
+) -> int:
+    """Fit split-KV workspace to currently available CUDA allocator capacity."""
+    kv_splits = int(kv_splits)
+    if kv_splits <= 1 or is_fake_mode() or not q.is_cuda:
+        return kv_splits
+
+    free_bytes, total_bytes = torch.cuda.mem_get_info(q.device)
+    reclaimable_bytes = max(
+        0,
+        torch.cuda.memory_reserved(q.device) - torch.cuda.memory_allocated(q.device),
+    )
+    reserve_bytes = max(512 << 20, int(total_bytes * 0.05))
+    budget_bytes = max(0, free_bytes + reclaimable_bytes - reserve_bytes)
+
+    candidate = kv_splits
+    while candidate > 1:
+        required_bytes = _blk64_split_workspace_bytes(q, value_dim, candidate)
+        if required_bytes <= budget_bytes:
+            return candidate
+        if not allow_fallback:
+            required_gib = required_bytes / (1 << 30)
+            budget_gib = budget_bytes / (1 << 30)
+            raise RuntimeError(
+                f"blk64 split-KV kv_splits={kv_splits} requires about "
+                f"{required_gib:.2f} GiB of live workspace, but only "
+                f"{budget_gib:.2f} GiB is available after the safety reserve; "
+                "lower kv_splits"
+            )
+        candidate //= 2
+    return 1
 
 
 def _infer_sm100_bwd_sparse_block_size(
@@ -468,6 +534,7 @@ def _bsa_attn_fwd_sm90_blk64(
     q2k_block_nums: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
+    kv_splits: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Launch the SM90 blk64 sparse forward kernel on BHSD tensors."""
     assert q.dtype in (torch.float16, torch.bfloat16), "SM90 blk64 fwd supports fp16/bf16"
@@ -482,6 +549,9 @@ def _bsa_attn_fwd_sm90_blk64(
     assert head_dim in (64, 96, 128), "SM90 blk64 fwd supports QK dim 64, 96, or 128"
     assert v.shape[-1] in (64, 96, 128), "SM90 blk64 fwd supports value dim 64, 96, or 128"
     assert q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
+    kv_splits = int(kv_splits)
+    assert 1 <= kv_splits <= 256, "kv_splits must be in [1, 256]"
+    is_split_kv = kv_splits > 1
     assert seqlen_q % SM90_FWD_BLOCK_SIZE == 0, (
         "SM90 blk64 fwd requires seqlen_q to be a multiple of 64"
     )
@@ -523,15 +593,39 @@ def _bsa_attn_fwd_sm90_blk64(
 
     if softmax_scale is None:
         softmax_scale = head_dim ** -0.5
-    if out is None:
+    if is_split_kv:
+        assert out is None, "SM90 split-KV writes FP32 partials before combine"
         out = torch.empty(
-            (batch, num_q_heads, seqlen_q, v.shape[-1]), dtype=q.dtype, device=q.device
+            (batch, kv_splits * num_q_heads, seqlen_q, v.shape[-1]),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        lse = torch.empty(
+            (batch, kv_splits * num_q_heads, seqlen_q),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        split_offsets = _build_sm100_blk64_kv_split_offsets(
+            q2k_block_nums,
+            0,
+            batch,
+            num_q_heads,
+            num_q_blocks,
+            kv_splits,
+            q.device,
         )
     else:
-        assert out.shape == (batch, num_q_heads, seqlen_q, v.shape[-1])
-        assert out.dtype == q.dtype and out.is_cuda
-
-    lse = torch.empty((batch, num_q_heads, seqlen_q), dtype=torch.float32, device=q.device)
+        if out is None:
+            out = torch.empty(
+                (batch, num_q_heads, seqlen_q, v.shape[-1]), dtype=q.dtype, device=q.device
+            )
+        else:
+            assert out.shape == (batch, num_q_heads, seqlen_q, v.shape[-1])
+            assert out.dtype == q.dtype and out.is_cuda
+        lse = torch.empty(
+            (batch, num_q_heads, seqlen_q), dtype=torch.float32, device=q.device
+        )
+        split_offsets = None
 
     q2k_block_index = q2k_block_index.contiguous()
 
@@ -542,6 +636,9 @@ def _bsa_attn_fwd_sm90_blk64(
     lse_t = lse.permute(2, 1, 0)
     q2k_t = q2k_block_index.permute(3, 2, 1, 0)
     q2k_nums_t = q2k_block_nums.permute(2, 1, 0)
+    split_offsets_t = (
+        split_offsets.permute(3, 2, 1, 0) if split_offsets is not None else None
+    )
     if has_block_sizes:
         block_sizes_t = block_sizes_bh.permute(2, 1, 0)
 
@@ -555,6 +652,11 @@ def _bsa_attn_fwd_sm90_blk64(
     block_sizes_cute = (
         from_dlpack(block_sizes_t.detach()) if has_block_sizes else q2k_nums_cute
     )
+    split_offsets_cute = (
+        from_dlpack(split_offsets_t.detach())
+        if split_offsets_t is not None
+        else q2k_nums_cute
+    )
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     fwd_kernel = BlockSparseAttnForwardSm90Blk64(
@@ -566,6 +668,7 @@ def _bsa_attn_fwd_sm90_blk64(
         dtype=torch2cute_dtype_map[q.dtype],
         acc_dtype=cutlass.Float32,
         has_block_sizes=has_block_sizes,
+        num_splits=kv_splits,
     )
 
     compile_key = (
@@ -584,6 +687,8 @@ def _bsa_attn_fwd_sm90_blk64(
         _tensor_compile_key(q2k_nums_t),
         has_block_sizes,
         _tensor_compile_key(block_sizes_t) if has_block_sizes else None,
+        kv_splits,
+        _tensor_compile_key(split_offsets_t) if split_offsets_t is not None else None,
     )
     args = (
         q_cute,
@@ -594,18 +699,21 @@ def _bsa_attn_fwd_sm90_blk64(
         q2k_cute,
         q2k_nums_cute,
         block_sizes_cute,
+        split_offsets_cute,
         softmax_scale,
         current_stream,
     )
     if compile_key not in bsa_attn_fwd.compile_cache:
         t0 = time.time()
         bsa_attn_fwd.compile_cache[compile_key] = cute.compile(fwd_kernel, *args)
-        print(f"Compiled sm90 blk64 fwd in {time.time() - t0:.1f}s")
+        print(f"Compiled SM90 blk64 fwd in {time.time() - t0:.1f}s")
 
     if not is_fake_mode():
         with torch.cuda.nvtx.range("bsa_attn_fwd_sm90_blk64_kernel"):
             bsa_attn_fwd.compile_cache[compile_key](*args)
 
+    if is_split_kv:
+        return _combine_blk64_kv_bucketed_partials(q, out, lse, kv_splits)
     return out, lse
 
 
@@ -774,7 +882,8 @@ def _combine_blk64_kv_bucketed_partials(
     kv_splits = int(kv_splits)
     assert 1 <= kv_splits <= 256, "kv_splits must be in [1, 256]"
 
-    batch, num_heads, seqlen_q, head_dim = q.shape
+    batch, num_heads, seqlen_q, _ = q.shape
+    head_dim = o_partial_phys.shape[-1]
     if o_partial_phys.dtype != torch.float32:
         raise TypeError("KV-bucketed blk64 fwd requires fp32 O partial")
 
@@ -1021,43 +1130,40 @@ def bsa_attn_fwd_blk64(
         use_clc: True forces the SM100 CLC persistent scheduler path, False
             forces the SingleTileScheduler path, and None (default) uses the
             interface's shape-based auto policy.
-        kv_splits: number of KV buckets per Q block on SM100. kv_splits=1 keeps
-            the legacy single-kernel fwd path; kv_splits>1 uses pre-schedule,
-            partial attention, and combine. Pass "auto" to choose splits from
-            the estimated K/V working set and device L2 cache size.
+        kv_splits: number of KV buckets per Q block on SM90/SM100, in [1, 256].
+            kv_splits=1 keeps the legacy single-kernel fwd path; kv_splits>1
+            uses FP32 partial attention workspace and a combine kernel. Pass
+            "auto" to select 1/2/4/8 splits at 256/450/900 KV blocks; SM90
+            keeps a single Q head unsplit in the 256--449 range. The SM100
+            split path does not use its CLC scheduler. Auto may lower the split
+            count to fit the available workspace; an explicit count reports
+            an error instead.
         block_sparse_num: fixed number of valid KV blocks per Q block when
             q2k_block_nums is empty. Defaults to q2k_block_index.shape[-1].
     """
-    assert q.dtype == torch.bfloat16, "blk64 requires bf16"
+    arch = _get_device_arch()
+    if arch // 10 == 9:
+        assert q.dtype in (torch.float16, torch.bfloat16), (
+            "SM90 blk64 requires fp16 or bf16"
+        )
+    else:
+        assert q.dtype == torch.bfloat16, "SM100 blk64 requires bf16"
     assert q.is_cuda and k.is_cuda and v.is_cuda
     assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
 
-    arch = _get_device_arch()
+    requested_use_clc = use_clc
     auto_kv_splits = isinstance(kv_splits, str)
     if auto_kv_splits:
         assert kv_splits == "auto", "kv_splits string value must be 'auto'"
         kv_splits_i = 1
     else:
         kv_splits_i = int(kv_splits)
-        assert kv_splits_i >= 1, "kv_splits must be >= 1"
+        assert 1 <= kv_splits_i <= 256, "kv_splits must be in [1, 256]"
     out_bshd = None
     if layout == "bshd":
-        if arch // 10 == 9:
-            out_bshd = torch.empty(
-                q.shape[0],
-                q.shape[1],
-                q.shape[2],
-                v.shape[-1],
-                dtype=q.dtype,
-                device=q.device,
-            )
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-        else:
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
     else:
         assert layout == "bhsd", f"layout must be 'bhsd' or 'bshd', got {layout!r}"
 
@@ -1080,7 +1186,6 @@ def bsa_attn_fwd_blk64(
         softmax_scale = q.size(3) ** -0.5
 
     if arch // 10 == 9:
-        assert kv_splits_i == 1, "kv_splits is only supported by the SM100 blk64 path"
         block_sizes_sm90 = None if block_sizes is None or block_sizes.numel() == 0 else block_sizes
         block_nums_sm90 = (
             None if q2k_block_nums is None or q2k_block_nums.numel() == 0 else q2k_block_nums
@@ -1092,6 +1197,22 @@ def bsa_attn_fwd_blk64(
             "block_sparse_num must be <= q2k_block_index.shape[-1]"
         )
         fixed_block_sparse_num = fixed_block_sparse_num if block_nums_sm90 is None else 0
+        if auto_kv_splits:
+            kv_splits_i = _sm90_blk64_auto_kv_splits(
+                q, q2k_block_index, fixed_block_sparse_num
+            )
+        kv_splits_i = _resolve_blk64_split_workspace(
+            q,
+            v.shape[-1],
+            kv_splits_i,
+            allow_fallback=auto_kv_splits,
+        )
+        if layout == "bshd" and kv_splits_i == 1:
+            out_bshd = torch.empty(
+                (q.shape[0], q.shape[2], q.shape[1], v.shape[-1]),
+                dtype=q.dtype,
+                device=q.device,
+            )
         out, lse = _bsa_attn_fwd_sm90_blk64(
             q,
             k,
@@ -1102,8 +1223,11 @@ def bsa_attn_fwd_blk64(
             q2k_block_nums=block_nums_sm90,
             softmax_scale=softmax_scale,
             out=out_bshd.transpose(1, 2) if out_bshd is not None else None,
+            kv_splits=kv_splits_i,
         )
-        return (out_bshd, lse) if out_bshd is not None else (out, lse)
+        if layout == "bshd":
+            return (out_bshd, lse) if out_bshd is not None else (out.transpose(1, 2), lse)
+        return out, lse
 
     if arch // 10 == 12:
         assert kv_splits_i == 1, "kv_splits is only supported by the SM100 blk64 path"
@@ -1163,11 +1287,19 @@ def bsa_attn_fwd_blk64(
         kv_splits_i = _sm100_blk64_auto_kv_splits(
             q, q2k_block_index, fixed_block_sparse_num
         )
+    kv_splits_i = _resolve_blk64_split_workspace(
+        q,
+        v.shape[-1],
+        kv_splits_i,
+        allow_fallback=auto_kv_splits,
+    )
     _validate_sm100_blk64_int32_bounds(
         q, k, v, q2k_block_index, fixed_block_sparse_num, block_sizes, q2k_block_nums
     )
     if kv_splits_i > 1:
-        kv_bucket_use_clc = False if auto_kv_splits else use_clc
+        if requested_use_clc is True:
+            raise ValueError("SM100 blk64 split-KV does not support use_clc=True")
+        kv_bucket_use_clc = False
         out, lse = _bsa_attn_fwd_blk64_kv_bucketed(
             q,
             k,
