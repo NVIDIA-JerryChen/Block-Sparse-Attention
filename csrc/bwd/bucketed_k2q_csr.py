@@ -1,4 +1,3 @@
-import time
 from typing import Optional, Tuple
 
 import cutlass
@@ -359,17 +358,11 @@ def build_bucketed_k2q_csr_cutedsl(
             has_variable_block_nums,
             max_kv_blocks,
         )
-        compile_start = time.perf_counter()
         build_bucketed_k2q_csr_cutedsl.compile_cache[compile_key] = cute.compile(
             kernel,
             *(_to_cute_tensor(tensor) for tensor in tensors),
             current_stream,
             options="--enable-tvm-ffi",
-        )
-        print(
-            "Compiled bucketed K-to-Q CSR CuTe DSL in "
-            f"{time.perf_counter() - compile_start:.1f}s",
-            flush=True,
         )
 
     if not is_fake_mode():

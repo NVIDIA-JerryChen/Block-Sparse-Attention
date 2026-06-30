@@ -14,19 +14,21 @@
 2. 确认**全部用例 PASS** 后再 commit
 3. 若修改了 `src/common/` 的共享组件，需运行**所有测试**都通过
 4. 新增功能必须有对应测试覆盖
-5. **如果单个 test case 或 demo 运行超过 30s，则认定为死锁**，死锁问题的解决见 skill: `AI/DEBUG_2CTA.md`
+5. **确认编译完成后**，如果单个 test case 或 demo 的 kernel launch 运行超过 30s，则认定为死锁，死锁问题的解决见 skill: `AI/DEBUG_2CTA.md`
 
 ## 开发测试规范
 
-- **编译计时**：每次 `cute.compile(...)` 后必须打印编译耗时，区分编译慢和 kernel 死锁：
+- **按需编译计时**：正常开发时无需为每次 `cute.compile(...)` 打印编译耗时。仅当 test case 或 demo 运行时间异常、疑似死锁时，才在调试代码中临时对编译阶段单独计时，以区分编译耗时和 kernel launch 卡住：
   ```python
   import time
+
   t0 = time.time()
   compiled = cute.compile(demo, ...)
   print(f"Compiled in {time.time() - t0:.1f}s")
-  compiled(...)  # If this times out, treat it as a deadlock.
+
+  compiled(...)  # If this exceeds 30s after compilation completes, treat it as a deadlock.
   ```
-- **超时 30s = 死锁**：kernel 运行超过 30s 认定为死锁，不是编译慢（编译通常 < 10s）
+- **超时 30s = 死锁**：先确认 `cute.compile(...)` 已返回；如果随后的 kernel launch 超过 30s，则认定为死锁。用于定位问题的编译计时和 `print` 仅限临时调试代码，不应提交。
 
 ## 文件组织规范
 
