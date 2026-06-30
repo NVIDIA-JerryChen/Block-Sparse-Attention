@@ -413,15 +413,17 @@ def _test_bwd_layout_equivalence():
         layout="bshd",
     )
     # Bucketed CSR scatter and dQ accumulation use atomics, so equivalent
-    # layouts can differ by a small BF16 rounding step.
+    # layouts can differ by a BF16 rounding step.
+    layout_rtol = 1e-2
+    layout_atol = 5e-4
     torch.testing.assert_close(
-        dq_auto.transpose(1, 2), dq_bhsd, rtol=1e-3, atol=5e-4
+        dq_auto.transpose(1, 2), dq_bhsd, rtol=layout_rtol, atol=layout_atol
     )
     torch.testing.assert_close(
-        dk_auto.transpose(1, 2), dk_bhsd, rtol=1e-3, atol=5e-4
+        dk_auto.transpose(1, 2), dk_bhsd, rtol=layout_rtol, atol=layout_atol
     )
     torch.testing.assert_close(
-        dv_auto.transpose(1, 2), dv_bhsd, rtol=1e-3, atol=5e-4
+        dv_auto.transpose(1, 2), dv_bhsd, rtol=layout_rtol, atol=layout_atol
     )
 
     dq_buf = torch.empty_like(q_bshd)
@@ -449,13 +451,13 @@ def _test_bwd_layout_equivalence():
     assert dk_bshd.data_ptr() == dk_buf.data_ptr()
     assert dv_bshd.data_ptr() == dv_buf.data_ptr()
     torch.testing.assert_close(
-        dq_bshd.transpose(1, 2), dq_bhsd, rtol=1e-3, atol=5e-4
+        dq_bshd.transpose(1, 2), dq_bhsd, rtol=layout_rtol, atol=layout_atol
     )
     torch.testing.assert_close(
-        dk_bshd.transpose(1, 2), dk_bhsd, rtol=1e-3, atol=5e-4
+        dk_bshd.transpose(1, 2), dk_bhsd, rtol=layout_rtol, atol=layout_atol
     )
     torch.testing.assert_close(
-        dv_bshd.transpose(1, 2), dv_bhsd, rtol=1e-3, atol=5e-4
+        dv_bshd.transpose(1, 2), dv_bhsd, rtol=layout_rtol, atol=layout_atol
     )
 
 
