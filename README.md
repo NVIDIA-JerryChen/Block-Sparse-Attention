@@ -12,6 +12,7 @@
 | pack_gqa | Yes | No | No |
 | Persistent scheduling | Static + CLC dynamic | Static | CLC dynamic (built-in) |
 | Variable block counts (`q2k_block_nums`) | Yes (>= 0) | Yes (>= 1) | Yes (>= 1) |
+| KV split (`kv_splits`) | No | Explicit / auto | Explicit / auto |
 | LSE output | Yes | Yes | Yes |
 
 **Backward backends:**
@@ -23,7 +24,10 @@
 | Attention | MHA only | MHA only |
 | Sparse task layout | bucketed k2q CSR | bucketed k2q CSR |
 
-**Not supported (current sparse kernels):** causal, local, mask_mod, score_mod, split-kv, paged_kv, softcap, varlen
+**Not supported (current sparse kernels):** causal, local, mask_mod, score_mod, paged_kv, softcap, varlen
+
+Split-KV is supported by the SM90/SM100 blk64 forward paths. The blk128 and
+backward paths do not support it.
 
 ## Directory Structure
 
@@ -59,6 +63,14 @@ BSA/
 │   │   └── flash_bwd_sm90.py             # Localized Hopper backward kernel
 │   └── sm100_blk64/                      # blk64 backward — SM100 CuTe DSL / JIT compiled
 │       └── flash_bwd_sm100.py            # Bucketed k2q CSR backward kernel
+│
+├── csrc/utils/                            # Shared CuTe DSL device/kernel helpers
+│   ├── kernel_utils.py                    # Math, layout, and tensor utilities
+│   ├── pipeline.py                        # TMA/UMMA pipeline helpers
+│   ├── tile_scheduler.py                  # Shared tile schedulers
+│   ├── block_sparse_tile_scheduler.py     # blk64 CLC persistent scheduler
+│   ├── softmax.py / pack_gqa.py           # Forward attention helpers
+│   └── ...
 │
 ├── utils/
 │   ├── cache_utils.py            # JIT compilation cache
@@ -99,13 +111,19 @@ make setup
 
 ```python
 import torch
-from bsa_attn_interface import bsa_attn_fwd, bsa_attn_bwd
+from bsa_attn_interface import bsa_attn_fwd, bsa_attn_fwd_blk64, bsa_attn_bwd
 
 q = torch.randn(1, 8, 1024, 128, device="cuda", dtype=torch.bfloat16)
 k = torch.randn(1, 8, 1024, 128, device="cuda", dtype=torch.bfloat16)
 v = torch.randn(1, 8, 1024, 128, device="cuda", dtype=torch.bfloat16)
 
 out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes)
+
+# Split long KV lists across partial forward kernels and combine their results.
+out, lse = bsa_attn_fwd_blk64(
+    q, k, v, q2k_block_index, block_sizes, q2k_block_nums,
+    kv_splits="auto", block_sparse_num=block_sparse_num,
+)
 
 # BSHD compatibility path. The wrapper canonicalizes to BHSD with view-only transposes.
 q_bshd = q.transpose(1, 2)
@@ -202,6 +220,27 @@ q2k_block_index = [0, 1, ..., N-1]  # for all Q blocks
 block_sparse_num = N                  # must be even, >= 2
 block_sizes = [tile_n] * N            # last block adjusted for seqlen remainder
 ```
+
+### `bsa_attn_fwd_blk64(..., kv_splits=1, ...)`
+
+The SM90 and SM100 blk64 forward paths can split each Q block's active KV list:
+
+- `kv_splits=1` uses the legacy single forward kernel without partial-output
+  workspace or a combine kernel.
+- `kv_splits=2..256` produces FP32 O/LSE partials for each split and combines
+  them into the requested output dtype. Partial workspace grows linearly with
+  `kv_splits`.
+- `kv_splits="auto"` selects 1, 2, 4, or 8 splits at KV block-count thresholds
+  256, 450, and 900. On SM90, the 256--449 range stays unsplit for a single Q
+  head. With fixed block counts, the policy uses `block_sparse_num`; otherwise
+  it uses `q2k_block_index.shape[-1]`. Auto lowers the split count if its
+  estimated workspace does not fit; explicit split counts report an error
+  instead.
+
+SM90 split-KV supports the same MHA/GQA/MQA and QK/V dimensions (64, 96, or
+128) as its single-kernel path. SM100 blk64 retains its existing shape
+constraints, and its split path does not use the CLC scheduler; auto split
+selection disables CLC for that path.
 
 ### `bsa_attn_bwd(dout, q, k, v, out, lse, q2k_block_index, block_sparse_num, block_sizes, ...)`
 

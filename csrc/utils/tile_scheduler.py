@@ -26,8 +26,8 @@ from cutlass.utils.hardware_info import HardwareInfo
 
 from quack.cute_dsl_utils import ParamsBase
 
-import csrc.common.fa_cute.utils as utils
-from csrc.common.fa_cute.fast_math import clz
+from csrc.utils import kernel_utils as utils
+from csrc.utils.fast_math import clz
 
 
 class SchedulingMode(IntEnum):
@@ -264,6 +264,9 @@ class SingleTileScheduler:
     def advance_to_next_work(self, *, loc=None, ip=None):
         self._is_first_block = False
         return self.get_current_work()
+
+    def consumer_advance(self, *, loc=None, ip=None):
+        return self.advance_to_next_work(loc=loc, ip=ip)
 
     def producer_tail(self, *, loc=None, ip=None):
         pass

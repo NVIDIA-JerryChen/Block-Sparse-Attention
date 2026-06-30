@@ -10,9 +10,9 @@ from cutlass import Float32, Int32
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
 
-from csrc.common.fa_cute.cute_dsl_utils import torch2cute_dtype_map
-from csrc.common.fa_cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
-from csrc.common.fa_cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
+from csrc.utils.cute_dsl_utils import torch2cute_dtype_map
+from csrc.utils.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
+from csrc.utils.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from utils.cache_utils import get_jit_cache
 from utils.testing import is_fake_mode
 
@@ -116,6 +116,32 @@ def _compile_bwd_preprocess(
     )
 
 
+def _bwd_preprocess_compile_key(
+    arch,
+    dtype,
+    head_dim,
+    head_dim_v,
+    m_block_size,
+    has_cuseqlens_q,
+    has_seqused_q,
+    has_dlse,
+    has_dq_accum,
+    use_padded_offsets,
+):
+    return (
+        int(arch),
+        dtype,
+        head_dim,
+        head_dim_v,
+        m_block_size,
+        has_cuseqlens_q,
+        has_seqused_q,
+        has_dlse,
+        has_dq_accum,
+        use_padded_offsets,
+    )
+
+
 def _bwd_preprocess(
     out,
     dout,
@@ -134,7 +160,8 @@ def _bwd_preprocess(
 ):
     """Compute dPsum/LSE log2 and optionally zero dQaccum."""
     is_varlen = cu_seqlens_q is not None
-    compile_key = (
+    compile_key = _bwd_preprocess_compile_key(
+        _get_device_arch(),
         dtype,
         head_dim,
         head_dim_v,
@@ -146,7 +173,9 @@ def _bwd_preprocess(
         use_padded_offsets,
     )
     if compile_key not in _bwd_preprocess.compile_cache:
-        _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
+        _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(
+            *compile_key[1:]
+        )
     if not is_fake_mode():
         _bwd_preprocess.compile_cache[compile_key](
             out, dout, dpsum, lse, lse_log2, dq_accum, cu_seqlens_q, seqused_q, dlse

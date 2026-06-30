@@ -46,6 +46,7 @@ from cutlass.pipeline import (
 )
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 
+from csrc.utils import quack_compat  # noqa: F401
 import quack.activation
 from quack import copy_utils, layout_utils
 from quack.cute_dsl_utils import ParamsBase
@@ -1063,9 +1064,6 @@ class BlockSparseAttnForwardSm100Blk128:
         clc_producer_state = cutlass_pipeline.make_pipeline_state(
             cutlass_pipeline.PipelineUserType.Producer, self.sched_stages
         )
-        clc_consumer_state = cutlass_pipeline.make_pipeline_state(
-            cutlass_pipeline.PipelineUserType.Consumer, self.sched_stages
-        )
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             clc_pipeline.producer_acquire(clc_producer_state)
@@ -1073,10 +1071,7 @@ class BlockSparseAttnForwardSm100Blk128:
             tile_scheduler.advance_to_next_work(mbarrier_addr=mbarrier_addr)
             clc_producer_state.advance()
 
-            clc_pipeline.consumer_wait(clc_consumer_state)
-            work_tile = tile_scheduler.get_current_work()
-            clc_pipeline.consumer_release(clc_consumer_state)
-            clc_consumer_state.advance()
+            work_tile = tile_scheduler.consumer_advance()
         clc_pipeline.producer_tail(clc_producer_state)
 
     @cute.jit
@@ -1086,15 +1081,9 @@ class BlockSparseAttnForwardSm100Blk128:
         tile_scheduler: "TileSchedulerProtocol",
     ):
         """Runs on empty warps (and non-leader CTA scheduler warp) — consumes CLC responses."""
-        clc_consumer_state = cutlass_pipeline.make_pipeline_state(
-            cutlass_pipeline.PipelineUserType.Consumer, self.sched_stages
-        )
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            clc_pipeline.consumer_wait(clc_consumer_state)
-            work_tile = tile_scheduler.get_current_work()
-            clc_pipeline.consumer_release(clc_consumer_state)
-            clc_consumer_state.advance()
+            work_tile = tile_scheduler.consumer_advance()
 
     @cute.jit
     def load(
@@ -4541,6 +4530,9 @@ class StaticPersistentTileScheduler:
 
     def consumer_advance(self, *, loc=None, ip=None):
         if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
+            # Match blk64 C++ ClcPersistentTileScheduler::consumer_advance:
+            # all warps must converge before consuming the next CLC response.
+            cute.arch.sync_threads()
             self._clc_pipeline.consumer_wait(self._clc_consumer_state)
             work_tile = self.get_current_work()
             self._clc_pipeline.consumer_release(self._clc_consumer_state)

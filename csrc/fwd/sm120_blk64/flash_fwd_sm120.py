@@ -9,7 +9,7 @@ import cutlass.utils.hopper_helpers as sm90_utils
 import cuda.bindings.driver as cuda
 from quack import layout_utils
 
-from csrc.common.fa_cute import utils as fa_utils
+from csrc.utils import kernel_utils as fa_utils
 
 
 SM120_FWD_BLOCK_SIZE = 64

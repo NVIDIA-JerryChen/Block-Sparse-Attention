@@ -69,7 +69,7 @@ def _compute_source_fingerprint() -> str:
     repo_root = Path(__file__).resolve().parents[1]
     source_roots = (
         repo_root / "utils",
-        repo_root / "csrc" / "common" / "fa_cute",
+        repo_root / "csrc" / "utils",
         repo_root / "csrc" / "fwd",
         repo_root / "csrc" / "bwd",
     )

@@ -2,7 +2,6 @@
 # BSA attention interface for SM90/SM100 block-sparse kernels.
 
 import math
-import time
 from functools import lru_cache
 from typing import Optional, Tuple
 
@@ -14,8 +13,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32
 from cutlass.cute.runtime import from_dlpack
-import triton
-import triton.language as tl
 from utils.cache_utils import get_jit_cache
 from utils.testing import is_fake_mode
 
@@ -35,6 +32,7 @@ try:
     from csrc.fwd.sm100_blk64.bsa_fwd_combine import FlashAttentionForwardCombine
 except ImportError:
     FlashAttentionForwardCombine = None
+from csrc.fwd.sm100_blk64.flash_fwd_sm100 import FlashAttentionForwardSm100Blk64
 from csrc.bwd.sm100_blk64.flash_bwd_sm100 import (
     BlockSparseAttnBackwardSm100Blk64,
     SM100_BWD_HEAD_DIM,
@@ -42,12 +40,30 @@ from csrc.bwd.sm100_blk64.flash_bwd_sm100 import (
     sm100_bwd_auto_bucketed_k2q_size_blocks,
     sm100_bwd_default_bucketed_k2q_size_blocks,
 )
-from csrc.bwd.sm100_blk128.flash_bwd_sm100 import (
-    SM100_BWD_HEAD_DIM as SM100_BLK128_BWD_HEAD_DIM,
-    SM100_BLK128_BWD_SPARSE_BLOCK_SIZE,
-    bsa_sm100_blk128_bwd_bucketed_k2q_csr,
-    sm100_blk128_bwd_default_bucketed_k2q_size_blocks,
-)
+try:
+    from csrc.bwd.sm100_blk128.flash_bwd_sm100 import (
+        SM100_BWD_HEAD_DIM as SM100_BLK128_BWD_HEAD_DIM,
+        SM100_BLK128_BWD_SPARSE_BLOCK_SIZE,
+        bsa_sm100_blk128_bwd_bucketed_k2q_csr,
+        sm100_blk128_bwd_default_bucketed_k2q_size_blocks,
+    )
+    _SM100_BLK128_BWD_IMPORT_ERROR = None
+except ImportError as exc:
+    _SM100_BLK128_BWD_IMPORT_ERROR = exc
+    SM100_BLK128_BWD_HEAD_DIM = 128
+    SM100_BLK128_BWD_SPARSE_BLOCK_SIZE = 128
+
+    def bsa_sm100_blk128_bwd_bucketed_k2q_csr(*args, **kwargs):
+        raise ImportError(
+            "SM100 blk128 backward is unavailable because its optional "
+            "CuTe dependencies failed to import."
+        ) from _SM100_BLK128_BWD_IMPORT_ERROR
+
+    def sm100_blk128_bwd_default_bucketed_k2q_size_blocks(*args, **kwargs):
+        raise ImportError(
+            "SM100 blk128 backward is unavailable because its optional "
+            "CuTe dependencies failed to import."
+        ) from _SM100_BLK128_BWD_IMPORT_ERROR
 from csrc.bwd.sm90_blk64.flash_bwd_sm90 import (
     BlockSparseAttnBackwardSm90Blk64,
     SM90_BWD_HEAD_DIM,
@@ -55,6 +71,7 @@ from csrc.bwd.sm90_blk64.flash_bwd_sm90 import (
     sm90_bwd_auto_bucketed_k2q_size_blocks,
     sm90_bwd_default_bucketed_k2q_size_blocks,
 )
+from csrc.bwd.bucketed_k2q_csr import build_bucketed_k2q_csr_cutedsl
 
 try:
     import bsa_fwd_blk64_ext  # triggers TORCH_LIBRARY registration of bsa_blk64.fwd
@@ -73,7 +90,7 @@ def maybe_contiguous(x):
 
 def _to_cute_tensor(
     t: torch.Tensor,
-    assumed_align: int = 16,
+    assumed_align: Optional[int] = 16,
     leading_dim: int = -1,
     fully_dynamic: bool = False,
     enable_tvm_ffi: bool = True,
@@ -119,6 +136,29 @@ def _to_sm90_bwd_cute_tensor(
         assumed_align=assumed_align,
         enable_tvm_ffi=enable_tvm_ffi,
     )
+
+
+def _workaround_cutlass_hash_import_bug():
+    """Avoid optional generated dialect imports that are broken in this environment."""
+    import importlib
+    import sys
+    import types
+
+    for suffix in ("arith", "dialect_proxy", "gpu", "lru_cache_ir", "op"):
+        canonical = f"cutlass._mlir_helpers.{suffix}"
+        alias = f"cutlass.base_dsl._mlir_helpers.{suffix}"
+        try:
+            sys.modules.setdefault(alias, importlib.import_module(canonical))
+        except Exception:
+            pass
+
+    for name in (
+        "cutlass._mlir.dialects._iket_ops_gen",
+        "cutlass._mlir.dialects._bitfield_ops_gen",
+        "cutlass._mlir.dialects._pyir_ops_gen",
+        "cutlass._mlir.dialects._ub_ops_gen",
+    ):
+        sys.modules.setdefault(name, types.ModuleType(name))
 
 
 torch2cute_dtype_map = {
@@ -181,12 +221,95 @@ def _validate_sm100_blk64_int32_bounds(
         _sm100_blk64_require_int32("q2k_block_nums.numel", q2k_block_nums.numel())
 
 
-def _tensor_compile_key(t: torch.Tensor):
-    return (tuple(t.shape), tuple(t.stride()), t.dtype)
+def _sm100_blk64_requires_int64_kv_strides(
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> bool:
+    """Return whether the rank-6 Int32 TMA coordinate basis is unsafe."""
+    coord_stride_limit = 1 << 27
+    for tensor in (k, v):
+        batch, heads, seqlen_k, _ = tensor.shape
+        stride_b, stride_h, stride_s, stride_d = map(int, tensor.stride())
+        rank6_shape = (64, 64, 2, heads, (seqlen_k + 63) // 64, batch)
+        rank6_stride = (
+            stride_s,
+            stride_d,
+            64 * stride_d,
+            stride_h,
+            64 * stride_s,
+            stride_b,
+        )
+        if any(
+            stride < 0 or stride > _SM100_BLK64_INT32_MAX
+            for stride in rank6_stride
+        ):
+            return True
+        # Rank-6 to rank-5 TMA lowering groups sparse-block and batch bases.
+        # Its BF16 dynamic scale overflows when either active basis reaches 2^27.
+        block_stride = rank6_stride[4]
+        batch_stride = rank6_stride[5]
+        if rank6_shape[4] > 1 and block_stride >= coord_stride_limit:
+            return True
+        if rank6_shape[5] > 1 and batch_stride >= coord_stride_limit:
+            return True
+    return False
 
 
 def _tensor_layout_compile_key(t: torch.Tensor):
     return (tuple(t.dim_order()), tuple(s == 0 for s in t.stride()))
+
+
+def _tensor_dynamic_layout_compile_key(t: torch.Tensor, leading_dim: int = -1):
+    """Match the static rank/dtype/broadcast parts of mark_layout_dynamic()."""
+    if leading_dim == -1:
+        leading_dim = t.ndim - 1
+    return (
+        t.dtype,
+        t.ndim,
+        int(leading_dim),
+        int(t.stride(leading_dim)),
+        tuple(s == 0 for s in t.stride()),
+    )
+
+
+def _dynamic_tensors_compile_key(
+    namespace: str,
+    config: tuple,
+    tensors: tuple[Optional[torch.Tensor], ...],
+    leading_dims: Optional[tuple[int, ...]] = None,
+):
+    if leading_dims is None:
+        leading_dims = tuple(-1 for _ in tensors)
+    assert len(tensors) == len(leading_dims)
+    return (
+        namespace,
+        *config,
+        *(
+            _tensor_dynamic_layout_compile_key(tensor, leading_dim)
+            if tensor is not None
+            else None
+            for tensor, leading_dim in zip(tensors, leading_dims)
+        ),
+    )
+
+
+def _sm90_bwd_compile_key(
+    arch: int,
+    dtype: torch.dtype,
+    head_dim: int,
+    has_block_sizes: bool,
+    stages: tuple[int, int, int],
+    tensors: tuple[torch.Tensor, ...],
+):
+    return (
+        "sm90_bucketed_k2q",
+        int(arch),
+        dtype,
+        int(head_dim),
+        bool(has_block_sizes),
+        *stages,
+        *((tensor.dtype, _tensor_layout_compile_key(tensor)) for tensor in tensors),
+    )
 
 
 def _ceil_div_int(a: int, b: int) -> int:
@@ -200,6 +323,7 @@ def _ceil_log2_int(x: int) -> int:
 
 
 def _bsa_fwd_blk64_kv_bucketed_combine_compile_key(
+    arch: int,
     dtype,
     head_dim: int,
     combine_tile_m: int,
@@ -209,6 +333,7 @@ def _bsa_fwd_blk64_kv_bucketed_combine_compile_key(
     combine_stages: int,
 ):
     return (
+        int(arch),
         dtype,
         cutlass.Float32,
         int(head_dim),
@@ -262,6 +387,123 @@ def _sm100_blk64_auto_kv_splits(
     else:
         splits = 1
     return max(1, min(int(splits), int(max_kv_splits), kv_blocks))
+
+
+def _sm90_blk64_auto_kv_splits(
+    q: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    fixed_block_sparse_num: int,
+    max_kv_splits: int = 16,
+) -> int:
+    """Apply the measured SM90 policy without changing SM100 auto tuning."""
+    splits = _sm100_blk64_auto_kv_splits(
+        q,
+        q2k_block_index,
+        fixed_block_sparse_num,
+        max_kv_splits,
+    )
+    # At this working-set size, a single-head SM90 launch already has enough
+    # Q tiles and does not amortize the combine kernel.
+    return 1 if splits == 2 and q.shape[1] == 1 else splits
+
+
+def _build_sm100_blk64_kv_split_offsets(
+    q2k_block_nums: Optional[torch.Tensor],
+    uniform_block_sparse_num: int,
+    batch_size: int,
+    num_heads: int,
+    num_q_blocks: int,
+    kv_splits: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build 8-block-aligned split offsets for the blk64 forward kernels."""
+    assert 1 <= kv_splits <= 256, "kv_splits must be in [1, 256]"
+    if q2k_block_nums is not None and q2k_block_nums.numel() > 0:
+        valid_kv = q2k_block_nums.to(torch.int32).contiguous().clamp_min(0)
+    else:
+        valid_kv = torch.full(
+            (batch_size, num_heads, num_q_blocks),
+            int(uniform_block_sparse_num),
+            dtype=torch.int32,
+            device=device,
+        )
+
+    split_ids = torch.arange(
+        kv_splits + 1,
+        dtype=torch.int64,
+        device=device,
+    )
+    valid_kv_i64 = valid_kv.to(torch.int64)
+    avg_blocks = valid_kv_i64 // kv_splits
+    aligned_base = (avg_blocks // 8) * 8
+    use_even_split = aligned_base == 0
+    remainder = valid_kv_i64 - aligned_base * kv_splits
+
+    even_offsets = (
+        valid_kv_i64[..., None] * split_ids + kv_splits - 1
+    ) // kv_splits
+    aligned_offsets = (
+        aligned_base[..., None] * split_ids
+        + torch.minimum(remainder[..., None], split_ids * 8)
+    )
+    aligned_offsets = torch.minimum(aligned_offsets, valid_kv_i64[..., None])
+    return torch.where(
+        use_even_split[..., None],
+        even_offsets,
+        aligned_offsets,
+    ).to(torch.int32).contiguous()
+
+
+def _blk64_split_workspace_bytes(
+    q: torch.Tensor,
+    value_dim: int,
+    kv_splits: int,
+) -> int:
+    """Estimate live split-KV partial, combine-output, and offset storage."""
+    batch, num_heads, seqlen_q, _ = q.shape
+    num_q_blocks = _ceil_div_int(seqlen_q, 64)
+    rows = batch * num_heads * seqlen_q
+    partial_bytes = kv_splits * rows * (value_dim + 1) * 4
+    final_bytes = rows * (value_dim * q.element_size() + 4)
+    offset_bytes = batch * num_heads * num_q_blocks * (kv_splits + 1) * 4
+    return int(partial_bytes + final_bytes + offset_bytes)
+
+
+def _resolve_blk64_split_workspace(
+    q: torch.Tensor,
+    value_dim: int,
+    kv_splits: int,
+    allow_fallback: bool,
+) -> int:
+    """Fit split-KV workspace to currently available CUDA allocator capacity."""
+    kv_splits = int(kv_splits)
+    if kv_splits <= 1 or is_fake_mode() or not q.is_cuda:
+        return kv_splits
+
+    free_bytes, total_bytes = torch.cuda.mem_get_info(q.device)
+    reclaimable_bytes = max(
+        0,
+        torch.cuda.memory_reserved(q.device) - torch.cuda.memory_allocated(q.device),
+    )
+    reserve_bytes = max(512 << 20, int(total_bytes * 0.05))
+    budget_bytes = max(0, free_bytes + reclaimable_bytes - reserve_bytes)
+
+    candidate = kv_splits
+    while candidate > 1:
+        required_bytes = _blk64_split_workspace_bytes(q, value_dim, candidate)
+        if required_bytes <= budget_bytes:
+            return candidate
+        if not allow_fallback:
+            required_gib = required_bytes / (1 << 30)
+            budget_gib = budget_bytes / (1 << 30)
+            raise RuntimeError(
+                f"blk64 split-KV kv_splits={kv_splits} requires about "
+                f"{required_gib:.2f} GiB of live workspace, but only "
+                f"{budget_gib:.2f} GiB is available after the safety reserve; "
+                "lower kv_splits"
+            )
+        candidate //= 2
+    return 1
 
 
 def _infer_sm100_bwd_sparse_block_size(
@@ -341,6 +583,7 @@ def _bsa_attn_fwd_sm90_blk64(
     q2k_block_nums: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
+    kv_splits: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Launch the SM90 blk64 sparse forward kernel on BHSD tensors."""
     assert q.dtype in (torch.float16, torch.bfloat16), "SM90 blk64 fwd supports fp16/bf16"
@@ -355,6 +598,9 @@ def _bsa_attn_fwd_sm90_blk64(
     assert head_dim in (64, 96, 128), "SM90 blk64 fwd supports QK dim 64, 96, or 128"
     assert v.shape[-1] in (64, 96, 128), "SM90 blk64 fwd supports value dim 64, 96, or 128"
     assert q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
+    kv_splits = int(kv_splits)
+    assert 1 <= kv_splits <= 256, "kv_splits must be in [1, 256]"
+    is_split_kv = kv_splits > 1
     assert seqlen_q % SM90_FWD_BLOCK_SIZE == 0, (
         "SM90 blk64 fwd requires seqlen_q to be a multiple of 64"
     )
@@ -396,15 +642,39 @@ def _bsa_attn_fwd_sm90_blk64(
 
     if softmax_scale is None:
         softmax_scale = head_dim ** -0.5
-    if out is None:
+    if is_split_kv:
+        assert out is None, "SM90 split-KV writes FP32 partials before combine"
         out = torch.empty(
-            (batch, num_q_heads, seqlen_q, v.shape[-1]), dtype=q.dtype, device=q.device
+            (batch, kv_splits * num_q_heads, seqlen_q, v.shape[-1]),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        lse = torch.empty(
+            (batch, kv_splits * num_q_heads, seqlen_q),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        split_offsets = _build_sm100_blk64_kv_split_offsets(
+            q2k_block_nums,
+            0,
+            batch,
+            num_q_heads,
+            num_q_blocks,
+            kv_splits,
+            q.device,
         )
     else:
-        assert out.shape == (batch, num_q_heads, seqlen_q, v.shape[-1])
-        assert out.dtype == q.dtype and out.is_cuda
-
-    lse = torch.empty((batch, num_q_heads, seqlen_q), dtype=torch.float32, device=q.device)
+        if out is None:
+            out = torch.empty(
+                (batch, num_q_heads, seqlen_q, v.shape[-1]), dtype=q.dtype, device=q.device
+            )
+        else:
+            assert out.shape == (batch, num_q_heads, seqlen_q, v.shape[-1])
+            assert out.dtype == q.dtype and out.is_cuda
+        lse = torch.empty(
+            (batch, num_q_heads, seqlen_q), dtype=torch.float32, device=q.device
+        )
+        split_offsets = None
 
     q2k_block_index = q2k_block_index.contiguous()
 
@@ -415,18 +685,52 @@ def _bsa_attn_fwd_sm90_blk64(
     lse_t = lse.permute(2, 1, 0)
     q2k_t = q2k_block_index.permute(3, 2, 1, 0)
     q2k_nums_t = q2k_block_nums.permute(2, 1, 0)
+    split_offsets_t = (
+        split_offsets.permute(3, 2, 1, 0) if split_offsets is not None else None
+    )
     if has_block_sizes:
         block_sizes_t = block_sizes_bh.permute(2, 1, 0)
 
-    q_cute = from_dlpack(q_t.detach(), assumed_align=128)
-    k_cute = from_dlpack(k_t.detach(), assumed_align=128)
-    v_cute = from_dlpack(v_t.detach(), assumed_align=128)
-    out_cute = from_dlpack(out_t.detach(), assumed_align=128)
-    lse_cute = from_dlpack(lse_t.detach(), assumed_align=4)
-    q2k_cute = from_dlpack(q2k_t.detach())
-    q2k_nums_cute = from_dlpack(q2k_nums_t.detach())
+    q_cute = _to_cute_tensor(
+        q_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False
+    )
+    k_cute = _to_cute_tensor(
+        k_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False
+    )
+    v_cute = _to_cute_tensor(
+        v_t, assumed_align=128, leading_dim=0, enable_tvm_ffi=False
+    )
+    out_cute = _to_cute_tensor(
+        out_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False
+    )
+    lse_cute = _to_cute_tensor(
+        lse_t, assumed_align=4, leading_dim=0, enable_tvm_ffi=False
+    )
+    q2k_cute = _to_cute_tensor(
+        q2k_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False
+    )
+    q2k_nums_cute = _to_cute_tensor(
+        q2k_nums_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False
+    )
     block_sizes_cute = (
-        from_dlpack(block_sizes_t.detach()) if has_block_sizes else q2k_nums_cute
+        _to_cute_tensor(
+            block_sizes_t,
+            assumed_align=None,
+            leading_dim=0,
+            enable_tvm_ffi=False,
+        )
+        if has_block_sizes
+        else q2k_nums_cute
+    )
+    split_offsets_cute = (
+        _to_cute_tensor(
+            split_offsets_t,
+            assumed_align=None,
+            leading_dim=0,
+            enable_tvm_ffi=False,
+        )
+        if split_offsets_t is not None
+        else q2k_nums_cute
     )
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -439,24 +743,33 @@ def _bsa_attn_fwd_sm90_blk64(
         dtype=torch2cute_dtype_map[q.dtype],
         acc_dtype=cutlass.Float32,
         has_block_sizes=has_block_sizes,
+        num_splits=kv_splits,
     )
 
-    compile_key = (
-        "sm90_blk64",
-        q.dtype,
-        head_dim,
-        v.shape[-1],
-        gqa_ratio,
-        SM90_FWD_BLOCK_SIZE,
-        _tensor_compile_key(q_t),
-        _tensor_compile_key(k_t),
-        _tensor_compile_key(v_t),
-        _tensor_compile_key(out_t),
-        _tensor_compile_key(lse_t),
-        _tensor_compile_key(q2k_t),
-        _tensor_compile_key(q2k_nums_t),
-        has_block_sizes,
-        _tensor_compile_key(block_sizes_t) if has_block_sizes else None,
+    compile_key = _dynamic_tensors_compile_key(
+        "sm90_blk64_fwd",
+        (
+            _get_device_arch(),
+            q.dtype,
+            head_dim,
+            v.shape[-1],
+            gqa_ratio,
+            SM90_FWD_BLOCK_SIZE,
+            has_block_sizes,
+            kv_splits,
+        ),
+        (
+            q_t,
+            k_t,
+            v_t,
+            out_t,
+            lse_t,
+            q2k_t,
+            q2k_nums_t,
+            block_sizes_t if has_block_sizes else q2k_nums_t,
+            split_offsets_t if split_offsets_t is not None else q2k_nums_t,
+        ),
+        leading_dims=(1, 1, 0, 1, 0, 0, 0, 0, 0),
     )
     args = (
         q_cute,
@@ -467,18 +780,19 @@ def _bsa_attn_fwd_sm90_blk64(
         q2k_cute,
         q2k_nums_cute,
         block_sizes_cute,
+        split_offsets_cute,
         softmax_scale,
         current_stream,
     )
     if compile_key not in bsa_attn_fwd.compile_cache:
-        t0 = time.time()
         bsa_attn_fwd.compile_cache[compile_key] = cute.compile(fwd_kernel, *args)
-        print(f"Compiled sm90 blk64 fwd in {time.time() - t0:.1f}s")
 
     if not is_fake_mode():
         with torch.cuda.nvtx.range("bsa_attn_fwd_sm90_blk64_kernel"):
             bsa_attn_fwd.compile_cache[compile_key](*args)
 
+    if is_split_kv:
+        return _combine_blk64_kv_bucketed_partials(q, out, lse, kv_splits)
     return out, lse
 
 
@@ -620,9 +934,7 @@ def _bsa_attn_fwd_sm120_blk64(
         current_stream,
     )
     if compile_key not in bsa_attn_fwd.compile_cache:
-        t0 = time.time()
         bsa_attn_fwd.compile_cache[compile_key] = cute.compile(fwd_kernel, *args)
-        print(f"Compiled sm120 blk64 fwd in {time.time() - t0:.1f}s")
 
     if not is_fake_mode():
         with torch.cuda.nvtx.range("bsa_attn_fwd_sm120_blk64_kernel"):
@@ -631,42 +943,24 @@ def _bsa_attn_fwd_sm120_blk64(
     return out, lse
 
 
-def _bsa_attn_fwd_blk64_kv_bucketed(
+def _combine_blk64_kv_bucketed_partials(
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    q2k_block_index: torch.Tensor,
-    fixed_block_sparse_num: int,
-    block_sizes: torch.Tensor,
-    q2k_block_nums: torch.Tensor,
-    softmax_scale: float,
+    o_partial_phys: torch.Tensor,
+    lse_partial_phys: torch.Tensor,
     kv_splits: int,
-    use_clc: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Launch KV-bucketed SM100 blk64 fwd and combine partial outputs."""
+    """Combine KV-bucketed partial outputs using the shared CuTeDSL combine kernel."""
     if FlashAttentionForwardCombine is None:
         raise ImportError(
-            "FlashAttentionForwardCombine is unavailable. Ensure local fa_cute "
+            "FlashAttentionForwardCombine is unavailable. Ensure local CuTe "
             "helpers are importable."
         )
 
     kv_splits = int(kv_splits)
     assert 1 <= kv_splits <= 256, "kv_splits must be in [1, 256]"
 
-    o_partial_phys, lse_partial_phys, split_offsets = torch.ops.bsa_blk64.fwd_kv_bucketed(
-        q,
-        k,
-        v,
-        q2k_block_index,
-        fixed_block_sparse_num,
-        block_sizes,
-        softmax_scale,
-        q2k_block_nums,
-        kv_splits,
-        use_clc,
-    )
-
-    batch, num_heads, seqlen_q, head_dim = q.shape
+    batch, num_heads, seqlen_q, _ = q.shape
+    head_dim = o_partial_phys.shape[-1]
     if o_partial_phys.dtype != torch.float32:
         raise TypeError("KV-bucketed blk64 fwd requires fp32 O partial")
 
@@ -714,6 +1008,7 @@ def _bsa_attn_fwd_blk64_kv_bucketed(
         else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     )
     compile_key = _bsa_fwd_blk64_kv_bucketed_combine_compile_key(
+        _get_device_arch(),
         dtype,
         head_dim,
         combine_tile_m,
@@ -722,7 +1017,7 @@ def _bsa_attn_fwd_blk64_kv_bucketed(
         combine_num_threads,
         combine_stages,
     )
-    if compile_key not in _bsa_attn_fwd_blk64_kv_bucketed.compile_cache:
+    if compile_key not in _combine_blk64_kv_bucketed_partials.compile_cache:
         combine_kernel = FlashAttentionForwardCombine(
             dtype=dtype,
             head_dim=head_dim,
@@ -763,16 +1058,14 @@ def _bsa_attn_fwd_blk64_kv_bucketed(
             None,
             current_stream,
         )
-        t0 = time.time()
-        _bsa_attn_fwd_blk64_kv_bucketed.compile_cache[compile_key] = cute.compile(
+        _combine_blk64_kv_bucketed_partials.compile_cache[compile_key] = cute.compile(
             combine_kernel,
             *args,
             options="--enable-tvm-ffi",
         )
-        print(f"Compiled kv-bucketed fwd combine in {time.time() - t0:.1f}s")
 
     if not is_fake_mode():
-        _bsa_attn_fwd_blk64_kv_bucketed.compile_cache[compile_key](
+        _combine_blk64_kv_bucketed_partials.compile_cache[compile_key](
             o_partial,
             lse_partial,
             out_bshd,
@@ -785,17 +1078,100 @@ def _bsa_attn_fwd_blk64_kv_bucketed(
             current_stream,
         )
 
-    # Keep split_offsets alive through the combine launch on the same stream.
-    _ = split_offsets
     # Combine writes its native BSHD/BSH layout. Return BHSD/BHS views without D2D.
     out = out_bshd.transpose(1, 2)
     lse = lse_bsh.transpose(1, 2)
     return out, lse
 
 
-_bsa_attn_fwd_blk64_kv_bucketed.compile_cache = get_jit_cache(
+_combine_blk64_kv_bucketed_partials.compile_cache = get_jit_cache(
     "bsa_fwd_blk64_kv_bucket_combine"
 )
+
+
+def _bsa_attn_fwd_blk64_kv_bucketed(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    fixed_block_sparse_num: int,
+    block_sizes: torch.Tensor,
+    q2k_block_nums: torch.Tensor,
+    softmax_scale: float,
+    kv_splits: int,
+    use_clc: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Launch KV-bucketed SM100 blk64 fwd and combine partial outputs."""
+    kv_splits = int(kv_splits)
+    assert 1 <= kv_splits <= 256, "kv_splits must be in [1, 256]"
+
+    o_partial_phys, lse_partial_phys, split_offsets = torch.ops.bsa_blk64.fwd_kv_bucketed(
+        q,
+        k,
+        v,
+        q2k_block_index,
+        fixed_block_sparse_num,
+        block_sizes,
+        softmax_scale,
+        q2k_block_nums,
+        kv_splits,
+        use_clc,
+    )
+    out, lse = _combine_blk64_kv_bucketed_partials(
+        q,
+        o_partial_phys,
+        lse_partial_phys,
+        kv_splits,
+    )
+    # Keep split_offsets alive through the combine launch on the same stream.
+    _ = split_offsets
+    return out, lse
+
+
+def choose_blk64_use_clc(
+    q: torch.Tensor,
+    block_sparse_num: int,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    layout: str = "bhsd",
+) -> bool:
+    """Select the measured-fastest blk64 scheduler for the common wrapper path.
+
+    The low-level ``torch.ops.bsa_blk64.fwd(..., use_clc)`` API treats
+    ``use_clc`` as an explicit scheduler request. This helper is for interface
+    defaults: callers can pass ``use_clc=True`` or ``False`` to force a path, or
+    leave it as ``None`` to use this shape-based policy.
+    """
+    if q2k_block_nums is not None and q2k_block_nums.numel() > 0:
+        return True
+
+    if layout == "bshd":
+        batch, seqlen_q, h, _ = q.shape
+    else:
+        assert layout == "bhsd", f"layout must be 'bhsd' or 'bshd', got {layout!r}"
+        batch, h, seqlen_q, _ = q.shape
+
+    num_m_blocks = (seqlen_q + 63) // 64
+    large_long_topk = num_m_blocks >= 8192 and block_sparse_num >= 512
+    if large_long_topk:
+        return True
+
+    if h == 1:
+        return False
+
+    total_tiles = batch * h * num_m_blocks
+    enough_tiles = num_m_blocks >= 128 and total_tiles >= 512
+    light_tile = block_sparse_num <= (64 if h == 2 else 128)
+    return enough_tiles and light_tile
+
+
+def choose_blk64_cutedsl_use_clc(
+    q: torch.Tensor,
+    block_sparse_num: int,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    layout: str = "bhsd",
+) -> bool:
+    """Select the same scheduler policy as the AOT SM100 blk64 wrapper."""
+    return choose_blk64_use_clc(q, block_sparse_num, q2k_block_nums, layout)
 
 
 def bsa_attn_fwd_blk64(
@@ -807,7 +1183,7 @@ def bsa_attn_fwd_blk64(
     q2k_block_nums: torch.Tensor,
     softmax_scale: Optional[float] = None,
     layout: str = "bhsd",
-    use_clc: bool = False,
+    use_clc: Optional[bool] = None,
     kv_splits: int | str = 1,
     block_sparse_num: Optional[int] = None,
 ):
@@ -827,45 +1203,43 @@ def bsa_attn_fwd_blk64(
         q2k_block_nums: (B, H, Q_tiles) int32
         softmax_scale: default 1/sqrt(D)
         layout: "bhsd" (default, zero-copy) or "bshd" (converted to BHSD).
-        use_clc: enable the SM100 CLC persistent scheduler path. Default False
-            uses the SingleTileScheduler fallback (one tile per CTA).
-        kv_splits: number of KV buckets per Q block on SM100. kv_splits=1 keeps
-            the legacy single-kernel fwd path; kv_splits>1 uses pre-schedule,
-            partial attention, and combine. Pass "auto" to choose splits from
-            the estimated K/V working set and device L2 cache size.
+        use_clc: True forces the SM100 CLC persistent scheduler path, False
+            forces the SingleTileScheduler path, and None (default) uses the
+            interface's shape-based auto policy.
+        kv_splits: number of KV buckets per Q block on SM90/SM100, in [1, 256].
+            kv_splits=1 keeps the legacy single-kernel fwd path; kv_splits>1
+            uses FP32 partial attention workspace and a combine kernel. Pass
+            "auto" to select 1/2/4/8 splits at 256/450/900 KV blocks; SM90
+            keeps a single Q head unsplit in the 256--449 range. The SM100
+            split path does not use its CLC scheduler. Auto may lower the split
+            count to fit the available workspace; an explicit count reports
+            an error instead.
         block_sparse_num: fixed number of valid KV blocks per Q block when
             q2k_block_nums is empty. Defaults to q2k_block_index.shape[-1].
     """
-    assert q.dtype == torch.bfloat16, "blk64 requires bf16"
+    arch = _get_device_arch()
+    if arch // 10 == 9:
+        assert q.dtype in (torch.float16, torch.bfloat16), (
+            "SM90 blk64 requires fp16 or bf16"
+        )
+    else:
+        assert q.dtype == torch.bfloat16, "SM100 blk64 requires bf16"
     assert q.is_cuda and k.is_cuda and v.is_cuda
     assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
 
-    arch = _get_device_arch()
+    requested_use_clc = use_clc
     auto_kv_splits = isinstance(kv_splits, str)
     if auto_kv_splits:
         assert kv_splits == "auto", "kv_splits string value must be 'auto'"
         kv_splits_i = 1
     else:
         kv_splits_i = int(kv_splits)
-        assert kv_splits_i >= 1, "kv_splits must be >= 1"
+        assert 1 <= kv_splits_i <= 256, "kv_splits must be in [1, 256]"
     out_bshd = None
     if layout == "bshd":
-        if arch // 10 == 9:
-            out_bshd = torch.empty(
-                q.shape[0],
-                q.shape[1],
-                q.shape[2],
-                v.shape[-1],
-                dtype=q.dtype,
-                device=q.device,
-            )
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-        else:
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
     else:
         assert layout == "bhsd", f"layout must be 'bhsd' or 'bshd', got {layout!r}"
 
@@ -888,7 +1262,6 @@ def bsa_attn_fwd_blk64(
         softmax_scale = q.size(3) ** -0.5
 
     if arch // 10 == 9:
-        assert kv_splits_i == 1, "kv_splits is only supported by the SM100 blk64 path"
         block_sizes_sm90 = None if block_sizes is None or block_sizes.numel() == 0 else block_sizes
         block_nums_sm90 = (
             None if q2k_block_nums is None or q2k_block_nums.numel() == 0 else q2k_block_nums
@@ -900,6 +1273,22 @@ def bsa_attn_fwd_blk64(
             "block_sparse_num must be <= q2k_block_index.shape[-1]"
         )
         fixed_block_sparse_num = fixed_block_sparse_num if block_nums_sm90 is None else 0
+        if auto_kv_splits:
+            kv_splits_i = _sm90_blk64_auto_kv_splits(
+                q, q2k_block_index, fixed_block_sparse_num
+            )
+        kv_splits_i = _resolve_blk64_split_workspace(
+            q,
+            v.shape[-1],
+            kv_splits_i,
+            allow_fallback=auto_kv_splits,
+        )
+        if layout == "bshd" and kv_splits_i == 1:
+            out_bshd = torch.empty(
+                (q.shape[0], q.shape[2], q.shape[1], v.shape[-1]),
+                dtype=q.dtype,
+                device=q.device,
+            )
         out, lse = _bsa_attn_fwd_sm90_blk64(
             q,
             k,
@@ -910,8 +1299,11 @@ def bsa_attn_fwd_blk64(
             q2k_block_nums=block_nums_sm90,
             softmax_scale=softmax_scale,
             out=out_bshd.transpose(1, 2) if out_bshd is not None else None,
+            kv_splits=kv_splits_i,
         )
-        return (out_bshd, lse) if out_bshd is not None else (out, lse)
+        if layout == "bshd":
+            return (out_bshd, lse) if out_bshd is not None else (out.transpose(1, 2), lse)
+        return out, lse
 
     if arch // 10 == 12:
         assert kv_splits_i == 1, "kv_splits is only supported by the SM100 blk64 path"
@@ -953,15 +1345,37 @@ def bsa_attn_fwd_blk64(
         if q2k_block_nums is None or q2k_block_nums.numel() == 0
         else 0
     )
+    if use_clc is None:
+        block_nums_for_policy = (
+            q2k_block_nums
+            if q2k_block_nums is not None and q2k_block_nums.numel() > 0
+            else None
+        )
+        policy_block_sparse_num = (
+            fixed_block_sparse_num
+            if fixed_block_sparse_num > 0
+            else q2k_block_index.shape[-1]
+        )
+        use_clc = choose_blk64_use_clc(
+            q, policy_block_sparse_num, block_nums_for_policy, layout="bhsd"
+        )
     if auto_kv_splits:
         kv_splits_i = _sm100_blk64_auto_kv_splits(
             q, q2k_block_index, fixed_block_sparse_num
         )
+    kv_splits_i = _resolve_blk64_split_workspace(
+        q,
+        v.shape[-1],
+        kv_splits_i,
+        allow_fallback=auto_kv_splits,
+    )
     _validate_sm100_blk64_int32_bounds(
         q, k, v, q2k_block_index, fixed_block_sparse_num, block_sizes, q2k_block_nums
     )
     if kv_splits_i > 1:
-        kv_bucket_use_clc = False if auto_kv_splits else use_clc
+        if requested_use_clc is True:
+            raise ValueError("SM100 blk64 split-KV does not support use_clc=True")
+        kv_bucket_use_clc = False
         out, lse = _bsa_attn_fwd_blk64_kv_bucketed(
             q,
             k,
@@ -996,6 +1410,286 @@ def bsa_attn_fwd_blk64(
     if layout == "bshd":
         out = out.transpose(1, 2)
     return out, lse
+
+
+def bsa_attn_fwd_blk64_cutedsl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    block_sizes: Optional[torch.Tensor],
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    layout: str = "bhsd",
+    block_sparse_num: int = 0,
+    use_clc: Optional[bool] = None,
+    kv_splits: int | str = 1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """BSA forward attention through an independent blk64 CuTeDSL kernel class."""
+    assert q.dtype == torch.bfloat16, "blk64 CuTeDSL requires bf16"
+    assert q.is_cuda and k.is_cuda and v.is_cuda
+    assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
+    auto_kv_splits = isinstance(kv_splits, str)
+    if auto_kv_splits:
+        assert kv_splits == "auto", "kv_splits string value must be 'auto'"
+        kv_splits_i = 1
+    else:
+        kv_splits_i = int(kv_splits)
+        assert kv_splits_i >= 1, "kv_splits must be >= 1"
+
+    if layout == "bhsd":
+        q_bhsd, k_bhsd, v_bhsd = [maybe_contiguous(t) for t in (q, k, v)]
+    else:
+        assert layout == "bshd", f"layout must be 'bhsd' or 'bshd', got {layout!r}"
+        q_bhsd = q.transpose(1, 2).contiguous()
+        k_bhsd = k.transpose(1, 2).contiguous()
+        v_bhsd = v.transpose(1, 2).contiguous()
+
+    batch_size, num_head, seqlen_q, head_dim = q_bhsd.shape
+    seqlen_k = k_bhsd.shape[2]
+    num_head_kv = k_bhsd.shape[1]
+    head_dim_v = v_bhsd.shape[-1]
+
+    assert head_dim == 128 and head_dim_v == 128, "blk64 CuTeDSL requires D=DV=128"
+    assert num_head == num_head_kv, "blk64 CuTeDSL currently supports MHA only"
+    assert k_bhsd.shape == (batch_size, num_head_kv, seqlen_k, head_dim)
+    assert v_bhsd.shape == (batch_size, num_head_kv, seqlen_k, head_dim_v)
+    assert q2k_block_index.dtype == torch.int32
+    q2k_block_index = maybe_contiguous(q2k_block_index)
+    has_block_sizes = block_sizes is not None and block_sizes.numel() > 0
+    if has_block_sizes:
+        block_sizes = maybe_contiguous(block_sizes)
+        assert block_sizes.dtype == torch.int32
+    else:
+        block_sizes = None
+    num_q_blocks = (seqlen_q + 63) // 64
+    has_variable_block_nums = q2k_block_nums is not None and q2k_block_nums.numel() > 0
+    if has_variable_block_nums:
+        q2k_block_nums = maybe_contiguous(q2k_block_nums)
+        assert q2k_block_nums.dtype == torch.int32
+        assert q2k_block_nums.shape == (
+            batch_size,
+            num_head,
+            num_q_blocks,
+        ), (
+            "q2k_block_nums must be shaped "
+            f"(B, H, ceil(S_q/64)); got {tuple(q2k_block_nums.shape)}"
+        )
+        uniform_block_sparse_num = 0
+    else:
+        if block_sparse_num <= 0:
+            block_sparse_num = int(q2k_block_index.shape[-1])
+        assert q2k_block_index.shape[-1] >= block_sparse_num, (
+            f"q2k_block_index last dim ({q2k_block_index.shape[-1]}) must be "
+            f">= block_sparse_num ({block_sparse_num})"
+        )
+        uniform_block_sparse_num = int(block_sparse_num)
+        q2k_block_nums = None
+
+    _validate_sm100_blk64_int32_bounds(
+        q_bhsd,
+        k_bhsd,
+        v_bhsd,
+        q2k_block_index,
+        uniform_block_sparse_num,
+        block_sizes,
+        q2k_block_nums,
+    )
+    use_int64_kv_strides = _sm100_blk64_requires_int64_kv_strides(k_bhsd, v_bhsd)
+
+    if softmax_scale is None:
+        softmax_scale = head_dim ** -0.5
+
+    dtype = torch2cute_dtype_map[q_bhsd.dtype]
+    arch = _get_device_arch()
+    allow_empty_block_nums = has_variable_block_nums
+    sparse_block_size = 64
+    qhead_per_kvhead = 1
+    tile_m = 64
+    tile_n = 256
+    use_2cta_instrs = False
+    if auto_kv_splits:
+        kv_splits_i = _sm100_blk64_auto_kv_splits(
+            q_bhsd,
+            q2k_block_index,
+            uniform_block_sparse_num,
+        )
+    if use_clc is None:
+        if kv_splits_i > 1:
+            use_clc_scheduler = False
+        else:
+            use_clc_scheduler = choose_blk64_cutedsl_use_clc(
+                q_bhsd,
+                uniform_block_sparse_num,
+                q2k_block_nums if has_variable_block_nums else None,
+                layout="bhsd",
+            )
+    else:
+        use_clc_scheduler = bool(use_clc)
+    assert not (kv_splits_i > 1 and use_clc_scheduler), (
+        "blk64 CuTeDSL kv_splits>1 does not support use_clc=True"
+    )
+    is_persistent = use_clc_scheduler
+    pack_gqa = False
+    input_layout = "bhsd_native"
+
+    split_offsets = None
+    if kv_splits_i > 1:
+        split_offsets = _build_sm100_blk64_kv_split_offsets(
+            q2k_block_nums,
+            uniform_block_sparse_num,
+            batch_size,
+            num_head,
+            num_q_blocks,
+            kv_splits_i,
+            q_bhsd.device,
+        )
+        out_bhsd = torch.empty(
+            (batch_size, kv_splits_i * num_head, seqlen_q, head_dim_v),
+            dtype=torch.float32,
+            device=q_bhsd.device,
+        )
+        lse = torch.empty(
+            (batch_size, kv_splits_i * num_head, seqlen_q),
+            dtype=torch.float32,
+            device=q_bhsd.device,
+        )
+    else:
+        out_bhsd = torch.empty(
+            (batch_size, num_head, seqlen_q, head_dim_v),
+            dtype=q_bhsd.dtype,
+            device=q_bhsd.device,
+        )
+        lse = torch.empty(
+            (batch_size, num_head, seqlen_q),
+            dtype=torch.float32,
+            device=q_bhsd.device,
+        )
+
+    current_stream = (
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        if is_fake_mode()
+        else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    )
+
+    compile_key = _dynamic_tensors_compile_key(
+        "sm100_blk64_fwd",
+        (
+            dtype,
+            head_dim,
+            head_dim_v,
+            qhead_per_kvhead,
+            pack_gqa,
+            tile_m,
+            tile_n,
+            sparse_block_size,
+            arch,
+            fa_logging.get_fa_log_level(),
+            has_variable_block_nums,
+            allow_empty_block_nums,
+            has_block_sizes,
+            kv_splits_i,
+            out_bhsd.dtype,
+            is_persistent,
+            use_clc_scheduler,
+            input_layout,
+            use_int64_kv_strides,
+        ),
+        (
+            q_bhsd,
+            k_bhsd,
+            v_bhsd,
+            out_bhsd,
+            lse,
+            q2k_block_index,
+            block_sizes,
+            q2k_block_nums,
+            split_offsets,
+        ),
+    )
+
+    if compile_key not in bsa_attn_fwd_blk64_cutedsl.compile_cache:
+        _workaround_cutlass_hash_import_bug()
+        q_tensor, k_tensor, v_tensor, o_tensor = [
+            _to_cute_tensor(t) for t in (q_bhsd, k_bhsd, v_bhsd, out_bhsd)
+        ]
+        lse_tensor = _to_cute_tensor(lse, assumed_align=4)
+        block_index_tensor = _to_cute_tensor(q2k_block_index)
+        block_sizes_tensor = _to_cute_tensor(block_sizes) if has_block_sizes else None
+        block_nums_tensor = (
+            _to_cute_tensor(q2k_block_nums) if has_variable_block_nums else None
+        )
+        split_offsets_tensor = (
+            _to_cute_tensor(split_offsets) if split_offsets is not None else None
+        )
+
+        fa_fwd = FlashAttentionForwardSm100Blk64(
+            head_dim,
+            head_dim_v,
+            qhead_per_kvhead=qhead_per_kvhead,
+            pack_gqa=pack_gqa,
+            m_block_size=tile_m,
+            n_block_size=tile_n,
+            sparse_block_size=sparse_block_size,
+            is_persistent=is_persistent,
+            use_2cta_instrs=use_2cta_instrs,
+            use_clc_scheduler=use_clc_scheduler,
+            allow_empty_block_nums=allow_empty_block_nums,
+            has_block_sizes=has_block_sizes,
+            num_splits=kv_splits_i,
+            use_raw_ws_epilogue=True,
+            use_int64_kv_strides=use_int64_kv_strides,
+        )
+
+        bsa_attn_fwd_blk64_cutedsl.compile_cache[compile_key] = cute.compile(
+            fa_fwd,
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            o_tensor,
+            lse_tensor,
+            softmax_scale,
+            block_index_tensor,
+            block_sizes_tensor,
+            uniform_block_sparse_num,
+            block_nums_tensor,
+            split_offsets_tensor,
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+
+    if not is_fake_mode():
+        with torch.cuda.nvtx.range("bsa_attn_fwd_blk64_cutedsl_kernel"):
+            bsa_attn_fwd_blk64_cutedsl.compile_cache[compile_key](
+                q_bhsd.detach(),
+                k_bhsd.detach(),
+                v_bhsd.detach(),
+                out_bhsd.detach(),
+                lse,
+                softmax_scale,
+                q2k_block_index.detach(),
+                block_sizes.detach() if has_block_sizes else None,
+                uniform_block_sparse_num,
+                q2k_block_nums.detach() if has_variable_block_nums else None,
+                split_offsets.detach() if split_offsets is not None else None,
+                current_stream,
+            )
+
+    if kv_splits_i > 1:
+        out_bhsd, lse = _combine_blk64_kv_bucketed_partials(
+            q_bhsd,
+            out_bhsd,
+            lse,
+            kv_splits_i,
+        )
+        # Keep split_offsets alive through the combine launch on the same stream.
+        _ = split_offsets
+
+    out = out_bhsd if layout == "bhsd" else out_bhsd.transpose(1, 2).contiguous()
+    return out, lse
+
+
+bsa_attn_fwd_blk64_cutedsl.compile_cache = get_jit_cache("bsa_fwd_blk64_cutedsl")
 
 
 def bsa_attn_fwd(
@@ -1068,9 +1762,11 @@ def bsa_attn_fwd(
 
     # Block-sparse parameter validation
     assert q2k_block_index.dtype == torch.int32, "q2k_block_index must be int32"
+    q2k_block_index = maybe_contiguous(q2k_block_index)
     has_block_sizes = block_sizes is not None
     if has_block_sizes:
         assert block_sizes.dtype == torch.int32, "block_sizes must be int32"
+        block_sizes = maybe_contiguous(block_sizes)
     if q2k_block_nums is not None:
         q2k_block_nums = maybe_contiguous(q2k_block_nums)
         assert q2k_block_nums.dtype == torch.int32, "q2k_block_nums must be int32"
@@ -1261,24 +1957,37 @@ def bsa_attn_fwd(
         has_block_sizes=has_block_sizes,
     )
 
-    compile_key = (
-        dtype,
-        head_dim,
-        head_dim_v,
-        qhead_per_kvhead,
-        lse is None,
-        bsa_fwd_kernel.m_block_size,
-        bsa_fwd_kernel.n_block_size,
-        bsa_fwd_kernel.pack_gqa,
-        arch,
-        bsa_fwd_kernel.use_2cta_instrs,
-        bsa_fwd_kernel.use_clc_scheduler,
-        bsa_fwd_kernel.is_persistent,
-        fa_logging.get_fa_log_level(),
-        has_variable_block_nums,
-        allow_empty_block_nums and has_variable_block_nums,
-        has_block_sizes,
-        "bhsd_kernel_boundary",
+    compile_key = _dynamic_tensors_compile_key(
+        "sm100_blk128_fwd",
+        (
+            dtype,
+            head_dim,
+            head_dim_v,
+            qhead_per_kvhead,
+            lse is None,
+            bsa_fwd_kernel.m_block_size,
+            bsa_fwd_kernel.n_block_size,
+            bsa_fwd_kernel.pack_gqa,
+            arch,
+            bsa_fwd_kernel.use_2cta_instrs,
+            bsa_fwd_kernel.use_clc_scheduler,
+            bsa_fwd_kernel.is_persistent,
+            fa_logging.get_fa_log_level(),
+            has_variable_block_nums,
+            allow_empty_block_nums and has_variable_block_nums,
+            has_block_sizes,
+            "bhsd_kernel_boundary",
+        ),
+        (
+            q_kernel,
+            k_kernel,
+            v_kernel,
+            out_kernel,
+            lse,
+            q2k_block_index,
+            block_sizes,
+            q2k_block_nums,
+        ),
     )
 
     if compile_key not in bsa_attn_fwd.compile_cache:
@@ -1613,214 +2322,6 @@ def bsa_attn_bwd(
     return dq_out, dk_out, dv_out
 
 
-@triton.jit
-def _bucketed_k2q_count_edges_kernel(
-    counts,
-    q2k_index,
-    q2k_nums,
-    idx_b_s: tl.constexpr,
-    idx_h_s: tl.constexpr,
-    idx_q_s: tl.constexpr,
-    idx_k_s: tl.constexpr,
-    nums_b_s: tl.constexpr,
-    nums_h_s: tl.constexpr,
-    nums_q_s: tl.constexpr,
-    num_heads: tl.constexpr,
-    num_kv_blocks: tl.constexpr,
-    num_q_groups: tl.constexpr,
-    bucket_size_blocks: tl.constexpr,
-    max_k: tl.constexpr,
-    block_sparse_num: tl.constexpr,
-    has_variable_nums: tl.constexpr,
-):
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    q = tl.program_id(2)
-
-    n = block_sparse_num
-    if has_variable_nums:
-        n = tl.load(q2k_nums + b * nums_b_s + h * nums_h_s + q * nums_q_s)
-
-    q_group = q // bucket_size_blocks
-    q2k_base = q2k_index + b * idx_b_s + h * idx_h_s + q * idx_q_s
-    count_base = ((b * num_heads + h) * num_q_groups + q_group) * num_kv_blocks
-
-    for i in tl.range(0, max_k):
-        if i < n:
-            kv = tl.load(q2k_base + i * idx_k_s)
-            if (kv >= 0) & (kv < num_kv_blocks):
-                tl.atomic_add(counts + count_base + kv, 1, sem="relaxed")
-
-
-@triton.jit
-def _bucketed_k2q_count_edges_fixed_vec_kernel(
-    counts,
-    q2k_index,
-    idx_b_s: tl.constexpr,
-    idx_h_s: tl.constexpr,
-    idx_q_s: tl.constexpr,
-    idx_k_s: tl.constexpr,
-    num_heads: tl.constexpr,
-    num_kv_blocks: tl.constexpr,
-    num_q_groups: tl.constexpr,
-    bucket_size_blocks: tl.constexpr,
-    block_sparse_num: tl.constexpr,
-    num_k_tiles: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    qk_tile = tl.program_id(2)
-    q = qk_tile // num_k_tiles
-    k_tile = qk_tile - q * num_k_tiles
-
-    offs = k_tile * BLOCK_K + tl.arange(0, BLOCK_K)
-    mask = offs < block_sparse_num
-    q_group = q // bucket_size_blocks
-    q2k_base = q2k_index + b * idx_b_s + h * idx_h_s + q * idx_q_s
-    count_base = ((b * num_heads + h) * num_q_groups + q_group) * num_kv_blocks
-
-    kv = tl.load(q2k_base + offs * idx_k_s, mask=mask, other=0)
-    tl.atomic_add(counts + count_base + kv, 1, sem="relaxed", mask=mask)
-
-
-@triton.jit
-def _bucketed_k2q_local_offsets_kernel(
-    counts,
-    local_offsets,
-    group_totals,
-    num_heads: tl.constexpr,
-    num_kv_blocks: tl.constexpr,
-    num_q_groups: tl.constexpr,
-):
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    g = tl.program_id(2)
-
-    count_base = ((b * num_heads + h) * num_q_groups + g) * num_kv_blocks
-    offset_base = ((b * num_heads + h) * num_q_groups + g) * (num_kv_blocks + 1)
-
-    running = tl.full((), 0, tl.int32)
-    for kv in tl.range(0, num_kv_blocks):
-        tl.store(local_offsets + offset_base + kv, running)
-        running += tl.load(counts + count_base + kv)
-    tl.store(local_offsets + offset_base + num_kv_blocks, running)
-    tl.store(group_totals + (b * num_heads + h) * num_q_groups + g, running)
-
-
-@triton.jit
-def _bucketed_k2q_finalize_offsets_kernel(
-    local_offsets,
-    group_totals,
-    bucketed_k2q_offsets,
-    cursors,
-    num_heads: tl.constexpr,
-    num_kv_blocks: tl.constexpr,
-    num_q_groups: tl.constexpr,
-):
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    g = tl.program_id(2)
-
-    bh_group_base = (b * num_heads + h) * num_q_groups
-    base = tl.full((), 0, tl.int32)
-    for prev_g in tl.range(0, num_q_groups):
-        if prev_g < g:
-            base += tl.load(group_totals + bh_group_base + prev_g)
-
-    local_base = (bh_group_base + g) * (num_kv_blocks + 1)
-    k2q_offset_base = (bh_group_base + g) * (num_kv_blocks + 1)
-    cursor_base = (bh_group_base + g) * num_kv_blocks
-
-    for kv in tl.range(0, num_kv_blocks):
-        offset = base + tl.load(local_offsets + local_base + kv)
-        tl.store(bucketed_k2q_offsets + k2q_offset_base + kv, offset)
-        tl.store(cursors + cursor_base + kv, offset)
-    tl.store(
-        bucketed_k2q_offsets + k2q_offset_base + num_kv_blocks,
-        base + tl.load(local_offsets + local_base + num_kv_blocks),
-    )
-
-
-@triton.jit
-def _bucketed_k2q_scatter_q_indices_kernel(
-    cursors,
-    bucketed_k2q_indices,
-    q2k_index,
-    q2k_nums,
-    idx_b_s: tl.constexpr,
-    idx_h_s: tl.constexpr,
-    idx_q_s: tl.constexpr,
-    idx_k_s: tl.constexpr,
-    nums_b_s: tl.constexpr,
-    nums_h_s: tl.constexpr,
-    nums_q_s: tl.constexpr,
-    num_heads: tl.constexpr,
-    num_kv_blocks: tl.constexpr,
-    num_q_groups: tl.constexpr,
-    bucket_size_blocks: tl.constexpr,
-    max_edges_per_bh: tl.constexpr,
-    max_k: tl.constexpr,
-    block_sparse_num: tl.constexpr,
-    has_variable_nums: tl.constexpr,
-):
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    q = tl.program_id(2)
-
-    n = block_sparse_num
-    if has_variable_nums:
-        n = tl.load(q2k_nums + b * nums_b_s + h * nums_h_s + q * nums_q_s)
-
-    q_group = q // bucket_size_blocks
-    q2k_base = q2k_index + b * idx_b_s + h * idx_h_s + q * idx_q_s
-    cursor_base = ((b * num_heads + h) * num_q_groups + q_group) * num_kv_blocks
-    k2q_indices_base = (b * num_heads + h) * max_edges_per_bh
-
-    for i in tl.range(0, max_k):
-        if i < n:
-            kv = tl.load(q2k_base + i * idx_k_s)
-            if (kv >= 0) & (kv < num_kv_blocks):
-                pos = tl.atomic_add(cursors + cursor_base + kv, 1, sem="relaxed")
-                tl.store(bucketed_k2q_indices + k2q_indices_base + pos, q)
-
-
-@triton.jit
-def _bucketed_k2q_scatter_q_indices_fixed_vec_kernel(
-    cursors,
-    bucketed_k2q_indices,
-    q2k_index,
-    idx_b_s: tl.constexpr,
-    idx_h_s: tl.constexpr,
-    idx_q_s: tl.constexpr,
-    idx_k_s: tl.constexpr,
-    num_heads: tl.constexpr,
-    num_kv_blocks: tl.constexpr,
-    num_q_groups: tl.constexpr,
-    bucket_size_blocks: tl.constexpr,
-    max_edges_per_bh: tl.constexpr,
-    block_sparse_num: tl.constexpr,
-    num_k_tiles: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    qk_tile = tl.program_id(2)
-    q = qk_tile // num_k_tiles
-    k_tile = qk_tile - q * num_k_tiles
-
-    offs = k_tile * BLOCK_K + tl.arange(0, BLOCK_K)
-    mask = offs < block_sparse_num
-    q_group = q // bucket_size_blocks
-    q2k_base = q2k_index + b * idx_b_s + h * idx_h_s + q * idx_q_s
-    cursor_base = ((b * num_heads + h) * num_q_groups + q_group) * num_kv_blocks
-    k2q_indices_base = (b * num_heads + h) * max_edges_per_bh
-
-    kv = tl.load(q2k_base + offs * idx_k_s, mask=mask, other=0)
-    pos = tl.atomic_add(cursors + cursor_base + kv, 1, sem="relaxed", mask=mask)
-    tl.store(bucketed_k2q_indices + k2q_indices_base + pos, q, mask=mask)
-
-
 def _build_bucketed_k2q_csr(
     q2k_block_index: torch.Tensor,
     block_sparse_num: int,
@@ -1829,158 +2330,19 @@ def _build_bucketed_k2q_csr(
     bucket_size_blocks: int = 1152,
     q2k_block_nums: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
-    """Build bucketed k2q CSR on GPU for the backward path.
+    """Build bucketed K-to-Q CSR metadata with CuTe DSL kernels.
 
-    The returned offsets have shape ``(B, H, num_q_groups, num_kv_blocks + 1)``.
-    For each ``(b, h, q_group, kv_block)``, the corresponding slice in
-    ``bucketed_k2q_indices`` stores the attending Q block ids.
+    The offsets have shape ``(B, H, num_q_groups, num_kv_blocks + 1)``.
+    Each corresponding slice in ``bucketed_k2q_indices`` stores the global
+    Q-block ids attending that KV block.
     """
-    assert q2k_block_index.dtype == torch.int32
-    assert q2k_block_index.is_cuda
-    B, H, num_q_blocks, max_kv = q2k_block_index.shape
-    G = bucket_size_blocks
-    num_q_groups = (num_q_blocks + G - 1) // G
-
-    q2k_block_index = q2k_block_index.contiguous()
-    if q2k_block_nums is None:
-        nums = q2k_block_index
-        max_edges = num_q_blocks * int(block_sparse_num)
-        max_k = int(block_sparse_num)
-        has_variable_nums = False
-    else:
-        assert q2k_block_nums.dtype == torch.int32
-        assert q2k_block_nums.shape == (B, H, num_q_blocks)
-        nums = q2k_block_nums.contiguous()
-        max_edges = num_q_blocks * max_kv
-        max_k = max_kv
-        has_variable_nums = True
-
-    max_edges = max(1, max_edges)
-    max_k2q_rows_per_group = num_kv_blocks
-
-    counts = torch.zeros(
-        (B, H, num_q_groups, num_kv_blocks),
-        dtype=torch.int32,
-        device=q2k_block_index.device,
-    )
-    local_offsets = torch.empty(
-        (B, H, num_q_groups, num_kv_blocks + 1),
-        dtype=torch.int32,
-        device=q2k_block_index.device,
-    )
-    group_totals = torch.empty(
-        (B, H, num_q_groups),
-        dtype=torch.int32,
-        device=q2k_block_index.device,
-    )
-    bucketed_k2q_offsets = torch.empty_like(local_offsets)
-    cursors = torch.empty_like(counts)
-    bucketed_k2q_indices = torch.empty(
-        (B, H, max_edges), dtype=torch.int32, device=q2k_block_index.device
-    )
-
-    grid_q = (B, H, num_q_blocks)
-    if has_variable_nums:
-        _bucketed_k2q_count_edges_kernel[grid_q](
-            counts,
-            q2k_block_index,
-            nums,
-            q2k_block_index.stride(0),
-            q2k_block_index.stride(1),
-            q2k_block_index.stride(2),
-            q2k_block_index.stride(3),
-            nums.stride(0),
-            nums.stride(1),
-            nums.stride(2),
-            H,
-            num_kv_blocks,
-            num_q_groups,
-            G,
-            max_k,
-            int(block_sparse_num),
-            has_variable_nums,
-        )
-    else:
-        block_k = 1024
-        num_k_tiles = triton.cdiv(max_k, block_k)
-        grid_qk = (B, H, num_q_blocks * num_k_tiles)
-        _bucketed_k2q_count_edges_fixed_vec_kernel[grid_qk](
-            counts,
-            q2k_block_index,
-            q2k_block_index.stride(0),
-            q2k_block_index.stride(1),
-            q2k_block_index.stride(2),
-            q2k_block_index.stride(3),
-            H,
-            num_kv_blocks,
-            num_q_groups,
-            G,
-            int(block_sparse_num),
-            num_k_tiles,
-            BLOCK_K=block_k,
-        )
-
-    grid_group = (B, H, num_q_groups)
-    _bucketed_k2q_local_offsets_kernel[grid_group](
-        counts,
-        local_offsets,
-        group_totals,
-        H,
+    return build_bucketed_k2q_csr_cutedsl(
+        q2k_block_index,
+        block_sparse_num,
         num_kv_blocks,
-        num_q_groups,
+        bucket_size_blocks=bucket_size_blocks,
+        q2k_block_nums=q2k_block_nums,
     )
-    _bucketed_k2q_finalize_offsets_kernel[grid_group](
-        local_offsets,
-        group_totals,
-        bucketed_k2q_offsets,
-        cursors,
-        H,
-        num_kv_blocks,
-        num_q_groups,
-    )
-
-    if has_variable_nums:
-        _bucketed_k2q_scatter_q_indices_kernel[grid_q](
-            cursors,
-            bucketed_k2q_indices,
-            q2k_block_index,
-            nums,
-            q2k_block_index.stride(0),
-            q2k_block_index.stride(1),
-            q2k_block_index.stride(2),
-            q2k_block_index.stride(3),
-            nums.stride(0),
-            nums.stride(1),
-            nums.stride(2),
-            H,
-            num_kv_blocks,
-            num_q_groups,
-            G,
-            max_edges,
-            max_k,
-            int(block_sparse_num),
-            has_variable_nums,
-        )
-    else:
-        _bucketed_k2q_scatter_q_indices_fixed_vec_kernel[grid_qk](
-            cursors,
-            bucketed_k2q_indices,
-            q2k_block_index,
-            q2k_block_index.stride(0),
-            q2k_block_index.stride(1),
-            q2k_block_index.stride(2),
-            q2k_block_index.stride(3),
-            H,
-            num_kv_blocks,
-            num_q_groups,
-            G,
-            max_edges,
-            int(block_sparse_num),
-            num_k_tiles,
-            BLOCK_K=block_k,
-        )
-
-    return bucketed_k2q_offsets, bucketed_k2q_indices, num_q_groups, max_k2q_rows_per_group
 
 
 def _bsa_attn_bwd_bucketed_k2q_csr(
@@ -2004,9 +2366,9 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
 
     This has the same tensor contract as :func:`bsa_attn_bwd`, but builds a
     compact bucketed k2q CSR task layout and runs the blk64 backward
-    kernel. Task construction is performed on GPU with Triton on every
-    call, so this path is suitable when the sparse pattern changes each
-    backward.
+    kernel. Task construction is performed on GPU with CuTe DSL kernels
+    on every call, so this path is suitable when the sparse pattern changes
+    each backward.
     """
     q, k, v, out, dout = [maybe_contiguous(t) for t in (q, k, v, out, dout)]
     lse = maybe_contiguous(lse)
@@ -2111,25 +2473,17 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         bwd_kernel = BlockSparseAttnBackwardSm90Blk64(dtype, head_dim, head_dim)
         problem_shape = (seqlen_q, seqlen_k, head_dim, (num_heads, batch_size))
 
-        compile_key = (
-            "sm90_bucketed_k2q",
+        compile_key = _sm90_bwd_compile_key(
+            arch,
             q.dtype,
             head_dim,
-            num_heads,
-            bucketed_k2q_offsets.shape[2],
             block_sizes_sm90 is not None,
-            bwd_kernel.dQaccum_stage,
-            bwd_kernel.PdS_stage,
-            bwd_kernel.Q_stage,
-            _tensor_compile_key(dout),
-            _tensor_compile_key(out),
-            _tensor_compile_key(q),
-            _tensor_compile_key(k),
-            _tensor_compile_key(v),
-            _tensor_compile_key(dq),
-            _tensor_compile_key(dk),
-            _tensor_compile_key(dv),
-            _tensor_compile_key(lse),
+            (
+                bwd_kernel.dQaccum_stage,
+                bwd_kernel.PdS_stage,
+                bwd_kernel.Q_stage,
+            ),
+            (dout, out, q, k, v, dq, dk, dv, lse),
         )
 
         if compile_key not in _bsa_attn_bwd_bucketed_k2q_csr.compile_cache:

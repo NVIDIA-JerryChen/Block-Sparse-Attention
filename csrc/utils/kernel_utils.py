@@ -185,7 +185,7 @@ def create_softcap_scoremod_bwd(softcap_val):
 LOG2_E = math.log2(math.e)
 
 
-def compute_softmax_scale_log2(softmax_scale, score_mod):
+def compute_softmax_scale_log2(softmax_scale, score_mod=None):
     """Compute softmax_scale_log2 and adjusted softmax_scale based on whether score_mod is used.
 
     When score_mod is None, fold the log2(e) factor into softmax_scale_log2 and set softmax_scale

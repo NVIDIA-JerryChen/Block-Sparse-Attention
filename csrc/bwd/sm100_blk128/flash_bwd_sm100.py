@@ -17,18 +17,18 @@ from cutlass.pipeline import PipelineAsync
 
 import quack.activation
 from quack import layout_utils
-from csrc.common.fa_cute import utils
-from csrc.common.fa_cute.cute_dsl_utils import (
+from csrc.utils import kernel_utils as utils
+from csrc.utils.cute_dsl_utils import (
     assume_tensor_aligned,
     get_broadcast_dims,
     to_cute_tensor,
 )
-from csrc.common.fa_cute import copy_utils
-from csrc.common.fa_cute import pipeline
-from csrc.common.fa_cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx
-from csrc.common.fa_cute.seqlen_info import SeqlenInfoQK
-from csrc.common.fa_cute.block_info import BlockInfo
-from csrc.common.fa_cute.interface import (
+from csrc.utils import copy_utils
+from csrc.utils import pipeline
+from csrc.utils.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx
+from csrc.utils.seqlen_info import SeqlenInfoQK
+from csrc.utils.block_info import BlockInfo
+from csrc.utils.interface import (
     _bwd_postprocess_convert,
     _bwd_preprocess,
     _get_device_arch,
@@ -36,12 +36,12 @@ from csrc.common.fa_cute.interface import (
 )
 from utils.testing import is_fake_mode
 from quack.cute_dsl_utils import ParamsBase
-from csrc.common.fa_cute.tile_scheduler import (
+from csrc.utils.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
 )
 
-from csrc.common.fa_cute.named_barrier import NamedBarrierBwdSm100
+from csrc.utils.named_barrier import NamedBarrierBwdSm100
 from utils.cache_utils import get_jit_cache
 
 
