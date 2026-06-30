@@ -239,8 +239,21 @@ class BucketedK2QCsrUniversal:
                         )
 
 
-def _tensor_compile_key(tensor: torch.Tensor) -> tuple:
-    return tensor.dtype, tuple(tensor.shape), tuple(tensor.stride())
+def _bucketed_k2q_csr_compile_key(
+    device_capability: tuple[int, int],
+    block_sparse_num: int,
+    bucket_size_blocks: int,
+    has_variable_block_nums: bool,
+    max_kv_blocks: int,
+) -> tuple:
+    """Return only the configuration that changes generated device code."""
+    edge_width = max_kv_blocks if has_variable_block_nums else block_sparse_num
+    return (
+        device_capability,
+        int(bucket_size_blocks),
+        bool(has_variable_block_nums),
+        int(edge_width),
+    )
 
 
 def _to_cute_tensor(tensor: torch.Tensor) -> cute.Tensor:
@@ -327,16 +340,17 @@ def build_bucketed_k2q_csr_cutedsl(
         q2k_block_index,
         q2k_block_nums,
     )
-    compile_key = (
-        (
-            torch.cuda.get_device_capability(q2k_block_index.device)
-            if not is_fake_mode()
-            else (0, 0)
-        ),
-        int(block_sparse_num),
-        int(bucket_size_blocks),
+    device_capability = (
+        torch.cuda.get_device_capability(q2k_block_index.device)
+        if not is_fake_mode()
+        else (0, 0)
+    )
+    compile_key = _bucketed_k2q_csr_compile_key(
+        device_capability,
+        block_sparse_num,
+        bucket_size_blocks,
         has_variable_block_nums,
-        *(_tensor_compile_key(tensor) for tensor in tensors),
+        max_kv_blocks,
     )
     if compile_key not in build_bucketed_k2q_csr_cutedsl.compile_cache:
         kernel = BucketedK2QCsrUniversal(
