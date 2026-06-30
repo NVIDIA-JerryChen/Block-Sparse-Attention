@@ -16,12 +16,12 @@ from cutlass.utils import LayoutEnum
 from quack import copy_utils
 from quack import layout_utils
 
-from csrc.common.fa_cute import utils
-from csrc.common.fa_cute.cute_dsl_utils import assume_tensor_aligned
-from csrc.common.fa_cute.seqlen_info import SeqlenInfoQK
+from csrc.utils import kernel_utils as utils
+from csrc.utils.cute_dsl_utils import assume_tensor_aligned
+from csrc.utils.seqlen_info import SeqlenInfoQK
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 from quack.cute_dsl_utils import ParamsBase
-from csrc.common.fa_cute.tile_scheduler import (
+from csrc.utils.tile_scheduler import (
     SingleTileScheduler,
     SingleTileVarlenScheduler,
     TileSchedulerArguments,

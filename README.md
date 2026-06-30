@@ -64,6 +64,12 @@ BSA/
 │   └── sm100_blk64/                      # blk64 backward — SM100 CuTe DSL / JIT compiled
 │       └── flash_bwd_sm100.py            # Bucketed k2q CSR backward kernel
 │
+├── csrc/utils/                            # Shared CuTe DSL device/kernel helpers
+│   ├── kernel_utils.py                    # Math, layout, and tensor utilities
+│   ├── pipeline.py                        # TMA/UMMA pipeline helpers
+│   ├── tile_scheduler.py                  # Shared tile schedulers
+│   └── ...
+│
 ├── utils/
 │   ├── cache_utils.py            # JIT compilation cache
 │   ├── testing.py                # Reference attention, tolerance helpers

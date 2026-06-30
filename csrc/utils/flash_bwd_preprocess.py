@@ -25,10 +25,10 @@ from cutlass.cutlass_dsl import Arch, BaseDSL
 
 from quack import copy_utils, layout_utils
 
-from csrc.common.fa_cute import utils
-from csrc.common.fa_cute.seqlen_info import SeqlenInfo
+from csrc.utils import kernel_utils as utils
+from csrc.utils.seqlen_info import SeqlenInfo
 from quack.cute_dsl_utils import ParamsBase
-from csrc.common.fa_cute.tile_scheduler import (
+from csrc.utils.tile_scheduler import (
     SingleTileScheduler,
     SingleTileVarlenScheduler,
     TileSchedulerArguments,

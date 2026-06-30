@@ -10,7 +10,7 @@ from bsa_attn_interface import (
     _sm90_bwd_compile_key,
     bsa_attn_fwd,
 )
-from csrc.common.fa_cute.interface import _bwd_preprocess_compile_key
+from csrc.utils.interface import _bwd_preprocess_compile_key
 from utils.cache_utils import JITCache
 
 

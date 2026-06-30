@@ -10,9 +10,9 @@ from cutlass import Float32, Int32
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
 
-from csrc.common.fa_cute.cute_dsl_utils import torch2cute_dtype_map
-from csrc.common.fa_cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
-from csrc.common.fa_cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
+from csrc.utils.cute_dsl_utils import torch2cute_dtype_map
+from csrc.utils.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
+from csrc.utils.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from utils.cache_utils import get_jit_cache
 from utils.testing import is_fake_mode
 

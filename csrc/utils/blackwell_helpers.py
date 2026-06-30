@@ -7,7 +7,7 @@ from cutlass import Int32, Boolean, const_expr
 from cutlass.cute.nvgpu import tcgen05
 from cutlass._mlir.dialects import llvm
 
-import csrc.common.fa_cute.mma_sm100_desc as sm100_desc
+from csrc.utils import mma_sm100_desc as sm100_desc
 
 
 def _tcgen05_mma_kind(op: cute.nvgpu.tcgen05.mma.MmaOp) -> str:

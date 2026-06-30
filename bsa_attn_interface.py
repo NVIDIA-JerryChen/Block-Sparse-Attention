@@ -952,7 +952,7 @@ def _combine_blk64_kv_bucketed_partials(
     """Combine KV-bucketed partial outputs using the shared CuTeDSL combine kernel."""
     if FlashAttentionForwardCombine is None:
         raise ImportError(
-            "FlashAttentionForwardCombine is unavailable. Ensure local fa_cute "
+            "FlashAttentionForwardCombine is unavailable. Ensure local CuTe "
             "helpers are importable."
         )
 

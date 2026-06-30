@@ -12,7 +12,7 @@
 
 1. 修改 kernel 代码后，**先运行对应的单元测试**
 2. 确认**全部用例 PASS** 后再 commit
-3. 若修改了 `src/common/` 的共享组件，需运行**所有测试**都通过
+3. 若修改了 `csrc/utils/` 的共享组件，需运行**所有测试**都通过
 4. 新增功能必须有对应测试覆盖
 5. **确认编译完成后**，如果单个 test case 或 demo 的 kernel launch 运行超过 30s，则认定为死锁，死锁问题的解决见 skill: `AI/DEBUG_2CTA.md`
 
