@@ -415,6 +415,24 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
 
 # ============== Pytest ==============
 
+def test_flash_fwd_sm100_blk128_clc_scheduler():
+    """Regression test for CTA-wide convergence when consuming CLC responses."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("SM100+ required")
+
+    _test_single(
+        1,
+        128,
+        256,
+        1,
+        1,
+        128,
+        torch.bfloat16,
+        blk_m=128,
+        blk_n=128,
+    )
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "gqa", "mqa"])
 @pytest.mark.parametrize("d", [64, 128])

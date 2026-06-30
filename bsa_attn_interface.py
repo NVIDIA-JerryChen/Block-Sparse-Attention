@@ -2028,7 +2028,8 @@ def bsa_attn_fwd(
             else None
         )
 
-        bsa_attn_fwd.compile_cache[compile_key] = cute.compile(
+        compile_start = time.time()
+        compiled_kernel = cute.compile(
             bsa_fwd_kernel,
             q_tensor,
             k_tensor,
@@ -2043,6 +2044,8 @@ def bsa_attn_fwd(
             current_stream,
             options="--enable-tvm-ffi",
         )
+        print(f"Compiled SM100 blk128 forward in {time.time() - compile_start:.1f}s")
+        bsa_attn_fwd.compile_cache[compile_key] = compiled_kernel
 
     if not is_fake_mode():
         with torch.cuda.nvtx.range("bsa_attn_fwd_kernel"):
