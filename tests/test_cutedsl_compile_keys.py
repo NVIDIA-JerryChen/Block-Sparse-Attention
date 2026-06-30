@@ -4,11 +4,13 @@ import pytest
 import torch
 
 from bsa_attn_interface import (
+    _bsa_fwd_blk64_kv_bucketed_combine_compile_key,
     _bsa_attn_fwd_sm90_blk64,
     _dynamic_tensors_compile_key,
     _sm90_bwd_compile_key,
     bsa_attn_fwd,
 )
+from csrc.common.fa_cute.interface import _bwd_preprocess_compile_key
 from utils.cache_utils import JITCache
 
 
@@ -90,6 +92,28 @@ def test_dynamic_tensor_compile_key_tracks_static_type_parts():
     assert contiguous_key != broadcast_key
     assert contiguous_key != float_key
     assert contiguous_key != non_unit_key
+
+
+def test_arch_specific_helper_keys_do_not_cross_devices():
+    combine_args = (torch.bfloat16, 128, 16, 64, 2, 128, 4)
+    assert _bsa_fwd_blk64_kv_bucketed_combine_compile_key(
+        90, *combine_args
+    ) != _bsa_fwd_blk64_kv_bucketed_combine_compile_key(100, *combine_args)
+
+    preprocess_args = (
+        torch.bfloat16,
+        128,
+        128,
+        64,
+        False,
+        False,
+        False,
+        True,
+        True,
+    )
+    assert _bwd_preprocess_compile_key(
+        90, *preprocess_args
+    ) != _bwd_preprocess_compile_key(100, *preprocess_args)
 
 
 def _run_sm90_fwd_case(

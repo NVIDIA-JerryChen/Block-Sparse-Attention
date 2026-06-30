@@ -324,6 +324,7 @@ def _ceil_log2_int(x: int) -> int:
 
 
 def _bsa_fwd_blk64_kv_bucketed_combine_compile_key(
+    arch: int,
     dtype,
     head_dim: int,
     combine_tile_m: int,
@@ -333,6 +334,7 @@ def _bsa_fwd_blk64_kv_bucketed_combine_compile_key(
     combine_stages: int,
 ):
     return (
+        int(arch),
         dtype,
         cutlass.Float32,
         int(head_dim),
@@ -1011,6 +1013,7 @@ def _combine_blk64_kv_bucketed_partials(
         else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     )
     compile_key = _bsa_fwd_blk64_kv_bucketed_combine_compile_key(
+        _get_device_arch(),
         dtype,
         head_dim,
         combine_tile_m,
@@ -1768,9 +1771,11 @@ def bsa_attn_fwd(
 
     # Block-sparse parameter validation
     assert q2k_block_index.dtype == torch.int32, "q2k_block_index must be int32"
+    q2k_block_index = maybe_contiguous(q2k_block_index)
     has_block_sizes = block_sizes is not None
     if has_block_sizes:
         assert block_sizes.dtype == torch.int32, "block_sizes must be int32"
+        block_sizes = maybe_contiguous(block_sizes)
     if q2k_block_nums is not None:
         q2k_block_nums = maybe_contiguous(q2k_block_nums)
         assert q2k_block_nums.dtype == torch.int32, "q2k_block_nums must be int32"
@@ -1961,24 +1966,37 @@ def bsa_attn_fwd(
         has_block_sizes=has_block_sizes,
     )
 
-    compile_key = (
-        dtype,
-        head_dim,
-        head_dim_v,
-        qhead_per_kvhead,
-        lse is None,
-        bsa_fwd_kernel.m_block_size,
-        bsa_fwd_kernel.n_block_size,
-        bsa_fwd_kernel.pack_gqa,
-        arch,
-        bsa_fwd_kernel.use_2cta_instrs,
-        bsa_fwd_kernel.use_clc_scheduler,
-        bsa_fwd_kernel.is_persistent,
-        fa_logging.get_fa_log_level(),
-        has_variable_block_nums,
-        allow_empty_block_nums and has_variable_block_nums,
-        has_block_sizes,
-        "bhsd_kernel_boundary",
+    compile_key = _dynamic_tensors_compile_key(
+        "sm100_blk128_fwd",
+        (
+            dtype,
+            head_dim,
+            head_dim_v,
+            qhead_per_kvhead,
+            lse is None,
+            bsa_fwd_kernel.m_block_size,
+            bsa_fwd_kernel.n_block_size,
+            bsa_fwd_kernel.pack_gqa,
+            arch,
+            bsa_fwd_kernel.use_2cta_instrs,
+            bsa_fwd_kernel.use_clc_scheduler,
+            bsa_fwd_kernel.is_persistent,
+            fa_logging.get_fa_log_level(),
+            has_variable_block_nums,
+            allow_empty_block_nums and has_variable_block_nums,
+            has_block_sizes,
+            "bhsd_kernel_boundary",
+        ),
+        (
+            q_kernel,
+            k_kernel,
+            v_kernel,
+            out_kernel,
+            lse,
+            q2k_block_index,
+            block_sizes,
+            q2k_block_nums,
+        ),
     )
 
     if compile_key not in bsa_attn_fwd.compile_cache:
