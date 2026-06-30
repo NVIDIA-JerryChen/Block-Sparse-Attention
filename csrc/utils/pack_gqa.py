@@ -6,7 +6,7 @@ import cutlass.cute as cute
 
 from . import quack_compat  # noqa: F401
 from quack import layout_utils
-from . import utils
+from . import kernel_utils as utils
 
 
 def pack_gqa_layout(T, qhead_per_kvhead, nheads_kv, head_idx):

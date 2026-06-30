@@ -11,7 +11,7 @@ from cutlass import Float32
 
 from . import quack_compat  # noqa: F401
 from quack import layout_utils
-from . import utils
+from . import kernel_utils as utils
 from quack.cute_dsl_utils import ParamsBase
 
 

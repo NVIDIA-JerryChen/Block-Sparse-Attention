@@ -265,6 +265,9 @@ class SingleTileScheduler:
         self._is_first_block = False
         return self.get_current_work()
 
+    def consumer_advance(self, *, loc=None, ip=None):
+        return self.advance_to_next_work(loc=loc, ip=ip)
+
     def producer_tail(self, *, loc=None, ip=None):
         pass
 

@@ -7,8 +7,8 @@ from cutlass import Float32, Int32, Uint32, Boolean, const_expr
 from cutlass.cutlass_dsl import T
 from cutlass._mlir.dialects import llvm
 
-from csrc.fwd.sm100_blk128 import mma_sm100_desc as sm100_desc
-from csrc.fwd.sm100_blk128.blackwell_helpers import (
+from csrc.utils import mma_sm100_desc as sm100_desc
+from csrc.utils.blackwell_helpers import (
     declare_ptx_idesc,
     declare_ptx_smem_desc,
     i64_to_i32x2,

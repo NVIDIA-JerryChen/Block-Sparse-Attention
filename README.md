@@ -68,6 +68,8 @@ BSA/
 │   ├── kernel_utils.py                    # Math, layout, and tensor utilities
 │   ├── pipeline.py                        # TMA/UMMA pipeline helpers
 │   ├── tile_scheduler.py                  # Shared tile schedulers
+│   ├── block_sparse_tile_scheduler.py     # blk64 CLC persistent scheduler
+│   ├── softmax.py / pack_gqa.py           # Forward attention helpers
 │   └── ...
 │
 ├── utils/

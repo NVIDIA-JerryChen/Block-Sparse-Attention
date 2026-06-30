@@ -46,7 +46,7 @@ from cutlass.pipeline import (
 )
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 
-from csrc.fwd.sm100_blk128 import quack_compat  # noqa: F401
+from csrc.utils import quack_compat  # noqa: F401
 import quack.activation
 from quack import copy_utils, layout_utils
 from quack.cute_dsl_utils import ParamsBase

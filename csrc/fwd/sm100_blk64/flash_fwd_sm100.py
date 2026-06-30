@@ -24,26 +24,25 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
-from csrc.fwd.sm100_blk128 import quack_compat  # noqa: F401
+from csrc.utils import quack_compat  # noqa: F401
 from quack import copy_utils, layout_utils
 
-from csrc.fwd.sm100_blk128.cute_dsl_utils import assume_tensor_aligned
-from csrc.fwd.sm100_blk128 import utils
-from csrc.fwd.sm100_blk128 import pipeline as pipeline_custom
-from csrc.fwd.sm100_blk128.softmax import SoftmaxSm100
-from csrc.fwd.sm100_blk128.seqlen_info import SeqlenInfoQK
-from csrc.fwd.sm100_blk128.pack_gqa import PackGQA, pack_gqa_layout
-from csrc.fwd.sm100_blk128 import mma_sm100_desc as sm100_desc
+from csrc.utils.cute_dsl_utils import assume_tensor_aligned
+from csrc.utils import kernel_utils as utils
+from csrc.utils import pipeline as pipeline_custom
+from csrc.utils.softmax import SoftmaxSm100
+from csrc.utils.seqlen_info import SeqlenInfoQK
+from csrc.utils.pack_gqa import PackGQA, pack_gqa_layout
 from csrc.fwd.sm100_blk64 import blackwell_helpers as sm100_utils
-from csrc.fwd.sm100_blk128.named_barrier import NamedBarrierFwdSm100
+from csrc.utils.named_barrier import NamedBarrierFwdSm100
 from quack.cute_dsl_utils import ParamsBase
 import cutlass.pipeline as cutlass_pipeline
-from csrc.fwd.sm100_blk128.tile_scheduler import (
+from csrc.utils.block_sparse_tile_scheduler import (
     TileSchedulerArguments,
     TileSchedulerProtocol,
     SchedulingMode,
     SingleTileScheduler,
-    StaticPersistentTileScheduler,
+    BlockSparsePersistentTileScheduler,
 )
 
 class FlashAttentionForwardSm100Blk64:
@@ -651,11 +650,11 @@ class FlashAttentionForwardSm100Blk64:
             gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
 
         if const_expr(self.use_clc_scheduler):
-            TileScheduler = StaticPersistentTileScheduler
+            TileScheduler = BlockSparsePersistentTileScheduler
         elif const_expr(not self.is_persistent):
             TileScheduler = SingleTileScheduler
         else:
-            TileScheduler = StaticPersistentTileScheduler
+            TileScheduler = BlockSparsePersistentTileScheduler
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mQ.shape[0]), self.cta_tiler[0]),
             cute.size(mQ.shape[2]),
@@ -669,6 +668,7 @@ class FlashAttentionForwardSm100Blk64:
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             element_size=self.k_dtype.width // 8,
             is_persistent=self.is_persistent,
+            is_split_kv=self.is_split_kv,
             cluster_shape_mn=self.cluster_shape_mn,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(
@@ -2112,7 +2112,7 @@ class FlashAttentionForwardSm100Blk64:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
-            seqlen = SeqlenInfoCls()
+            seqlen = SeqlenInfoCls(batch_idx)
             out_head_idx = head_idx + split_idx * num_heads if const_expr(self.is_split_kv) else head_idx
 
             mO_cur = mO[None, None, None, batch_idx][None, None, out_head_idx]
@@ -2758,7 +2758,7 @@ class FlashAttentionForwardSm100Blk64:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
-            seqlen = SeqlenInfoCls()
+            seqlen = SeqlenInfoCls(batch_idx)
             out_head_idx = head_idx + split_idx * num_heads if const_expr(self.is_split_kv) else head_idx
 
             mO_cur = mO[None, None, None, batch_idx][None, None, out_head_idx]

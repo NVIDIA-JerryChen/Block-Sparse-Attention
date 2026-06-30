@@ -5,22 +5,9 @@ from functools import lru_cache
 
 import torch
 
-try:
-    from triton.tools.disasm import extract
-except ImportError:
-    extract = None
-
 import cutlass
 import cutlass.cute as cute
-from cutlass.cutlass_dsl import NumericMeta
 from cutlass.cute.runtime import from_dlpack
-
-StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None))
-
-
-load_cubin_module_data_og = cutlass.base_dsl.runtime.cuda.load_cubin_module_data
-cute_compile_og = cute.compile
-
 
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
