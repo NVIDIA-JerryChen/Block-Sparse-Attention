@@ -6,6 +6,7 @@ from csrc.bwd.bucketed_k2q_csr import (
     _bucketed_k2q_csr_compile_key,
     build_bucketed_k2q_csr_cutedsl,
 )
+from utils.cache_utils import JITCache
 
 
 def _reference_bucketed_k2q(
@@ -243,7 +244,7 @@ def test_bucketed_k2q_csr_variable_empty_edge_width():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_bucketed_k2q_csr_reuses_compile_across_runtime_shapes():
+def test_bucketed_k2q_csr_reuses_compile_across_runtime_shapes(monkeypatch):
     block_sparse_num = 2
     bucket_size_blocks = 3
     device_capability = torch.cuda.get_device_capability()
@@ -254,7 +255,12 @@ def test_bucketed_k2q_csr_reuses_compile_across_runtime_shapes():
         False,
         4,
     )
-    build_bucketed_k2q_csr_cutedsl.compile_cache.cache.pop(compile_key, None)
+    compile_cache = JITCache()
+    monkeypatch.setattr(
+        build_bucketed_k2q_csr_cutedsl,
+        "compile_cache",
+        compile_cache,
+    )
 
     first = torch.tensor(
         [[[[0, 1, -1, -1], [1, 2, -1, -1]]]],
@@ -267,7 +273,8 @@ def test_bucketed_k2q_csr_reuses_compile_across_runtime_shapes():
         num_kv_blocks=3,
         bucket_size_blocks=bucket_size_blocks,
     )
-    compiled = build_bucketed_k2q_csr_cutedsl.compile_cache[compile_key]
+    compiled = compile_cache[compile_key]
+    assert len(compile_cache.cache) == 1
 
     second = torch.arange(
         2 * 3 * 5 * 6,
@@ -283,4 +290,5 @@ def test_bucketed_k2q_csr_reuses_compile_across_runtime_shapes():
         bucket_size_blocks=bucket_size_blocks,
     )
 
-    assert build_bucketed_k2q_csr_cutedsl.compile_cache[compile_key] is compiled
+    assert len(compile_cache.cache) == 1
+    assert compile_cache[compile_key] is compiled

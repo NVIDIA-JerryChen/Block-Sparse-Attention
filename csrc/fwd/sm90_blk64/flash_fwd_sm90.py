@@ -522,6 +522,36 @@ class BlockSparseAttnForwardSm90Blk64(BatchedStaticSchedulerMixin):
         softmax_scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
+        # Restore compile-time head dimensions while keeping sequence, head,
+        # batch shapes, and their strides dynamic.
+        mQ = cute.make_tensor(
+            mQ.iterator,
+            cute.make_layout(
+                (mQ.shape[0], self.qk_dim, mQ.shape[2], mQ.shape[3]),
+                stride=mQ.stride,
+            ),
+        )
+        mK = cute.make_tensor(
+            mK.iterator,
+            cute.make_layout(
+                (mK.shape[0], self.qk_dim, mK.shape[2], mK.shape[3]),
+                stride=mK.stride,
+            ),
+        )
+        mV = cute.make_tensor(
+            mV.iterator,
+            cute.make_layout(
+                (self.value_dim, mV.shape[1], mV.shape[2], mV.shape[3]),
+                stride=mV.stride,
+            ),
+        )
+        mO = cute.make_tensor(
+            mO.iterator,
+            cute.make_layout(
+                (mO.shape[0], self.value_dim, mO.shape[2], mO.shape[3]),
+                stride=mO.stride,
+            ),
+        )
         self.check_dim([mQ, mK, mO], 1)
         self.check_dim(mV, 0)
 

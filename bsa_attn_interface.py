@@ -91,7 +91,7 @@ def maybe_contiguous(x):
 
 def _to_cute_tensor(
     t: torch.Tensor,
-    assumed_align: int = 16,
+    assumed_align: Optional[int] = 16,
     leading_dim: int = -1,
     fully_dynamic: bool = False,
     enable_tvm_ffi: bool = True,
@@ -256,20 +256,19 @@ def _sm100_blk64_requires_int64_kv_strides(
     return False
 
 
-def _tensor_compile_key(t: torch.Tensor):
-    return (tuple(t.shape), tuple(t.stride()), t.dtype)
-
-
 def _tensor_layout_compile_key(t: torch.Tensor):
     return (tuple(t.dim_order()), tuple(s == 0 for s in t.stride()))
 
 
-def _tensor_dynamic_layout_compile_key(t: torch.Tensor):
+def _tensor_dynamic_layout_compile_key(t: torch.Tensor, leading_dim: int = -1):
     """Match the static rank/dtype/broadcast parts of mark_layout_dynamic()."""
+    if leading_dim == -1:
+        leading_dim = t.ndim - 1
     return (
         t.dtype,
         t.ndim,
-        int(t.stride(-1)),
+        int(leading_dim),
+        int(t.stride(leading_dim)),
         tuple(s == 0 for s in t.stride()),
     )
 
@@ -278,15 +277,19 @@ def _dynamic_tensors_compile_key(
     namespace: str,
     config: tuple,
     tensors: tuple[Optional[torch.Tensor], ...],
+    leading_dims: Optional[tuple[int, ...]] = None,
 ):
+    if leading_dims is None:
+        leading_dims = tuple(-1 for _ in tensors)
+    assert len(tensors) == len(leading_dims)
     return (
         namespace,
         *config,
         *(
-            _tensor_dynamic_layout_compile_key(tensor)
+            _tensor_dynamic_layout_compile_key(tensor, leading_dim)
             if tensor is not None
             else None
-            for tensor in tensors
+            for tensor, leading_dim in zip(tensors, leading_dims)
         ),
     )
 
@@ -687,18 +690,44 @@ def _bsa_attn_fwd_sm90_blk64(
     if has_block_sizes:
         block_sizes_t = block_sizes_bh.permute(2, 1, 0)
 
-    q_cute = from_dlpack(q_t.detach(), assumed_align=128)
-    k_cute = from_dlpack(k_t.detach(), assumed_align=128)
-    v_cute = from_dlpack(v_t.detach(), assumed_align=128)
-    out_cute = from_dlpack(out_t.detach(), assumed_align=128)
-    lse_cute = from_dlpack(lse_t.detach(), assumed_align=4)
-    q2k_cute = from_dlpack(q2k_t.detach())
-    q2k_nums_cute = from_dlpack(q2k_nums_t.detach())
+    q_cute = _to_cute_tensor(
+        q_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False
+    )
+    k_cute = _to_cute_tensor(
+        k_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False
+    )
+    v_cute = _to_cute_tensor(
+        v_t, assumed_align=128, leading_dim=0, enable_tvm_ffi=False
+    )
+    out_cute = _to_cute_tensor(
+        out_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False
+    )
+    lse_cute = _to_cute_tensor(
+        lse_t, assumed_align=4, leading_dim=0, enable_tvm_ffi=False
+    )
+    q2k_cute = _to_cute_tensor(
+        q2k_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False
+    )
+    q2k_nums_cute = _to_cute_tensor(
+        q2k_nums_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False
+    )
     block_sizes_cute = (
-        from_dlpack(block_sizes_t.detach()) if has_block_sizes else q2k_nums_cute
+        _to_cute_tensor(
+            block_sizes_t,
+            assumed_align=None,
+            leading_dim=0,
+            enable_tvm_ffi=False,
+        )
+        if has_block_sizes
+        else q2k_nums_cute
     )
     split_offsets_cute = (
-        from_dlpack(split_offsets_t.detach())
+        _to_cute_tensor(
+            split_offsets_t,
+            assumed_align=None,
+            leading_dim=0,
+            enable_tvm_ffi=False,
+        )
         if split_offsets_t is not None
         else q2k_nums_cute
     )
@@ -716,24 +745,30 @@ def _bsa_attn_fwd_sm90_blk64(
         num_splits=kv_splits,
     )
 
-    compile_key = (
-        "sm90_blk64",
-        q.dtype,
-        head_dim,
-        v.shape[-1],
-        gqa_ratio,
-        SM90_FWD_BLOCK_SIZE,
-        _tensor_compile_key(q_t),
-        _tensor_compile_key(k_t),
-        _tensor_compile_key(v_t),
-        _tensor_compile_key(out_t),
-        _tensor_compile_key(lse_t),
-        _tensor_compile_key(q2k_t),
-        _tensor_compile_key(q2k_nums_t),
-        has_block_sizes,
-        _tensor_compile_key(block_sizes_t) if has_block_sizes else None,
-        kv_splits,
-        _tensor_compile_key(split_offsets_t) if split_offsets_t is not None else None,
+    compile_key = _dynamic_tensors_compile_key(
+        "sm90_blk64_fwd",
+        (
+            _get_device_arch(),
+            q.dtype,
+            head_dim,
+            v.shape[-1],
+            gqa_ratio,
+            SM90_FWD_BLOCK_SIZE,
+            has_block_sizes,
+            kv_splits,
+        ),
+        (
+            q_t,
+            k_t,
+            v_t,
+            out_t,
+            lse_t,
+            q2k_t,
+            q2k_nums_t,
+            block_sizes_t if has_block_sizes else q2k_nums_t,
+            split_offsets_t if split_offsets_t is not None else q2k_nums_t,
+        ),
+        leading_dims=(1, 1, 0, 1, 0, 0, 0, 0, 0),
     )
     args = (
         q_cute,
