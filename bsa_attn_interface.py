@@ -264,6 +264,25 @@ def _tensor_layout_compile_key(t: torch.Tensor):
     return (tuple(t.dim_order()), tuple(s == 0 for s in t.stride()))
 
 
+def _sm90_bwd_compile_key(
+    arch: int,
+    dtype: torch.dtype,
+    head_dim: int,
+    has_block_sizes: bool,
+    stages: tuple[int, int, int],
+    tensors: tuple[torch.Tensor, ...],
+):
+    return (
+        "sm90_bucketed_k2q",
+        int(arch),
+        dtype,
+        int(head_dim),
+        bool(has_block_sizes),
+        *stages,
+        *((tensor.dtype, _tensor_layout_compile_key(tensor)) for tensor in tensors),
+    )
+
+
 def _ceil_div_int(a: int, b: int) -> int:
     return (int(a) + int(b) - 1) // int(b)
 
@@ -2372,25 +2391,17 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         bwd_kernel = BlockSparseAttnBackwardSm90Blk64(dtype, head_dim, head_dim)
         problem_shape = (seqlen_q, seqlen_k, head_dim, (num_heads, batch_size))
 
-        compile_key = (
-            "sm90_bucketed_k2q",
+        compile_key = _sm90_bwd_compile_key(
+            arch,
             q.dtype,
             head_dim,
-            num_heads,
-            bucketed_k2q_offsets.shape[2],
             block_sizes_sm90 is not None,
-            bwd_kernel.dQaccum_stage,
-            bwd_kernel.PdS_stage,
-            bwd_kernel.Q_stage,
-            _tensor_compile_key(dout),
-            _tensor_compile_key(out),
-            _tensor_compile_key(q),
-            _tensor_compile_key(k),
-            _tensor_compile_key(v),
-            _tensor_compile_key(dq),
-            _tensor_compile_key(dk),
-            _tensor_compile_key(dv),
-            _tensor_compile_key(lse),
+            (
+                bwd_kernel.dQaccum_stage,
+                bwd_kernel.PdS_stage,
+                bwd_kernel.Q_stage,
+            ),
+            (dout, out, q, k, v, dq, dk, dv, lse),
         )
 
         if compile_key not in _bsa_attn_bwd_bucketed_k2q_csr.compile_cache:
