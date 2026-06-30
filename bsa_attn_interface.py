@@ -264,6 +264,33 @@ def _tensor_layout_compile_key(t: torch.Tensor):
     return (tuple(t.dim_order()), tuple(s == 0 for s in t.stride()))
 
 
+def _tensor_dynamic_layout_compile_key(t: torch.Tensor):
+    """Match the static rank/dtype/broadcast parts of mark_layout_dynamic()."""
+    return (
+        t.dtype,
+        t.ndim,
+        int(t.stride(-1)),
+        tuple(s == 0 for s in t.stride()),
+    )
+
+
+def _dynamic_tensors_compile_key(
+    namespace: str,
+    config: tuple,
+    tensors: tuple[Optional[torch.Tensor], ...],
+):
+    return (
+        namespace,
+        *config,
+        *(
+            _tensor_dynamic_layout_compile_key(tensor)
+            if tensor is not None
+            else None
+            for tensor in tensors
+        ),
+    )
+
+
 def _sm90_bwd_compile_key(
     arch: int,
     dtype: torch.dtype,
@@ -1397,6 +1424,7 @@ def bsa_attn_fwd_blk64_cutedsl(
     assert k_bhsd.shape == (batch_size, num_head_kv, seqlen_k, head_dim)
     assert v_bhsd.shape == (batch_size, num_head_kv, seqlen_k, head_dim_v)
     assert q2k_block_index.dtype == torch.int32
+    q2k_block_index = maybe_contiguous(q2k_block_index)
     has_block_sizes = block_sizes is not None and block_sizes.numel() > 0
     if has_block_sizes:
         block_sizes = maybe_contiguous(block_sizes)
@@ -1513,30 +1541,40 @@ def bsa_attn_fwd_blk64_cutedsl(
         else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     )
 
-    compile_key = (
-        dtype,
-        head_dim,
-        head_dim_v,
-        qhead_per_kvhead,
-        pack_gqa,
-        tile_m,
-        tile_n,
-        sparse_block_size,
-        arch,
-        fa_logging.get_fa_log_level(),
-        has_variable_block_nums,
-        allow_empty_block_nums,
-        has_block_sizes,
-        kv_splits_i,
-        out_bhsd.dtype,
-        tuple(out_bhsd.shape),
-        tuple(out_bhsd.stride()),
-        tuple(lse.shape),
-        tuple(lse.stride()),
-        is_persistent,
-        use_clc_scheduler,
-        input_layout,
-        use_int64_kv_strides,
+    compile_key = _dynamic_tensors_compile_key(
+        "sm100_blk64_fwd",
+        (
+            dtype,
+            head_dim,
+            head_dim_v,
+            qhead_per_kvhead,
+            pack_gqa,
+            tile_m,
+            tile_n,
+            sparse_block_size,
+            arch,
+            fa_logging.get_fa_log_level(),
+            has_variable_block_nums,
+            allow_empty_block_nums,
+            has_block_sizes,
+            kv_splits_i,
+            out_bhsd.dtype,
+            is_persistent,
+            use_clc_scheduler,
+            input_layout,
+            use_int64_kv_strides,
+        ),
+        (
+            q_bhsd,
+            k_bhsd,
+            v_bhsd,
+            out_bhsd,
+            lse,
+            q2k_block_index,
+            block_sizes,
+            q2k_block_nums,
+            split_offsets,
+        ),
     )
 
     if compile_key not in bsa_attn_fwd_blk64_cutedsl.compile_cache:
