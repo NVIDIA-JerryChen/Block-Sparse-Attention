@@ -412,9 +412,17 @@ def _test_bwd_layout_equivalence():
         softmax_scale=softmax_scale,
         layout="bshd",
     )
-    assert torch.equal(dq_auto.transpose(1, 2), dq_bhsd)
-    assert torch.equal(dk_auto.transpose(1, 2), dk_bhsd)
-    assert torch.equal(dv_auto.transpose(1, 2), dv_bhsd)
+    # Bucketed CSR scatter and dQ accumulation use atomics, so equivalent
+    # layouts can differ by a small BF16 rounding step.
+    torch.testing.assert_close(
+        dq_auto.transpose(1, 2), dq_bhsd, rtol=1e-3, atol=5e-4
+    )
+    torch.testing.assert_close(
+        dk_auto.transpose(1, 2), dk_bhsd, rtol=1e-3, atol=5e-4
+    )
+    torch.testing.assert_close(
+        dv_auto.transpose(1, 2), dv_bhsd, rtol=1e-3, atol=5e-4
+    )
 
     dq_buf = torch.empty_like(q_bshd)
     dk_buf = torch.empty_like(k_bshd)
@@ -440,9 +448,15 @@ def _test_bwd_layout_equivalence():
     assert dq_bshd.data_ptr() == dq_buf.data_ptr()
     assert dk_bshd.data_ptr() == dk_buf.data_ptr()
     assert dv_bshd.data_ptr() == dv_buf.data_ptr()
-    assert torch.equal(dq_bshd.transpose(1, 2), dq_bhsd)
-    assert torch.equal(dk_bshd.transpose(1, 2), dk_bhsd)
-    assert torch.equal(dv_bshd.transpose(1, 2), dv_bhsd)
+    torch.testing.assert_close(
+        dq_bshd.transpose(1, 2), dq_bhsd, rtol=1e-3, atol=5e-4
+    )
+    torch.testing.assert_close(
+        dk_bshd.transpose(1, 2), dk_bhsd, rtol=1e-3, atol=5e-4
+    )
+    torch.testing.assert_close(
+        dv_bshd.transpose(1, 2), dv_bhsd, rtol=1e-3, atol=5e-4
+    )
 
 
 # ============== Pytest ==============

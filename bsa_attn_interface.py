@@ -14,8 +14,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32
 from cutlass.cute.runtime import from_dlpack
-import triton
-import triton.language as tl
 from utils.cache_utils import get_jit_cache
 from utils.testing import is_fake_mode
 
@@ -74,6 +72,7 @@ from csrc.bwd.sm90_blk64.flash_bwd_sm90 import (
     sm90_bwd_auto_bucketed_k2q_size_blocks,
     sm90_bwd_default_bucketed_k2q_size_blocks,
 )
+from csrc.bwd.bucketed_k2q_csr import build_bucketed_k2q_csr_cutedsl
 
 try:
     import bsa_fwd_blk64_ext  # triggers TORCH_LIBRARY registration of bsa_blk64.fwd
@@ -2222,214 +2221,6 @@ def bsa_attn_bwd(
     return dq_out, dk_out, dv_out
 
 
-@triton.jit
-def _bucketed_k2q_count_edges_kernel(
-    counts,
-    q2k_index,
-    q2k_nums,
-    idx_b_s: tl.constexpr,
-    idx_h_s: tl.constexpr,
-    idx_q_s: tl.constexpr,
-    idx_k_s: tl.constexpr,
-    nums_b_s: tl.constexpr,
-    nums_h_s: tl.constexpr,
-    nums_q_s: tl.constexpr,
-    num_heads: tl.constexpr,
-    num_kv_blocks: tl.constexpr,
-    num_q_groups: tl.constexpr,
-    bucket_size_blocks: tl.constexpr,
-    max_k: tl.constexpr,
-    block_sparse_num: tl.constexpr,
-    has_variable_nums: tl.constexpr,
-):
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    q = tl.program_id(2)
-
-    n = block_sparse_num
-    if has_variable_nums:
-        n = tl.load(q2k_nums + b * nums_b_s + h * nums_h_s + q * nums_q_s)
-
-    q_group = q // bucket_size_blocks
-    q2k_base = q2k_index + b * idx_b_s + h * idx_h_s + q * idx_q_s
-    count_base = ((b * num_heads + h) * num_q_groups + q_group) * num_kv_blocks
-
-    for i in tl.range(0, max_k):
-        if i < n:
-            kv = tl.load(q2k_base + i * idx_k_s)
-            if (kv >= 0) & (kv < num_kv_blocks):
-                tl.atomic_add(counts + count_base + kv, 1, sem="relaxed")
-
-
-@triton.jit
-def _bucketed_k2q_count_edges_fixed_vec_kernel(
-    counts,
-    q2k_index,
-    idx_b_s: tl.constexpr,
-    idx_h_s: tl.constexpr,
-    idx_q_s: tl.constexpr,
-    idx_k_s: tl.constexpr,
-    num_heads: tl.constexpr,
-    num_kv_blocks: tl.constexpr,
-    num_q_groups: tl.constexpr,
-    bucket_size_blocks: tl.constexpr,
-    block_sparse_num: tl.constexpr,
-    num_k_tiles: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    qk_tile = tl.program_id(2)
-    q = qk_tile // num_k_tiles
-    k_tile = qk_tile - q * num_k_tiles
-
-    offs = k_tile * BLOCK_K + tl.arange(0, BLOCK_K)
-    mask = offs < block_sparse_num
-    q_group = q // bucket_size_blocks
-    q2k_base = q2k_index + b * idx_b_s + h * idx_h_s + q * idx_q_s
-    count_base = ((b * num_heads + h) * num_q_groups + q_group) * num_kv_blocks
-
-    kv = tl.load(q2k_base + offs * idx_k_s, mask=mask, other=0)
-    tl.atomic_add(counts + count_base + kv, 1, sem="relaxed", mask=mask)
-
-
-@triton.jit
-def _bucketed_k2q_local_offsets_kernel(
-    counts,
-    local_offsets,
-    group_totals,
-    num_heads: tl.constexpr,
-    num_kv_blocks: tl.constexpr,
-    num_q_groups: tl.constexpr,
-):
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    g = tl.program_id(2)
-
-    count_base = ((b * num_heads + h) * num_q_groups + g) * num_kv_blocks
-    offset_base = ((b * num_heads + h) * num_q_groups + g) * (num_kv_blocks + 1)
-
-    running = tl.full((), 0, tl.int32)
-    for kv in tl.range(0, num_kv_blocks):
-        tl.store(local_offsets + offset_base + kv, running)
-        running += tl.load(counts + count_base + kv)
-    tl.store(local_offsets + offset_base + num_kv_blocks, running)
-    tl.store(group_totals + (b * num_heads + h) * num_q_groups + g, running)
-
-
-@triton.jit
-def _bucketed_k2q_finalize_offsets_kernel(
-    local_offsets,
-    group_totals,
-    bucketed_k2q_offsets,
-    cursors,
-    num_heads: tl.constexpr,
-    num_kv_blocks: tl.constexpr,
-    num_q_groups: tl.constexpr,
-):
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    g = tl.program_id(2)
-
-    bh_group_base = (b * num_heads + h) * num_q_groups
-    base = tl.full((), 0, tl.int32)
-    for prev_g in tl.range(0, num_q_groups):
-        if prev_g < g:
-            base += tl.load(group_totals + bh_group_base + prev_g)
-
-    local_base = (bh_group_base + g) * (num_kv_blocks + 1)
-    k2q_offset_base = (bh_group_base + g) * (num_kv_blocks + 1)
-    cursor_base = (bh_group_base + g) * num_kv_blocks
-
-    for kv in tl.range(0, num_kv_blocks):
-        offset = base + tl.load(local_offsets + local_base + kv)
-        tl.store(bucketed_k2q_offsets + k2q_offset_base + kv, offset)
-        tl.store(cursors + cursor_base + kv, offset)
-    tl.store(
-        bucketed_k2q_offsets + k2q_offset_base + num_kv_blocks,
-        base + tl.load(local_offsets + local_base + num_kv_blocks),
-    )
-
-
-@triton.jit
-def _bucketed_k2q_scatter_q_indices_kernel(
-    cursors,
-    bucketed_k2q_indices,
-    q2k_index,
-    q2k_nums,
-    idx_b_s: tl.constexpr,
-    idx_h_s: tl.constexpr,
-    idx_q_s: tl.constexpr,
-    idx_k_s: tl.constexpr,
-    nums_b_s: tl.constexpr,
-    nums_h_s: tl.constexpr,
-    nums_q_s: tl.constexpr,
-    num_heads: tl.constexpr,
-    num_kv_blocks: tl.constexpr,
-    num_q_groups: tl.constexpr,
-    bucket_size_blocks: tl.constexpr,
-    max_edges_per_bh: tl.constexpr,
-    max_k: tl.constexpr,
-    block_sparse_num: tl.constexpr,
-    has_variable_nums: tl.constexpr,
-):
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    q = tl.program_id(2)
-
-    n = block_sparse_num
-    if has_variable_nums:
-        n = tl.load(q2k_nums + b * nums_b_s + h * nums_h_s + q * nums_q_s)
-
-    q_group = q // bucket_size_blocks
-    q2k_base = q2k_index + b * idx_b_s + h * idx_h_s + q * idx_q_s
-    cursor_base = ((b * num_heads + h) * num_q_groups + q_group) * num_kv_blocks
-    k2q_indices_base = (b * num_heads + h) * max_edges_per_bh
-
-    for i in tl.range(0, max_k):
-        if i < n:
-            kv = tl.load(q2k_base + i * idx_k_s)
-            if (kv >= 0) & (kv < num_kv_blocks):
-                pos = tl.atomic_add(cursors + cursor_base + kv, 1, sem="relaxed")
-                tl.store(bucketed_k2q_indices + k2q_indices_base + pos, q)
-
-
-@triton.jit
-def _bucketed_k2q_scatter_q_indices_fixed_vec_kernel(
-    cursors,
-    bucketed_k2q_indices,
-    q2k_index,
-    idx_b_s: tl.constexpr,
-    idx_h_s: tl.constexpr,
-    idx_q_s: tl.constexpr,
-    idx_k_s: tl.constexpr,
-    num_heads: tl.constexpr,
-    num_kv_blocks: tl.constexpr,
-    num_q_groups: tl.constexpr,
-    bucket_size_blocks: tl.constexpr,
-    max_edges_per_bh: tl.constexpr,
-    block_sparse_num: tl.constexpr,
-    num_k_tiles: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    qk_tile = tl.program_id(2)
-    q = qk_tile // num_k_tiles
-    k_tile = qk_tile - q * num_k_tiles
-
-    offs = k_tile * BLOCK_K + tl.arange(0, BLOCK_K)
-    mask = offs < block_sparse_num
-    q_group = q // bucket_size_blocks
-    q2k_base = q2k_index + b * idx_b_s + h * idx_h_s + q * idx_q_s
-    cursor_base = ((b * num_heads + h) * num_q_groups + q_group) * num_kv_blocks
-    k2q_indices_base = (b * num_heads + h) * max_edges_per_bh
-
-    kv = tl.load(q2k_base + offs * idx_k_s, mask=mask, other=0)
-    pos = tl.atomic_add(cursors + cursor_base + kv, 1, sem="relaxed", mask=mask)
-    tl.store(bucketed_k2q_indices + k2q_indices_base + pos, q, mask=mask)
-
-
 def _build_bucketed_k2q_csr(
     q2k_block_index: torch.Tensor,
     block_sparse_num: int,
@@ -2438,158 +2229,19 @@ def _build_bucketed_k2q_csr(
     bucket_size_blocks: int = 1152,
     q2k_block_nums: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
-    """Build bucketed k2q CSR on GPU for the backward path.
+    """Build bucketed K-to-Q CSR metadata with CuTe DSL kernels.
 
-    The returned offsets have shape ``(B, H, num_q_groups, num_kv_blocks + 1)``.
-    For each ``(b, h, q_group, kv_block)``, the corresponding slice in
-    ``bucketed_k2q_indices`` stores the attending Q block ids.
+    The offsets have shape ``(B, H, num_q_groups, num_kv_blocks + 1)``.
+    Each corresponding slice in ``bucketed_k2q_indices`` stores the global
+    Q-block ids attending that KV block.
     """
-    assert q2k_block_index.dtype == torch.int32
-    assert q2k_block_index.is_cuda
-    B, H, num_q_blocks, max_kv = q2k_block_index.shape
-    G = bucket_size_blocks
-    num_q_groups = (num_q_blocks + G - 1) // G
-
-    q2k_block_index = q2k_block_index.contiguous()
-    if q2k_block_nums is None:
-        nums = q2k_block_index
-        max_edges = num_q_blocks * int(block_sparse_num)
-        max_k = int(block_sparse_num)
-        has_variable_nums = False
-    else:
-        assert q2k_block_nums.dtype == torch.int32
-        assert q2k_block_nums.shape == (B, H, num_q_blocks)
-        nums = q2k_block_nums.contiguous()
-        max_edges = num_q_blocks * max_kv
-        max_k = max_kv
-        has_variable_nums = True
-
-    max_edges = max(1, max_edges)
-    max_k2q_rows_per_group = num_kv_blocks
-
-    counts = torch.zeros(
-        (B, H, num_q_groups, num_kv_blocks),
-        dtype=torch.int32,
-        device=q2k_block_index.device,
-    )
-    local_offsets = torch.empty(
-        (B, H, num_q_groups, num_kv_blocks + 1),
-        dtype=torch.int32,
-        device=q2k_block_index.device,
-    )
-    group_totals = torch.empty(
-        (B, H, num_q_groups),
-        dtype=torch.int32,
-        device=q2k_block_index.device,
-    )
-    bucketed_k2q_offsets = torch.empty_like(local_offsets)
-    cursors = torch.empty_like(counts)
-    bucketed_k2q_indices = torch.empty(
-        (B, H, max_edges), dtype=torch.int32, device=q2k_block_index.device
-    )
-
-    grid_q = (B, H, num_q_blocks)
-    if has_variable_nums:
-        _bucketed_k2q_count_edges_kernel[grid_q](
-            counts,
-            q2k_block_index,
-            nums,
-            q2k_block_index.stride(0),
-            q2k_block_index.stride(1),
-            q2k_block_index.stride(2),
-            q2k_block_index.stride(3),
-            nums.stride(0),
-            nums.stride(1),
-            nums.stride(2),
-            H,
-            num_kv_blocks,
-            num_q_groups,
-            G,
-            max_k,
-            int(block_sparse_num),
-            has_variable_nums,
-        )
-    else:
-        block_k = 1024
-        num_k_tiles = triton.cdiv(max_k, block_k)
-        grid_qk = (B, H, num_q_blocks * num_k_tiles)
-        _bucketed_k2q_count_edges_fixed_vec_kernel[grid_qk](
-            counts,
-            q2k_block_index,
-            q2k_block_index.stride(0),
-            q2k_block_index.stride(1),
-            q2k_block_index.stride(2),
-            q2k_block_index.stride(3),
-            H,
-            num_kv_blocks,
-            num_q_groups,
-            G,
-            int(block_sparse_num),
-            num_k_tiles,
-            BLOCK_K=block_k,
-        )
-
-    grid_group = (B, H, num_q_groups)
-    _bucketed_k2q_local_offsets_kernel[grid_group](
-        counts,
-        local_offsets,
-        group_totals,
-        H,
+    return build_bucketed_k2q_csr_cutedsl(
+        q2k_block_index,
+        block_sparse_num,
         num_kv_blocks,
-        num_q_groups,
+        bucket_size_blocks=bucket_size_blocks,
+        q2k_block_nums=q2k_block_nums,
     )
-    _bucketed_k2q_finalize_offsets_kernel[grid_group](
-        local_offsets,
-        group_totals,
-        bucketed_k2q_offsets,
-        cursors,
-        H,
-        num_kv_blocks,
-        num_q_groups,
-    )
-
-    if has_variable_nums:
-        _bucketed_k2q_scatter_q_indices_kernel[grid_q](
-            cursors,
-            bucketed_k2q_indices,
-            q2k_block_index,
-            nums,
-            q2k_block_index.stride(0),
-            q2k_block_index.stride(1),
-            q2k_block_index.stride(2),
-            q2k_block_index.stride(3),
-            nums.stride(0),
-            nums.stride(1),
-            nums.stride(2),
-            H,
-            num_kv_blocks,
-            num_q_groups,
-            G,
-            max_edges,
-            max_k,
-            int(block_sparse_num),
-            has_variable_nums,
-        )
-    else:
-        _bucketed_k2q_scatter_q_indices_fixed_vec_kernel[grid_qk](
-            cursors,
-            bucketed_k2q_indices,
-            q2k_block_index,
-            q2k_block_index.stride(0),
-            q2k_block_index.stride(1),
-            q2k_block_index.stride(2),
-            q2k_block_index.stride(3),
-            H,
-            num_kv_blocks,
-            num_q_groups,
-            G,
-            max_edges,
-            int(block_sparse_num),
-            num_k_tiles,
-            BLOCK_K=block_k,
-        )
-
-    return bucketed_k2q_offsets, bucketed_k2q_indices, num_q_groups, max_k2q_rows_per_group
 
 
 def _bsa_attn_bwd_bucketed_k2q_csr(
@@ -2613,9 +2265,9 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
 
     This has the same tensor contract as :func:`bsa_attn_bwd`, but builds a
     compact bucketed k2q CSR task layout and runs the blk64 backward
-    kernel. Task construction is performed on GPU with Triton on every
-    call, so this path is suitable when the sparse pattern changes each
-    backward.
+    kernel. Task construction is performed on GPU with CuTe DSL kernels
+    on every call, so this path is suitable when the sparse pattern changes
+    each backward.
     """
     q, k, v, out, dout = [maybe_contiguous(t) for t in (q, k, v, out, dout)]
     lse = maybe_contiguous(lse)
