@@ -7,6 +7,7 @@ from enum import IntEnum
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.cute.nvgpu import tcgen05
 
 # ---------------------------------------------------------------------------
 # Enumerations that match the HW encodings (values MUST stay identical)
@@ -169,8 +170,8 @@ def mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp):
         op.acc_dtype,
         op.shape_mnk[0],
         op.shape_mnk[1],
-        Major.K if op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
-        Major.K if op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
+        Major.K if op.a_major_mode == tcgen05.OperandMajorMode.K else Major.MN,
+        Major.K if op.b_major_mode == tcgen05.OperandMajorMode.K else Major.MN,
     )
 
 
@@ -199,7 +200,9 @@ def _layout_type(swizzle: cute.Swizzle) -> LayoutType:
             1: LayoutType.SWIZZLE_32B,
             2: LayoutType.SWIZZLE_64B,
             3: LayoutType.SWIZZLE_128B,
-        }[B]  # KeyError ⇒ invalid B→ raise
+        }[
+            B
+        ]  # KeyError ⇒ invalid B→ raise
     if M == 5:  # Swizzle<2,5,2> (the only legal triple for M==5)
         if (B, S) != (2, 2):
             raise ValueError("Only Swizzle<2,5,2> supported for 128B_BASE32B")
@@ -285,12 +288,3 @@ def make_smem_desc_base(layout: cute.Layout, swizzle: cute.Swizzle, major: Major
 def make_smem_desc_start_addr(start_addr: cute.Pointer) -> cutlass.Int32:
     # 14 bits, remove 4 LSB (bits 0-13 in desc)
     return (start_addr.toint() & 0x3FFFF) >> 4
-
-
-def smem_desc_base_from_tensor(sA: cute.Tensor, major: Major) -> int:
-    sA_swizzle = sA.iterator.type.swizzle_type
-    return make_smem_desc_base(
-        cute.recast_layout(128, sA.element_type.width, sA.layout[0]),
-        sA_swizzle,
-        major,
-    )

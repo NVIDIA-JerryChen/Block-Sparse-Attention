@@ -23,11 +23,11 @@ import cutlass.cute as cute
 from cutlass import Float32, const_expr
 from cutlass.cutlass_dsl import Arch, BaseDSL
 
-from quack import copy_utils, layout_utils
+from csrc.utils import copy_utils, layout_utils
 
 from csrc.utils import kernel_utils as utils
 from csrc.utils.seqlen_info import SeqlenInfo
-from quack.cute_dsl_utils import ParamsBase
+from csrc.utils.cute_dsl_utils import ParamsBase
 from csrc.utils.tile_scheduler import (
     SingleTileScheduler,
     SingleTileVarlenScheduler,
@@ -35,7 +35,7 @@ from csrc.utils.tile_scheduler import (
 )
 
 
-class FlashAttentionBackwardPreprocess:
+class BlockSparseAttnBackwardPreprocess:
     def __init__(
         self,
         dtype: Type[cutlass.Numeric],
@@ -67,32 +67,6 @@ class FlashAttentionBackwardPreprocess:
         self.num_threads = num_threads
         self.use_padded_offsets = use_padded_offsets
 
-    @staticmethod
-    def can_implement(dtype, head_dim, tile_m, num_threads) -> bool:
-        """Check if the kernel can be implemented with the given parameters.
-
-        :param dtype: data type
-        :type dtype: cutlass.Numeric
-        :param head_dim: head dimension
-        :type head_dim: int
-        :param tile_m: m block size
-        :type tile_m: int
-        :param num_threads: number of threads
-        :type num_threads: int
-
-        :return: True if the kernel can be implemented, False otherwise
-        :rtype: bool
-        """
-        if dtype not in [cutlass.Float16, cutlass.BFloat16]:
-            return False
-        if head_dim % 8 != 0:
-            return False
-        if num_threads % 32 != 0:
-            return False
-        if num_threads < tile_m:  # For multiplying lse with log2
-            return False
-        return True
-
     def _setup_attributes(self):
         # ///////////////////////////////////////////////////////////////////////////////
         # GMEM Tiled copy:
@@ -101,27 +75,15 @@ class FlashAttentionBackwardPreprocess:
         # We want kBlockKGmem to be a power of 2 so that when we do the summing,
         # it's just between threads in the same warp
         gmem_k_block_size = (
-            128
-            if self.head_dim_v_padded % 128 == 0
-            else (
-                64
-                if self.head_dim_v_padded % 64 == 0
-                else (32 if self.head_dim_v_padded % 32 == 0 else 16)
-            )
+            128 if self.head_dim_v_padded % 128 == 0 else (64 if self.head_dim_v_padded % 64 == 0 else (32 if self.head_dim_v_padded % 32 == 0 else 16))
         )
         num_copy_elems = 128 // self.dtype.width
         threads_per_row = gmem_k_block_size // num_copy_elems
-        self.gmem_tiled_copy_O = copy_utils.tiled_copy_2d(
-            self.dtype, threads_per_row, self.num_threads, num_copy_elems
-        )
+        self.gmem_tiled_copy_O = copy_utils.tiled_copy_2d(self.dtype, threads_per_row, self.num_threads, num_copy_elems)
         universal_copy_bits = 128
         num_copy_elems_dQaccum = universal_copy_bits // Float32.width
-        assert (
-            self.tile_m * self.head_dim_padded // num_copy_elems_dQaccum
-        ) % self.num_threads == 0
-        self.gmem_tiled_copy_dQaccum = copy_utils.tiled_copy_1d(
-            Float32, self.num_threads, num_copy_elems_dQaccum
-        )
+        assert (self.tile_m * self.head_dim_padded // num_copy_elems_dQaccum) % self.num_threads == 0
+        self.gmem_tiled_copy_dQaccum = copy_utils.tiled_copy_1d(Float32, self.num_threads, num_copy_elems_dQaccum)
 
     @cute.jit
     def __call__(
@@ -255,9 +217,7 @@ class FlashAttentionBackwardPreprocess:
             # ///////////////////////////////////////////////////////////////////////////////
             # Get the appropriate tiles for this thread block.
             # ///////////////////////////////////////////////////////////////////////////////
-            seqlen = SeqlenInfo.create(
-                batch_idx, mO.shape[1], mCuSeqlensQ, mSeqUsedQ, tile=self.tile_m
-            )
+            seqlen = SeqlenInfo.create(batch_idx, mO.shape[1], mCuSeqlensQ, mSeqUsedQ, tile=self.tile_m)
             mO_cur = seqlen.offset_batch(mO, batch_idx, dim=0)[None, head_idx, None]
             mdO_cur = seqlen.offset_batch(mdO, batch_idx, dim=0)[None, head_idx, None]
             # Stats buffers (dpsum/lse_log2) are always consumed with padded q-offsets
@@ -266,9 +226,7 @@ class FlashAttentionBackwardPreprocess:
             stats_use_padded_offsets = self.use_padded_offsets
             if const_expr(mdQaccum is not None):
                 stats_use_padded_offsets = True
-            mPdPsum_cur = seqlen.offset_batch(
-                mPdPsum, batch_idx, dim=2, padded=stats_use_padded_offsets
-            )[None, head_idx]
+            mPdPsum_cur = seqlen.offset_batch(mPdPsum, batch_idx, dim=2, padded=stats_use_padded_offsets)[None, head_idx]
             headdim_v = mO_cur.shape[cute.rank(mO_cur) - 1]
             seqlen_q = seqlen.seqlen
             seqlen_q_rounded = cute.round_up(seqlen_q, self.tile_m)
@@ -315,9 +273,7 @@ class FlashAttentionBackwardPreprocess:
             if const_expr(self.use_pdl):
                 cute.arch.griddepcontrol_launch_dependents()
             # Sum across the "k" dimension
-            pdpsum = (tOrO.load().to(Float32) * tOrdO.load().to(Float32)).reduce(
-                cute.ReductionOp.ADD, init_val=0.0, reduction_profile=(0, None, 1)
-            )
+            pdpsum = (tOrO.load().to(Float32) * tOrdO.load().to(Float32)).reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=(0, None, 1))
             threads_per_row = gmem_tiled_copy_O.layout_src_tv_tiled[0].shape[0]
             assert cute.arch.WARP_SIZE % threads_per_row == 0
             pdpsum = utils.warp_reduce(pdpsum, operator.add, width=threads_per_row)
@@ -361,9 +317,7 @@ class FlashAttentionBackwardPreprocess:
                 cute.copy(gmem_tiled_copy_dQaccum, zero, tdQgdQaccum)
 
             if const_expr(mLSE is not None):
-                mLSElog2_cur = seqlen.offset_batch(
-                    mLSElog2, batch_idx, dim=2, padded=stats_use_padded_offsets
-                )[None, head_idx]
+                mLSElog2_cur = seqlen.offset_batch(mLSElog2, batch_idx, dim=2, padded=stats_use_padded_offsets)[None, head_idx]
                 gLSElog2 = cute.local_tile(mLSElog2_cur, (self.tile_m,), (m_block,))
                 LOG2_E = math.log2(math.e)
                 if tidx < seqlen_q_rounded - m_block * self.tile_m:

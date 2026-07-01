@@ -45,7 +45,7 @@ setup:
 	@if echo "$(BLK)" | grep -q "64"; then \
 		echo "=== Building blk64 wheel ===" && \
 		mkdir -p $(WHEEL_DIR) && \
-		$(PYTHON) csrc/fwd/sm100_blk64/setup.py bdist_wheel --dist-dir $(WHEEL_DIR)/ && \
+		$(PYTHON) csrc/fwd/sm100_blk64/cpp/setup.py bdist_wheel --dist-dir $(WHEEL_DIR)/ && \
 		echo "=== Installing blk64 wheel ===" && \
 		pip install --force-reinstall --no-deps $(WHEEL_DIR)/bsa_fwd_blk64_ext-*.whl; \
 	fi
@@ -98,10 +98,12 @@ bm-cli:
 	@echo "Smem banks:   bank_conflicts = 0 → no conflicts"
 
 clean:
-	rm -rf /tmp/$$(USER)/flash_attention_cute_dsl_cache/
+	rm -rf /tmp/$${USER}/flash_attention_cute_dsl_cache/
 	rm -rf build/ dist/ artifacts/wheels/ $(AGENT_SPACE)/wheels/ *.egg-info
 	rm -rf csrc/fwd/sm100_blk64/build/ csrc/fwd/sm100_blk64/dist/
 	rm -rf csrc/fwd/sm100_blk64/*.egg-info csrc/fwd/sm100_blk64/*.so
+	rm -rf csrc/fwd/sm100_blk64/cpp/build/ csrc/fwd/sm100_blk64/cpp/dist/
+	rm -rf csrc/fwd/sm100_blk64/cpp/*.egg-info csrc/fwd/sm100_blk64/cpp/*.so
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
 help:

@@ -1,13 +1,55 @@
 # Copyright (c) 2025, Tri Dao.
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# The ParamsBase, make_fake_tensor, and sub_packed_f32x2 implementations in
+# this file are adapted from quack-kernels 0.4.1 (Apache-2.0) and modified for
+# cudnn-frontend's CUTLASS DSL 4.5 integration.
 
-from typing import Tuple
-from functools import lru_cache
+from dataclasses import dataclass, fields
+from functools import partial
+from typing import Tuple, get_origin
 
 import torch
 
 import cutlass
 import cutlass.cute as cute
+from cutlass._mlir.dialects import nvvm
+from cutlass.base_dsl.tvm_ffi_builder import spec
+from cutlass.cutlass_dsl import NumericMeta
 from cutlass.cute.runtime import from_dlpack
+
+# Python scalars and CuTe numeric types are compile-time values. Everything
+# else in a ParamsBase dataclass is flattened into MLIR values at JIT time.
+_STATIC_TYPES = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None))
+
+
+def _install_constexpr_tvm_ffi_converter() -> None:
+    """Teach CUTLASS DSL's TVM-FFI converter about Constexpr annotations.
+
+    CUTLASS DSL 4.5 otherwise treats fields annotated as ``Constexpr[T]`` as
+    runtime arguments. Emitting ``ConstNone`` keeps those fields in the JIT
+    specialization and lets callers pass ``None`` at runtime. The NamedTuple
+    case preserves its concrete field annotations when a broader tuple type is
+    used at the call site.
+    """
+    import cutlass.cute._tvm_ffi_args_spec_converter as converter
+
+    original = converter._convert_single_arg
+    if getattr(original, "_cudnn_bsa_constexpr_compat", False):
+        return
+
+    def convert_single_arg(arg, arg_name, arg_type, ctx):
+        if arg_type is not None and get_origin(arg_type) is cutlass.Constexpr:
+            return spec.ConstNone(arg_name)
+        if isinstance(arg, tuple) and hasattr(type(arg), "_fields") and (arg_type is None or not hasattr(arg_type, "_fields")):
+            return original(arg, arg_name, type(arg), ctx)
+        return original(arg, arg_name, arg_type, ctx)
+
+    convert_single_arg._cudnn_bsa_constexpr_compat = True
+    converter._convert_single_arg = convert_single_arg
+
+
+_install_constexpr_tvm_ffi_converter()
 
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
@@ -18,14 +60,63 @@ torch2cute_dtype_map = {
 }
 
 
-@lru_cache
-def get_max_active_clusters(cluster_size):
-    return cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_size=cluster_size)
+def _partition_param_fields(obj):
+    """Split dataclass fields into compile-time and MLIR-backed values."""
+    all_fields = {field.name: getattr(obj, field.name) for field in fields(obj)}
+    constexpr = {name: value for name, value in all_fields.items() if isinstance(value, _STATIC_TYPES)}
+    dynamic = {name: value for name, value in all_fields.items() if not isinstance(value, _STATIC_TYPES)}
+    return constexpr, dynamic
 
 
-@lru_cache
-def get_device_capacity(device: torch.device = None) -> Tuple[int, int]:
-    return torch.cuda.get_device_capability(device)
+def _new_params_from_mlir_values(self, values):
+    constexpr_fields, dynamic_fields = _partition_param_fields(self)
+    values = list(values)
+    for (name, field), num_values in zip(dynamic_fields.items(), self._values_pos):
+        dynamic_fields[name] = cutlass.new_from_mlir_values(field, values[:num_values])
+        values = values[num_values:]
+    return self.__class__(**dynamic_fields, **constexpr_fields)
+
+
+@dataclass
+class ParamsBase:
+    """Base class for CuTe DSL parameter dataclasses.
+
+    Python scalar fields are JIT-specialized. Tensor and CuTe scalar fields
+    are flattened to MLIR values and rebuilt inside the compiled function.
+    """
+
+    def __extract_mlir_values__(self):
+        _, dynamic_fields = _partition_param_fields(self)
+        values, self._values_pos = [], []
+        for obj in dynamic_fields.values():
+            obj_values = cutlass.extract_mlir_values(obj)
+            values.extend(obj_values)
+            self._values_pos.append(len(obj_values))
+        return values
+
+    __new_from_mlir_values__ = _new_params_from_mlir_values
+
+
+def make_fake_tensor(dtype, shape, divisibility=1, leading_dim=-1):
+    """Create a fake compact tensor with symbolic non-leading strides."""
+    if dtype is None:
+        return None
+    if leading_dim < 0:
+        leading_dim += len(shape)
+    stride = tuple(1 if dim == leading_dim else cute.sym_int64(divisibility=divisibility) for dim in range(len(shape)))
+    return cute.runtime.make_fake_tensor(
+        dtype,
+        shape,
+        stride=stride,
+        assumed_align=divisibility * dtype.width // 8,
+    )
+
+
+sub_packed_f32x2 = partial(
+    cute.arch.calc_packed_f32x2_op,
+    src_c=None,
+    calc_func=nvvm.sub_packed_f32x2,
+)
 
 
 def assume_strides_aligned(t):
@@ -57,9 +148,7 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
             assumed_align=assumed_align,
             enable_tvm_ffi=enable_tvm_ffi,
         )
-        tensor.element_type = (
-            cutlass.Float8E4M3FN if t.dtype == torch.float8_e4m3fn else cutlass.Float8E5M2
-        )
+        tensor.element_type = cutlass.Float8E4M3FN if t.dtype == torch.float8_e4m3fn else cutlass.Float8E5M2
     else:
         tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
     if fully_dynamic:
@@ -67,35 +156,6 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
     if leading_dim == -1:
         leading_dim = t.ndim - 1
     return tensor.mark_layout_dynamic(leading_dim=leading_dim)
-
-
-def to_cute_aux_tensor(t, enable_tvm_ffi=True):
-    """Convert torch tensor to cute tensor for TVM FFI, tailored to FlexAttention aux tensors.
-    This allows the user to specify alignment and leading dimension for aux tensors used in
-    custom score_mod callables.
-    """
-    assumed_align: int = getattr(t, "__assumed_align__", None)
-    leading_dim: int = getattr(t, "__leading_dim__", None)
-    fully_dynamic: bool = leading_dim is None
-
-    return to_cute_tensor(
-        t,
-        assumed_align=assumed_align,
-        leading_dim=leading_dim,
-        fully_dynamic=fully_dynamic,
-        enable_tvm_ffi=enable_tvm_ffi,
-    )
-
-
-def get_aux_tensor_metadata(aux_tensors):
-    return tuple(
-        (
-            getattr(t, "__assumed_align__", 0),
-            getattr(t, "__leading_dim__", -1),
-            hasattr(t, "__leading_dim__"),
-        )
-        for t in aux_tensors
-    )
 
 
 def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:
@@ -106,38 +166,3 @@ def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:
     patterns are not interchangeable.
     """
     return tuple(s == 0 for s in tensor.stride())
-
-
-# credit: monellz (https://github.com/NVIDIA/cutlass/issues/2658#issuecomment-3630564264)
-def dump_kernel_attributes(compiled_kernel):
-    from cuda.bindings import driver
-    from cutlass.utils import HardwareInfo
-    import torch
-
-    device_id = torch.cuda.current_device()
-    hardware_info = HardwareInfo(device_id=device_id)
-    cubin_data = compiled_kernel.artifacts.CUBIN
-    assert cubin_data is not None, "cubin_data is None, need '--keep-cubin' option when compiling"
-    cuda_library = hardware_info._checkCudaErrors(
-        driver.cuLibraryLoadData(cubin_data, None, None, 0, None, None, 0)
-    )
-    kernels = hardware_info._checkCudaErrors(driver.cuLibraryEnumerateKernels(1, cuda_library))
-    kernel = hardware_info._checkCudaErrors(driver.cuKernelGetFunction(kernels[0]))
-    # more metrics: https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EXEC.html#group__CUDA__EXEC_1g5e92a1b0d8d1b82cb00dcfb2de15961b
-    local_size_bytes = hardware_info._checkCudaErrors(
-        driver.cuFuncGetAttribute(
-            driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
-            kernel,
-        )
-    )
-    num_regs = hardware_info._checkCudaErrors(
-        driver.cuFuncGetAttribute(
-            driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS,
-            kernel,
-        )
-    )
-
-    print("--- Kernel Info ---")
-    print(f"local_size_bytes: {local_size_bytes}")
-    print(f"num_regs: {num_regs}")
-    print("--- End Kernel Info ---")

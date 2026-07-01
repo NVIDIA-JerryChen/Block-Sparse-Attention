@@ -2,7 +2,7 @@
 
 ## Summary
 
-`SeqlenInfo.create` in `flash_bwd_preprocess.py` defaulted `tile=128`, but the backward kernel uses `tile_m=m_block_size` (e.g. 64 for causal SM90). This caused the preprocess to zero dq_accum and write lse_log2/dpsum at wrong padded offsets for all batches after batch 0.
+`SeqlenInfo.create` in `csrc/bwd/bsa_bwd_preprocess.py` defaulted `tile=128`, but the backward kernel uses `tile_m=m_block_size` (e.g. 64 for causal SM90). This caused the preprocess to zero dq_accum and write lse_log2/dpsum at wrong padded offsets for all batches after batch 0.
 
 ## How padded_offset works
 
@@ -29,7 +29,7 @@ The preprocess was zeroing at 256, the backward was writing at 192.
 ## Fix
 
 ```python
-# flash_bwd_preprocess.py line 216
+# csrc/bwd/bsa_bwd_preprocess.py line 216
 # Before:
 seqlen = SeqlenInfo.create(batch_idx, mO.shape[1], mCuSeqlensQ, mSeqUsedQ)
 # After:

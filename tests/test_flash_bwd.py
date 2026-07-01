@@ -312,6 +312,7 @@ def _test_bwd_topk_blk128(
     use_block_sizes,
     bucket_size_blocks=None,
     d=128,
+    shared_kv_blocks=False,
 ):
     device = "cuda"
     dtype = torch.bfloat16
@@ -324,9 +325,26 @@ def _test_bwd_topk_blk128(
     v = torch.randn(bs, nheads, seqlen_k, d, device=device, dtype=dtype)
     dout = torch.randn_like(q)
 
-    q2k_block_index, block_sparse_num, ref_block_sizes = _make_topk_args_any(
-        bs, seqlen_q, seqlen_k, nheads, topk, BLK128, device
-    )
+    if shared_kv_blocks:
+        assert topk == 2 and seqlen_k >= 3 * BLK128
+        num_q_blocks = (seqlen_q + BLK128 - 1) // BLK128
+        selected = torch.tensor([0, 2], device=device, dtype=torch.int32)
+        q2k_block_index = (
+            selected.view(1, 1, 1, topk)
+            .expand(bs, nheads, num_q_blocks, topk)
+            .contiguous()
+        )
+        block_sparse_num = topk
+        ref_block_sizes = torch.full(
+            ((seqlen_k + BLK128 - 1) // BLK128,),
+            BLK128,
+            device=device,
+            dtype=torch.int32,
+        )
+    else:
+        q2k_block_index, block_sparse_num, ref_block_sizes = _make_topk_args_any(
+            bs, seqlen_q, seqlen_k, nheads, topk, BLK128, device
+        )
     block_sizes = ref_block_sizes if use_block_sizes else None
     attn_bias = block_sparse_to_attn_bias(
         q2k_block_index,
@@ -729,6 +747,22 @@ def test_flash_bwd_sm100_blk128_multi_qbucket_correctness():
         topk=2,
         use_block_sizes=True,
         bucket_size_blocks=2,
+    )
+
+
+@pytest.mark.parametrize("num_q_blocks", [1, 4])
+def test_flash_bwd_sm100_blk128_dk_zero_init_transition(num_q_blocks):
+    """dK must zero-initialize once, then accumulate across later Q tiles."""
+    if _cuda_major() not in [10, 11]:
+        pytest.skip("SM100/SM110 blk128 bwd test")
+    _test_bwd_topk_blk128(
+        bs=1,
+        seqlen_q=num_q_blocks * BLK128,
+        seqlen_k=4 * BLK128,
+        nheads=1,
+        topk=2,
+        use_block_sizes=False,
+        shared_kv_blocks=True,
     )
 
 

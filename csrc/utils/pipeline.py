@@ -10,7 +10,6 @@ from cutlass.pipeline import PipelineState
 from cutlass.pipeline import PipelineUserType
 from cutlass.pipeline import NamedBarrier as NamedBarrierOg
 from cutlass.pipeline import PipelineAsync as PipelineAsyncOg
-from cutlass.pipeline import PipelineCpAsync as PipelineCpAsyncOg
 from cutlass.pipeline import PipelineTmaAsync as PipelineTmaAsyncOg
 from cutlass.pipeline import PipelineTmaUmma as PipelineTmaUmmaOg
 from cutlass.pipeline import PipelineUmmaAsync as PipelineUmmaAsyncOg
@@ -62,12 +61,12 @@ class PipelineStateSimple:
 
     @property
     def phase(self) -> Int32:
-        # PTX docs say that the phase parity needs to be 0 or 1, so by right we need to
-        # take modulo 2. But in practice just passing the phase in without modulo works fine.
+        # PTX requires the phase parity to be 0 or 1, so reduce the wrap count to a
+        # single parity bit instead of returning the unbounded number of wraps.
         if const_expr(self._stages == 1):
             return self._phase_index
         else:
-            return self._phase_index // self._stages
+            return (self._phase_index // self._stages) & 1
 
     def advance(self):
         if const_expr(self._stages == 1):
@@ -258,48 +257,12 @@ class PipelineAsync(_PipelineIndexPhaseMixin, PipelineAsyncOg):
     # to producer_commit / consumer_release above.
 
 
-# ── PipelineCpAsync ──────────────────────────────────────────────────────────
-
-
-@dataclass(frozen=True)
-class PipelineCpAsync(_PipelineIndexPhaseMixin, PipelineCpAsyncOg):
-    _elect_one_release: bool = False
-    _syncwarp_before_release: bool = True
-
-    @staticmethod
-    def create(
-        *args,
-        elect_one_release: bool = False,
-        syncwarp_before_release: bool = True,
-        **kwargs,
-    ):
-        obj = PipelineCpAsyncOg.create(*args, **kwargs)
-        object.__setattr__(obj, "__class__", PipelineCpAsync)
-        object.__setattr__(obj, "_elect_one_release", elect_one_release)
-        object.__setattr__(obj, "_syncwarp_before_release", syncwarp_before_release)
-        return obj
-
-    @dsl_user_op
-    def consumer_release(self, state: PipelineState, *, loc=None, ip=None):
-        _call_with_elect_one(
-            PipelineCpAsyncOg.consumer_release,
-            self,
-            state,
-            self._elect_one_release,
-            self._syncwarp_before_release,
-            loc,
-            ip,
-        )
-
-    # _w_index variants inherited from _PipelineIndexPhaseMixin.
-
-
 # ── PipelineTmaAsync ────────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
 class PipelineTmaAsync(_PipelineIndexPhaseMixin, PipelineTmaAsyncOg):
-    """Override producer_acquire to take in extra_tx_count parameter."""
+    """PipelineTmaAsync with an optional extra transaction byte count."""
 
     @dsl_user_op
     def producer_acquire(
@@ -311,9 +274,6 @@ class PipelineTmaAsync(_PipelineIndexPhaseMixin, PipelineTmaAsyncOg):
         loc=None,
         ip=None,
     ):
-        """
-        TMA producer commit conditionally waits on buffer empty and sets the transaction barrier for leader threadblocks.
-        """
         if_generate(
             try_acquire_token is None or try_acquire_token == 0,
             lambda: self.sync_object_empty.wait(state.index, state.phase, loc=loc, ip=ip),
@@ -359,9 +319,7 @@ class PipelineTmaUmma(_PipelineIndexPhaseMixin, PipelineTmaUmmaOg):
         if const_expr(extra_tx_count == 0):
             if_generate(
                 self.is_leader_cta,
-                lambda: self.sync_object_full.arrive(
-                    state.index, self.producer_mask, loc=loc, ip=ip
-                ),
+                lambda: self.sync_object_full.arrive(state.index, self.producer_mask, loc=loc, ip=ip),
                 loc=loc,
                 ip=ip,
             )
@@ -369,9 +327,7 @@ class PipelineTmaUmma(_PipelineIndexPhaseMixin, PipelineTmaUmmaOg):
             tx_count = self.sync_object_full.tx_count + extra_tx_count
             if_generate(
                 self.is_leader_cta,
-                lambda: self.sync_object_full.arrive_and_expect_tx(
-                    state.index, tx_count, loc=loc, ip=ip
-                ),
+                lambda: self.sync_object_full.arrive_and_expect_tx(state.index, tx_count, loc=loc, ip=ip),
                 loc=loc,
                 ip=ip,
             )

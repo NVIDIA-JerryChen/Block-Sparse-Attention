@@ -17,23 +17,27 @@ from utils.cache_utils import get_jit_cache
 from utils.testing import is_fake_mode
 
 from utils import fa_logging
-from csrc.fwd.sm100_blk128.flash_fwd_sm100 import (
+from csrc.fwd.sm100_blk128.bsa_fwd_sm100 import (
     BlockSparseAttnForwardSm100Blk128,
 )
-from csrc.fwd.sm90_blk64.flash_fwd_sm90 import (
+from csrc.fwd.sm90_blk64.bsa_fwd_sm90 import (
     BlockSparseAttnForwardSm90Blk64,
     SM90_FWD_BLOCK_SIZE,
 )
-from csrc.fwd.sm120_blk64.flash_fwd_sm120 import (
+from csrc.fwd.sm120_blk64.bsa_fwd_sm120 import (
     BlockSparseAttnForwardSm120Blk64,
     SM120_FWD_BLOCK_SIZE,
 )
 try:
-    from csrc.fwd.sm100_blk64.bsa_fwd_combine import FlashAttentionForwardCombine
+    from csrc.fwd.sm100_blk64.cutedsl.bsa_fwd_combine import (
+        BlockSparseAttnForwardCombine,
+    )
 except ImportError:
-    FlashAttentionForwardCombine = None
-from csrc.fwd.sm100_blk64.flash_fwd_sm100 import FlashAttentionForwardSm100Blk64
-from csrc.bwd.sm100_blk64.flash_bwd_sm100 import (
+    BlockSparseAttnForwardCombine = None
+from csrc.fwd.sm100_blk64.cutedsl.bsa_fwd_sm100 import (
+    BlockSparseAttnForwardSm100Blk64,
+)
+from csrc.bwd.sm100_blk64.bsa_bwd_sm100 import (
     BlockSparseAttnBackwardSm100Blk64,
     SM100_BWD_HEAD_DIM,
     SM100_BLK64_BWD_SPARSE_BLOCK_SIZE,
@@ -41,7 +45,7 @@ from csrc.bwd.sm100_blk64.flash_bwd_sm100 import (
     sm100_bwd_default_bucketed_k2q_size_blocks,
 )
 try:
-    from csrc.bwd.sm100_blk128.flash_bwd_sm100 import (
+    from csrc.bwd.sm100_blk128.bsa_bwd_sm100 import (
         SM100_BWD_HEAD_DIM as SM100_BLK128_BWD_HEAD_DIM,
         SM100_BLK128_BWD_SPARSE_BLOCK_SIZE,
         bsa_sm100_blk128_bwd_bucketed_k2q_csr,
@@ -64,7 +68,7 @@ except ImportError as exc:
             "SM100 blk128 backward is unavailable because its optional "
             "CuTe dependencies failed to import."
         ) from _SM100_BLK128_BWD_IMPORT_ERROR
-from csrc.bwd.sm90_blk64.flash_bwd_sm90 import (
+from csrc.bwd.sm90_blk64.bsa_bwd_sm90 import (
     BlockSparseAttnBackwardSm90Blk64,
     SM90_BWD_HEAD_DIM,
     SM90_BWD_SPARSE_BLOCK_SIZE,
@@ -389,24 +393,6 @@ def _sm100_blk64_auto_kv_splits(
     return max(1, min(int(splits), int(max_kv_splits), kv_blocks))
 
 
-def _sm90_blk64_auto_kv_splits(
-    q: torch.Tensor,
-    q2k_block_index: torch.Tensor,
-    fixed_block_sparse_num: int,
-    max_kv_splits: int = 16,
-) -> int:
-    """Apply the measured SM90 policy without changing SM100 auto tuning."""
-    splits = _sm100_blk64_auto_kv_splits(
-        q,
-        q2k_block_index,
-        fixed_block_sparse_num,
-        max_kv_splits,
-    )
-    # At this working-set size, a single-head SM90 launch already has enough
-    # Q tiles and does not amortize the combine kernel.
-    return 1 if splits == 2 and q.shape[1] == 1 else splits
-
-
 def _build_sm100_blk64_kv_split_offsets(
     q2k_block_nums: Optional[torch.Tensor],
     uniform_block_sparse_num: int,
@@ -584,6 +570,7 @@ def _bsa_attn_fwd_sm90_blk64(
     softmax_scale: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
     kv_splits: int = 1,
+    allow_empty_block_nums: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Launch the SM90 blk64 sparse forward kernel on BHSD tensors."""
     assert q.dtype in (torch.float16, torch.bfloat16), "SM90 blk64 fwd supports fp16/bf16"
@@ -601,6 +588,12 @@ def _bsa_attn_fwd_sm90_blk64(
     kv_splits = int(kv_splits)
     assert 1 <= kv_splits <= 256, "kv_splits must be in [1, 256]"
     is_split_kv = kv_splits > 1
+    # Keep fixed-count and split instances on the branch-free non-empty path.
+    allow_empty_block_nums = (
+        bool(allow_empty_block_nums)
+        and q2k_block_nums is not None
+        and not is_split_kv
+    )
     assert seqlen_q % SM90_FWD_BLOCK_SIZE == 0, (
         "SM90 blk64 fwd requires seqlen_q to be a multiple of 64"
     )
@@ -744,6 +737,7 @@ def _bsa_attn_fwd_sm90_blk64(
         acc_dtype=cutlass.Float32,
         has_block_sizes=has_block_sizes,
         num_splits=kv_splits,
+        allow_empty_block_nums=allow_empty_block_nums,
     )
 
     compile_key = _dynamic_tensors_compile_key(
@@ -757,6 +751,7 @@ def _bsa_attn_fwd_sm90_blk64(
             SM90_FWD_BLOCK_SIZE,
             has_block_sizes,
             kv_splits,
+            allow_empty_block_nums,
         ),
         (
             q_t,
@@ -950,9 +945,9 @@ def _combine_blk64_kv_bucketed_partials(
     kv_splits: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Combine KV-bucketed partial outputs using the shared CuTeDSL combine kernel."""
-    if FlashAttentionForwardCombine is None:
+    if BlockSparseAttnForwardCombine is None:
         raise ImportError(
-            "FlashAttentionForwardCombine is unavailable. Ensure local CuTe "
+            "BlockSparseAttnForwardCombine is unavailable. Ensure local CuTe "
             "helpers are importable."
         )
 
@@ -1018,7 +1013,7 @@ def _combine_blk64_kv_bucketed_partials(
         combine_stages,
     )
     if compile_key not in _combine_blk64_kv_bucketed_partials.compile_cache:
-        combine_kernel = FlashAttentionForwardCombine(
+        combine_kernel = BlockSparseAttnForwardCombine(
             dtype=dtype,
             head_dim=head_dim,
             tile_m=combine_tile_m,
@@ -1274,7 +1269,7 @@ def bsa_attn_fwd_blk64(
         )
         fixed_block_sparse_num = fixed_block_sparse_num if block_nums_sm90 is None else 0
         if auto_kv_splits:
-            kv_splits_i = _sm90_blk64_auto_kv_splits(
+            kv_splits_i = _sm100_blk64_auto_kv_splits(
                 q, q2k_block_index, fixed_block_sparse_num
             )
         kv_splits_i = _resolve_blk64_split_workspace(
@@ -1507,7 +1502,6 @@ def bsa_attn_fwd_blk64_cutedsl(
     qhead_per_kvhead = 1
     tile_m = 64
     tile_n = 256
-    use_2cta_instrs = False
     if auto_kv_splits:
         kv_splits_i = _sm100_blk64_auto_kv_splits(
             q_bhsd,
@@ -1623,7 +1617,7 @@ def bsa_attn_fwd_blk64_cutedsl(
             _to_cute_tensor(split_offsets) if split_offsets is not None else None
         )
 
-        fa_fwd = FlashAttentionForwardSm100Blk64(
+        bsa_fwd = BlockSparseAttnForwardSm100Blk64(
             head_dim,
             head_dim_v,
             qhead_per_kvhead=qhead_per_kvhead,
@@ -1632,17 +1626,15 @@ def bsa_attn_fwd_blk64_cutedsl(
             n_block_size=tile_n,
             sparse_block_size=sparse_block_size,
             is_persistent=is_persistent,
-            use_2cta_instrs=use_2cta_instrs,
             use_clc_scheduler=use_clc_scheduler,
             allow_empty_block_nums=allow_empty_block_nums,
             has_block_sizes=has_block_sizes,
             num_splits=kv_splits_i,
-            use_raw_ws_epilogue=True,
             use_int64_kv_strides=use_int64_kv_strides,
         )
 
         bsa_attn_fwd_blk64_cutedsl.compile_cache[compile_key] = cute.compile(
-            fa_fwd,
+            bsa_fwd,
             q_tensor,
             k_tensor,
             v_tensor,
@@ -1837,6 +1829,7 @@ def bsa_attn_fwd(
             q2k_block_nums=q2k_block_nums,
             softmax_scale=softmax_scale,
             out=out_bhsd,
+            allow_empty_block_nums=allow_empty_block_nums,
         )
         if lse is not None:
             lse.copy_(lse_sm90)
@@ -1969,7 +1962,6 @@ def bsa_attn_fwd(
             bsa_fwd_kernel.n_block_size,
             bsa_fwd_kernel.pack_gqa,
             arch,
-            bsa_fwd_kernel.use_2cta_instrs,
             bsa_fwd_kernel.use_clc_scheduler,
             bsa_fwd_kernel.is_persistent,
             fa_logging.get_fa_log_level(),
@@ -2607,7 +2599,6 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
         bwd_kernel = BlockSparseAttnBackwardSm100Blk64(
             sparse_block_size=sparse_block_size,
             has_block_sizes=has_block_sizes,
-            full_kv_blocks=False,
         )
 
         _bsa_attn_bwd_bucketed_k2q_csr.compile_cache[compile_key] = cute.compile(

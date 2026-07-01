@@ -3,16 +3,13 @@ from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.cute.nvgpu import tcgen05
 from cutlass import Float32, Int32, Uint32, Boolean, const_expr
 from cutlass.cutlass_dsl import T
 from cutlass._mlir.dialects import llvm
 
 from csrc.utils import mma_sm100_desc as sm100_desc
-from csrc.utils.blackwell_helpers import (
-    declare_ptx_idesc,
-    declare_ptx_smem_desc,
-    i64_to_i32x2,
-)
+from csrc.utils.tcgen05_mma_helpers import i64_to_i32x2
 
 
 @cute.jit
@@ -78,81 +75,10 @@ def tcgen05_fence_after_thread_sync() -> None:
 
 
 @cute.jit
-def tmem_rescale_16x32bx2_x32(tmem_addr: Int32, scale: Float32) -> None:
-    regs = ", ".join(f"r{i}" for i in range(32))
-    scale_ops = "\n\t".join(
-        f"mov.b32 f{i}, r{i};\n\t"
-        f"mul.rn.ftz.f32 f{i}, f{i}, scale;\n\t"
-        f"mov.b32 r{i}, f{i};"
-        for i in range(32)
-    )
-    llvm.inline_asm(
-        None,
-        [
-            Int32(cute.arch.make_warp_uniform(tmem_addr)).ir_value(),
-            Float32(scale).ir_value(),
-        ],
-        "{\n\t"
-        ".reg .b32 addr;\n\t"
-        ".reg .b32 r<32>;\n\t"
-        ".reg .f32 f<32>;\n\t"
-        ".reg .f32 scale;\n\t"
-        "mov.b32 addr, $0;\n\t"
-        "mov.f32 scale, $1;\n\t"
-        f"tcgen05.ld.sync.aligned.16x32bx2.x32.b32 {{{regs}}}, [addr], 32;\n\t"
-        f"{scale_ops}\n\t"
-        f"tcgen05.st.sync.aligned.16x32bx2.x32.b32 [addr], 32, {{{regs}}};\n\t"
-        "}\n",
-        "r,f",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-@cute.jit
-def tmem_rescale_32dp32b32x(tmem_addr: Int32, scale: Float32) -> None:
-    regs = ", ".join(f"r{i}" for i in range(32))
-    scale_ops = "\n\t".join(
-        f"mov.b64 la, {{r{i}, r{i + 1}}};\n\t"
-        "mul.rn.f32x2 la, la, lscale;\n\t"
-        f"mov.b64 {{r{i}, r{i + 1}}}, la;"
-        for i in range(0, 32, 2)
-    )
-    llvm.inline_asm(
-        None,
-        [
-            Int32(cute.arch.make_warp_uniform(tmem_addr)).ir_value(),
-            Float32(scale).ir_value(),
-        ],
-        "{\n\t"
-        ".reg .b32 addr;\n\t"
-        ".reg .b32 r<32>;\n\t"
-        ".reg .b64 la;\n\t"
-        ".reg .b64 lscale;\n\t"
-        ".reg .f32 scale;\n\t"
-        "mov.b32 addr, $0;\n\t"
-        "mov.f32 scale, $1;\n\t"
-        "mov.b64 lscale, {scale, scale};\n\t"
-        f"tcgen05.ld.sync.aligned.32x32b.x32.b32 {{{regs}}}, [addr];\n\t"
-        f"{scale_ops}\n\t"
-        f"tcgen05.st.sync.aligned.32x32b.x32.b32 [addr], {{{regs}}};\n\t"
-        "}\n",
-        "r,f",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-@cute.jit
 def tmem_rescale_4x32dp32b32x(tmem_addr: Int32, scale: Float32) -> None:
     regs = ", ".join(f"r{i}" for i in range(32))
     scale_ops = "\n\t".join(
-        f"mov.b64 la, {{r{i}, r{i + 1}}};\n\t"
-        "mul.rn.f32x2 la, la, lscale;\n\t"
-        f"mov.b64 {{r{i}, r{i + 1}}}, la;"
-        for i in range(0, 32, 2)
+        f"mov.b64 la, {{r{i}, r{i + 1}}};\n\t" "mul.rn.f32x2 la, la, lscale;\n\t" f"mov.b64 {{r{i}, r{i + 1}}}, la;" for i in range(0, 32, 2)
     )
     chunk_ops = "\n\t".join(
         "add.u32 addr_cur, addr, "
@@ -238,20 +164,12 @@ def shr_u32(x: Uint32, shift: Uint32) -> Uint32:
 
 
 @cute.jit
-def mask_f32x32_by_u32_branch(
-    acc_s: cute.Tensor, mask: Uint32, base: cutlass.Constexpr[int]
-) -> Tuple[Float32, ...]:
-    mask_ops = "\n\t".join(
-        f"and.b32 tmp, $64, {hex(1 << i)};\n\t"
-        "setp.eq.u32 p, tmp, 0;\n\t"
-        f"@p mov.f32 ${i}, neg_inf;"
-        for i in range(32)
-    )
+def mask_f32x32_by_u32_branch(acc_s: cute.Tensor, mask: Uint32, base: cutlass.Constexpr[int]) -> Tuple[Float32, ...]:
+    mask_ops = "\n\t".join(f"and.b32 tmp, $64, {hex(1 << i)};\n\t" "setp.eq.u32 p, tmp, 0;\n\t" f"@p mov.f32 ${i}, neg_inf;" for i in range(32))
     zero_ops = "\n\t".join(f"mov.f32 ${i}, neg_inf;" for i in range(32))
     out = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32()] * 32),
-        [Float32(acc_s[base + i]).ir_value() for i in range(32)]
-        + [Uint32(mask).ir_value()],
+        [Float32(acc_s[base + i]).ir_value() for i in range(32)] + [Uint32(mask).ir_value()],
         "{\n\t"
         ".reg .pred p;\n\t"
         ".reg .pred full;\n\t"
@@ -295,75 +213,9 @@ def tmem_store_bf16x16(tmem_addr: Int32, vals: cute.Tensor) -> None:
     regs = ", ".join(f"${i + 1}" for i in range(16))
     llvm.inline_asm(
         None,
-        [Int32(cute.arch.make_warp_uniform(tmem_addr)).ir_value()]
-        + [Int32(vals[i]).ir_value() for i in range(16)],
+        [Int32(cute.arch.make_warp_uniform(tmem_addr)).ir_value()] + [Int32(vals[i]).ir_value() for i in range(16)],
         f"tcgen05.st.sync.aligned.32x32b.x16.b32 [$0], {{{regs}}};",
         ",".join(["r"] * 17),
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-@cute.jit
-def tmem_combine_store_exchange_32dp32b32x(
-    tmem_o0_addr: Int32,
-    tmem_o1_addr: Int32,
-    exchange_smem_addr: Int32,
-    scale0: Float32,
-    scale1: Float32,
-) -> None:
-    regs0 = ", ".join(f"a{i}" for i in range(32))
-    regs1 = ", ".join(f"b{i}" for i in range(32))
-    combine_ops = "\n\t".join(
-        f"mov.b64 la, {{a{i}, a{i + 1}}};\n\t"
-        f"mov.b64 lb, {{b{i}, b{i + 1}}};\n\t"
-        "mul.rn.f32x2 lb, lb, lscale1;\n\t"
-        "fma.rn.f32x2 la, la, lscale0, lb;\n\t"
-        f"mov.b64 {{o{i}, o{i + 1}}}, la;"
-        for i in range(0, 32, 2)
-    )
-    store_ops = "\n\t".join(
-        f"add.u32 addr, saddr, {group * 32 * 4 * 4};\n\t"
-        f"st.shared.v4.b32 [addr], {{o{group * 4 + 0}, o{group * 4 + 1}, o{group * 4 + 2}, o{group * 4 + 3}}};"
-        for group in range(8)
-    )
-    llvm.inline_asm(
-        None,
-        [
-            Int32(cute.arch.make_warp_uniform(tmem_o0_addr)).ir_value(),
-            Int32(cute.arch.make_warp_uniform(tmem_o1_addr)).ir_value(),
-            Int32(exchange_smem_addr).ir_value(),
-            Float32(scale0).ir_value(),
-            Float32(scale1).ir_value(),
-        ],
-        "{\n\t"
-        ".reg .b32 taddr0;\n\t"
-        ".reg .b32 taddr1;\n\t"
-        ".reg .b32 saddr;\n\t"
-        ".reg .b32 addr;\n\t"
-        ".reg .b32 a<32>;\n\t"
-        ".reg .b32 b<32>;\n\t"
-        ".reg .b32 o<32>;\n\t"
-        ".reg .b64 la;\n\t"
-        ".reg .b64 lb;\n\t"
-        ".reg .b64 lscale0;\n\t"
-        ".reg .b64 lscale1;\n\t"
-        ".reg .f32 scale0;\n\t"
-        ".reg .f32 scale1;\n\t"
-        "mov.b32 taddr0, $0;\n\t"
-        "mov.b32 taddr1, $1;\n\t"
-        "mov.b32 saddr, $2;\n\t"
-        "mov.f32 scale0, $3;\n\t"
-        "mov.f32 scale1, $4;\n\t"
-        "mov.b64 lscale0, {scale0, scale0};\n\t"
-        "mov.b64 lscale1, {scale1, scale1};\n\t"
-        f"tcgen05.ld.sync.aligned.32x32b.x32.b32 {{{regs0}}}, [taddr0];\n\t"
-        f"tcgen05.ld.sync.aligned.32x32b.x32.b32 {{{regs1}}}, [taddr1];\n\t"
-        f"{combine_ops}\n\t"
-        f"{store_ops}\n\t"
-        "}\n",
-        "r,r,r,f,f",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -449,49 +301,16 @@ def tmem_combine_store_exchange_4x32dp32b32x(
 
 
 @cute.jit
-def smem_zero_store_exchange_32dp32b32x(exchange_smem_addr: Int32) -> None:
-    store_ops = "\n\t".join(
-        f"add.u32 addr, saddr, {group * 32 * 4 * 4};\n\t"
-        "st.shared.v4.b32 [addr], {z, z, z, z};"
-        for group in range(8)
-    )
-    llvm.inline_asm(
-        None,
-        [Int32(exchange_smem_addr).ir_value()],
-        "{\n\t"
-        ".reg .b32 saddr;\n\t"
-        ".reg .b32 addr;\n\t"
-        ".reg .b32 z;\n\t"
-        "mov.b32 saddr, $0;\n\t"
-        "mov.u32 z, 0;\n\t"
-        f"{store_ops}\n\t"
-        "}\n",
-        "r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-@cute.jit
 def smem_zero_store_exchange_4x32dp32b32x(exchange_smem_addr: Int32) -> None:
     store_ops = "\n\t".join(
-        f"add.u32 addr, saddr, {chunk * 32 * 32 * 4 + group * 32 * 4 * 4};\n\t"
-        "st.shared.v4.b32 [addr], {z, z, z, z};"
+        f"add.u32 addr, saddr, {chunk * 32 * 32 * 4 + group * 32 * 4 * 4};\n\t" "st.shared.v4.b32 [addr], {z, z, z, z};"
         for chunk in range(4)
         for group in range(8)
     )
     llvm.inline_asm(
         None,
         [Int32(exchange_smem_addr).ir_value()],
-        "{\n\t"
-        ".reg .b32 saddr;\n\t"
-        ".reg .b32 addr;\n\t"
-        ".reg .b32 z;\n\t"
-        "mov.b32 saddr, $0;\n\t"
-        "mov.u32 z, 0;\n\t"
-        f"{store_ops}\n\t"
-        "}\n",
+        "{\n\t" ".reg .b32 saddr;\n\t" ".reg .b32 addr;\n\t" ".reg .b32 z;\n\t" "mov.b32 saddr, $0;\n\t" "mov.u32 z, 0;\n\t" f"{store_ops}\n\t" "}\n",
         "r",
         has_side_effects=True,
         is_align_stack=False,
@@ -516,10 +335,7 @@ def smem_exchange_reduce_store_bf16x32(
         for group in range(8)
     )
     add_ops = "\n\t".join(
-        f"mov.b64 la, {{a{i}, a{i + 1}}};\n\t"
-        f"mov.b64 lb, {{b{i}, b{i + 1}}};\n\t"
-        "add.rn.f32x2 la, la, lb;\n\t"
-        f"mov.b64 {{a{i}, a{i + 1}}}, la;"
+        f"mov.b64 la, {{a{i}, a{i + 1}}};\n\t" f"mov.b64 lb, {{b{i}, b{i + 1}}};\n\t" "add.rn.f32x2 la, la, lb;\n\t" f"mov.b64 {{a{i}, a{i + 1}}}, la;"
         for i in range(0, 32, 2)
     )
     store_ops = "\n\t".join(
@@ -584,16 +400,10 @@ def smem_exchange_reduce_store_f32x32(
         for group in range(8)
     )
     add_ops = "\n\t".join(
-        f"mov.b64 la, {{a{i}, a{i + 1}}};\n\t"
-        f"mov.b64 lb, {{b{i}, b{i + 1}}};\n\t"
-        "add.rn.f32x2 la, la, lb;\n\t"
-        f"mov.b64 {{a{i}, a{i + 1}}}, la;"
+        f"mov.b64 la, {{a{i}, a{i + 1}}};\n\t" f"mov.b64 lb, {{b{i}, b{i + 1}}};\n\t" "add.rn.f32x2 la, la, lb;\n\t" f"mov.b64 {{a{i}, a{i + 1}}}, la;"
         for i in range(0, 32, 2)
     )
-    store_ops = "\n\t".join(
-        f"st.shared.v4.b32 [${2 + j // 4}], {{a{j + 0}, a{j + 1}, a{j + 2}, a{j + 3}}};"
-        for j in range(0, 32, 4)
-    )
+    store_ops = "\n\t".join(f"st.shared.v4.b32 [${2 + j // 4}], {{a{j + 0}, a{j + 1}, a{j + 2}, a{j + 3}}};" for j in range(0, 32, 4))
     llvm.inline_asm(
         None,
         [
@@ -643,8 +453,6 @@ def gemm_ptx_partial(
     split_arrive: Optional[int] = None,
     zero_init: bool | Boolean = False,
     tA_addr: Optional[Int32] = None,
-    cta_group: int = 1,
-    use_ws: bool = False,
 ) -> None:
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
     if const_expr(not is_ts):
@@ -658,9 +466,7 @@ def gemm_ptx_partial(
             sm100_desc.make_smem_desc_base(
                 cute.recast_layout(128, op.a_dtype.width, sA_layout[0]),
                 sA_swizzle,
-                sm100_desc.Major.K
-                if const_expr(op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
-                else sm100_desc.Major.MN,
+                sm100_desc.Major.K if const_expr(op.a_major_mode == tcgen05.OperandMajorMode.K) else sm100_desc.Major.MN,
             )
         )
         smem_desc_base_a_lo, smem_desc_a_hi = i64_to_i32x2(smem_desc_base_a)
@@ -674,50 +480,40 @@ def gemm_ptx_partial(
         sm100_desc.make_smem_desc_base(
             cute.recast_layout(128, op.b_dtype.width, sB_layout[0]),
             sB_swizzle,
-            sm100_desc.Major.K
-            if const_expr(op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
-            else sm100_desc.Major.MN,
+            sm100_desc.Major.K if const_expr(op.b_major_mode == tcgen05.OperandMajorMode.K) else sm100_desc.Major.MN,
         )
     )
     smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
     smem_desc_base_b_lo = const_expr(smem_desc_base_b_lo)
     smem_desc_b_hi = const_expr(smem_desc_b_hi)
 
-    tCrA_layout = (
-        tCrA.layout
-        if const_expr(not is_ts)
-        else cute.recast_layout(32, tCrA.element_type.width, tCrA.layout)
-    )
+    tCrA_layout = tCrA.layout if const_expr(not is_ts) else cute.recast_layout(32, tCrA.element_type.width, tCrA.layout)
     offset_a = [cute.crd2idx((0, 0, k), tCrA_layout) for k in range(cute.size(tCrA.shape[2]))]
     offset_b = [cute.crd2idx((0, 0, k), tCrB.layout) for k in range(cute.size(tCrB.shape[2]))]
     offset_b_diff = [offset_b[k] - offset_b[k - 1] for k in range(1, cute.size(tCrB.shape[2]))]
 
     if const_expr(not is_ts):
-        smem_desc_start_a_lo = Int32(
-            smem_desc_base_a_lo | sm100_desc.make_smem_desc_start_addr(sA[None, None, 0].iterator)
-        )
+        smem_desc_start_a_lo = Int32(smem_desc_base_a_lo | sm100_desc.make_smem_desc_start_addr(sA[None, None, 0].iterator))
     else:
         smem_desc_start_a_lo = None
-    smem_desc_start_b_lo = Int32(
-        smem_desc_base_b_lo | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator)
-    )
-    pred_str = "p" if isinstance(zero_init, Boolean) else "0" if zero_init else "1"
+    smem_desc_start_b_lo = Int32(smem_desc_base_b_lo | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator))
+    # zero_init may be a runtime Boolean (e.g. the loop-carried O_acc_cur flag); Python
+    # `not` on it would bake a wrong constant predicate at trace time, so pass the raw
+    # value through and flip the setp comparison instead.
+    zero_init_is_dynamic = isinstance(zero_init, Boolean)
+    pred_str = "p" if zero_init_is_dynamic else "0" if zero_init else "1"
+    pred_input = zero_init if zero_init_is_dynamic else not zero_init
+    pred_setp = "setp.eq.b32" if zero_init_is_dynamic else "setp.ne.b32"
+    mma_instr = "tcgen05.mma.ws.cta_group::1.kind::f16"
+    mma_suffix = ", 0"
     if const_expr(not is_ts):
-        if const_expr(use_ws):
-            assert cta_group == 1, "tcgen05.mma.ws is single-CTA only"
         assert mbar_ptr is None, "mbar_ptr must be None when a_src is not TMEM"
-        mma_instr = (
-            f"tcgen05.mma.ws.cta_group::{cta_group}.kind::f16"
-            if const_expr(use_ws)
-            else f"tcgen05.mma.cta_group::{cta_group}.kind::f16"
-        )
-        mma_suffix = ", 0" if const_expr(use_ws) else ""
         llvm.inline_asm(
             None,
             [
                 Int32(cute.arch.make_warp_uniform(smem_desc_start_a_lo)).ir_value(),
                 Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
-                Int32(not zero_init).ir_value(),
+                Int32(pred_input).ir_value(),
                 Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
             ],
             "{\n\t"
@@ -738,7 +534,7 @@ def gemm_ptx_partial(
             f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
             f"mov.b64 smem_desc_a, {{smem_desc_a_lo_start, smem_desc_a_hi}};\n\t"
             f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
-            "setp.ne.b32 p, $2, 0;\n\t"
+            f"{pred_setp} p, $2, 0;\n\t"
             f"@leader_thread {mma_instr} [tmem_acc], smem_desc_a, smem_desc_b, idesc, {pred_str}{mma_suffix};\n\t"
             + "".join(
                 (
@@ -757,25 +553,19 @@ def gemm_ptx_partial(
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     else:
-        if const_expr(use_ws):
-            assert cta_group == 1, "tcgen05.mma.ws is single-CTA only"
-        mma_instr = (
-            f"tcgen05.mma.ws.cta_group::{cta_group}.kind::f16"
-            if const_expr(use_ws)
-            else f"tcgen05.mma.cta_group::{cta_group}.kind::f16"
-        )
-        mma_suffix = ", 0" if const_expr(use_ws) else ""
         tA_addr = tCrA[None, None, 0].iterator.toint() if tA_addr is None else tA_addr
         input_args = [
             Int32(cute.arch.make_warp_uniform(tA_addr)).ir_value(),
             Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
-            Int32(not zero_init).ir_value(),
+            Int32(pred_input).ir_value(),
             Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
         ]
         if const_expr(mbar_ptr is not None):
             assert mbar_phase is not None, "mbar_phase must be provided when mbar_ptr is not None"
             assert split_arrive is not None, "split_arrive must be provided when mbar_ptr is not None"
+            assert split_arrive % op.shape_mnk[2] == 0, "split_arrive must be a multiple of the MMA K extent"
             split_arrive_idx = split_arrive // op.shape_mnk[2]
+            assert 1 <= split_arrive_idx <= cute.size(tCrA.shape[2]), "split_arrive must map to a K-tile index within [1, num_k_tiles]"
             input_args.append(mbar_ptr.toint().ir_value())
             input_args.append(Int32(mbar_phase).ir_value())
             mbar_wait_str = (
@@ -807,9 +597,12 @@ def gemm_ptx_partial(
             "mov.b32 tmem_acc, $3;\n\t"
             "mov.b32 tmem_a, $0;\n\t"
             "mov.b32 smem_desc_b_lo_start, $1;\n\t"
-            f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+            # The post-wait loop below updates smem_desc_b_lo incrementally, and the
+            # pre-wait loop that would otherwise seed it is empty when
+            # split_arrive_idx == 1, so initialize it from the base descriptor.
+            + ("mov.b32 smem_desc_b_lo, smem_desc_b_lo_start;\n\t" if mbar_ptr is not None else "") + f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
             f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
-            "setp.ne.b32 p, $2, 0;\n\t"
+            f"{pred_setp} p, $2, 0;\n\t"
             f"@leader_thread {mma_instr} [tmem_acc], [tmem_a], smem_desc_b, idesc, {pred_str}{mma_suffix};\n\t"
             + "".join(
                 (

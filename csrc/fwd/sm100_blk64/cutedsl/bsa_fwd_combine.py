@@ -18,7 +18,7 @@ from csrc.utils.seqlen_info import SeqlenInfo
 from cutlass.cute import FastDivmodDivisor
 
 
-class FlashAttentionForwardCombine:
+class BlockSparseAttnForwardCombine:
     def __init__(
         self,
         dtype: Type[cutlass.Numeric],
@@ -51,40 +51,13 @@ class FlashAttentionForwardCombine:
         self.is_even_k = head_dim % k_block_size == 0
         self.stages = stages
 
-    @staticmethod
-    def can_implement(
-        dtype,
-        head_dim,
-        tile_m,
-        k_block_size,
-        log_max_splits,
-        num_threads,
-    ) -> bool:
-        """Check if the kernel can be implemented with the given parameters."""
-        if dtype not in [cutlass.Float16, cutlass.BFloat16, cutlass.Float32]:
-            return False
-        if head_dim % 8 != 0:
-            return False
-        if num_threads % 32 != 0:
-            return False
-        if tile_m % 8 != 0:
-            return False
-        max_splits = 1 << log_max_splits
-        if max_splits > 256:
-            return False
-        if (tile_m * max_splits) % num_threads != 0:
-            return False
-        return True
-
     def _setup_attributes(self):
         # GMEM copy setup for O partial
         universal_copy_bits = 128
         async_copy_elems = universal_copy_bits // self.partial_dtype.width
         assert self.k_block_size % async_copy_elems == 0
 
-        k_block_gmem = (
-            128 if self.k_block_size % 128 == 0 else (64 if self.k_block_size % 64 == 0 else 32)
-        )
+        k_block_gmem = 128 if self.k_block_size % 128 == 0 else (64 if self.k_block_size % 64 == 0 else 32)
         gmem_threads_per_row = k_block_gmem // async_copy_elems
         assert self.num_threads % gmem_threads_per_row == 0
 
@@ -99,9 +72,7 @@ class FlashAttentionForwardCombine:
             order=(1, 0),
         )
         vOpartial_layout = cute.make_layout((1, async_copy_elems))  # 4 vals per load
-        self.gmem_tiled_copy_O_partial = cute.make_tiled_copy_tv(
-            atom_async_copy_partial, tOpartial_layout, vOpartial_layout
-        )
+        self.gmem_tiled_copy_O_partial = cute.make_tiled_copy_tv(atom_async_copy_partial, tOpartial_layout, vOpartial_layout)
 
         # GMEM copy setup for final O (use universal copy for store)
         atom_universal_copy = cute.make_copy_atom(
@@ -118,13 +89,7 @@ class FlashAttentionForwardCombine:
         # LSE copy setup with async copy (alignment = 1)
         lse_copy_bits = Float32.width  # 1 element per copy, width is in bits
         m_block_smem = (
-            128
-            if self.tile_m % 128 == 0
-            else (
-                64
-                if self.tile_m % 64 == 0
-                else (32 if self.tile_m % 32 == 0 else (16 if self.tile_m % 16 == 0 else 8))
-            )
+            128 if self.tile_m % 128 == 0 else (64 if self.tile_m % 64 == 0 else (32 if self.tile_m % 32 == 0 else (16 if self.tile_m % 16 == 0 else 8)))
         )
         gmem_threads_per_row_lse = m_block_smem
         assert self.num_threads % gmem_threads_per_row_lse == 0
@@ -140,9 +105,7 @@ class FlashAttentionForwardCombine:
             order=(1, 0),
         )
         vLSE_layout = cute.make_layout(1)
-        self.gmem_tiled_copy_LSE = cute.make_tiled_copy_tv(
-            atom_async_copy_lse, tLSE_layout, vLSE_layout
-        )
+        self.gmem_tiled_copy_LSE = cute.make_tiled_copy_tv(atom_async_copy_lse, tLSE_layout, vLSE_layout)
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Shared memory
@@ -170,17 +133,11 @@ class FlashAttentionForwardCombine:
             smem_lse_swizzle = cute.make_swizzle(4, 0, 4)
         else:
             smem_lse_swizzle = cute.make_swizzle(3, 2, 3)
-        smem_layout_atom_lse = cute.make_composed_layout(
-            smem_lse_swizzle, 0, cute.make_ordered_layout((8, m_block_smem), order=(1, 0))
-        )
-        self.smem_layout_lse = cute.tile_to_shape(
-            smem_layout_atom_lse, (self.max_splits, self.tile_m), (0, 1)
-        )
+        smem_layout_atom_lse = cute.make_composed_layout(smem_lse_swizzle, 0, cute.make_ordered_layout((8, m_block_smem), order=(1, 0)))
+        self.smem_layout_lse = cute.tile_to_shape(smem_layout_atom_lse, (self.max_splits, self.tile_m), (0, 1))
 
         # O partial shared memory layout (simple layout for pipeline stages)
-        self.smem_layout_o = cute.make_ordered_layout(
-            (self.tile_m, self.k_block_size, self.stages), order=(1, 0, 2)
-        )
+        self.smem_layout_o = cute.make_ordered_layout((self.tile_m, self.k_block_size, self.stages), order=(1, 0, 2))
 
     @cute.jit
     def __call__(
@@ -213,28 +170,18 @@ class FlashAttentionForwardCombine:
                 "O partial tensor must have 4 or 5 dimensions: (num_splits, batch, seqlen, nheads, headdim) or (num_splits, total_q, nheads, headdim)"
             )
         if const_expr(len(mLSE_partial.shape) not in [3, 4]):
-            raise ValueError(
-                "LSE partial tensor must have 3 or 4 dimensions: (num_splits, batch, seqlen, nheads) or (num_splits, total_q, nheads)"
-            )
+            raise ValueError("LSE partial tensor must have 3 or 4 dimensions: (num_splits, batch, seqlen, nheads) or (num_splits, total_q, nheads)")
         if const_expr(len(mO.shape) not in [3, 4]):
-            raise ValueError(
-                "O tensor must have 3 or 4 dimensions: (batch, seqlen, nheads, headdim) or (total_q, nheads, headdim)"
-            )
+            raise ValueError("O tensor must have 3 or 4 dimensions: (batch, seqlen, nheads, headdim) or (total_q, nheads, headdim)")
         if const_expr(mLSE is not None and len(mLSE.shape) not in [2, 3]):
-            raise ValueError(
-                "LSE tensor must have 2 or 3 dimensions: (batch, seqlen, nheads) or (total_q, nheads)"
-            )
+            raise ValueError("LSE tensor must have 2 or 3 dimensions: (batch, seqlen, nheads) or (total_q, nheads)")
 
         mO_partial, mO = [assume_tensor_aligned(t) for t in (mO_partial, mO)]
         # (num_splits, b, seqlen, h, d) -> (seqlen, d, num_splits, h, b)
         # or (num_splits, total_q, h, d) -> (total_q, d, num_splits, h)
-        O_partial_layout_transpose = (
-            [2, 4, 0, 3, 1] if const_expr(cu_seqlens is None) else [1, 3, 0, 2]
-        )
+        O_partial_layout_transpose = [2, 4, 0, 3, 1] if const_expr(cu_seqlens is None) else [1, 3, 0, 2]
         # (b, seqlen, h, d) -> (seqlen, d, h, b) or (total_q, h, d) -> (total_q, d, h)
-        mO_partial = cute.make_tensor(
-            mO_partial.iterator, cute.select(mO_partial.layout, mode=O_partial_layout_transpose)
-        )
+        mO_partial = cute.make_tensor(mO_partial.iterator, cute.select(mO_partial.layout, mode=O_partial_layout_transpose))
         O_layout_transpose = [1, 3, 2, 0] if const_expr(cu_seqlens is None) else [0, 2, 1]
         mO = cute.make_tensor(mO.iterator, cute.select(mO.layout, mode=O_layout_transpose))
         # (num_splits, b, seqlen, h) -> (seqlen, num_splits, h, b)
@@ -246,11 +193,7 @@ class FlashAttentionForwardCombine:
         )
         # (b, seqlen, h) -> (seqlen, h, b) or (total_q, h) -> (total_q, h)
         LSE_layout_transpose = [1, 2, 0] if const_expr(cu_seqlens is None) else [0, 1]
-        mLSE = (
-            cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
-            if mLSE is not None
-            else None
-        )
+        mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose)) if mLSE is not None else None
 
         # Determine if we have variable length sequences
         varlen = const_expr(cu_seqlens is not None or seqused is not None)
@@ -259,28 +202,19 @@ class FlashAttentionForwardCombine:
 
         @cute.struct
         class SharedStorage:
-            sLSE: cute.struct.Align[
-                cute.struct.MemRange[Float32, cute.cosize(self.smem_layout_lse)], 128
-            ]
+            sLSE: cute.struct.Align[cute.struct.MemRange[Float32, cute.cosize(self.smem_layout_lse)], 128]
             sMaxValidSplit: cute.struct.Align[cute.struct.MemRange[Int32, self.tile_m], 128]
-            sO: cute.struct.Align[
-                cute.struct.MemRange[self.partial_dtype, cute.cosize(self.smem_layout_o)], 128
-            ]
+            sO: cute.struct.Align[cute.struct.MemRange[self.partial_dtype, cute.cosize(self.smem_layout_o)], 128]
 
         smem_size = SharedStorage.size_in_bytes()
 
         # Grid dimensions: (ceil_div(seqlen, m_block), ceil_div(head_dim, k_block), num_head * batch)
         seqlen = mO_partial.shape[0]
         num_head = mO_partial.shape[3]
-        batch_size = (
-            mO_partial.shape[4]
-            if const_expr(cu_seqlens is None)
-            else Int32(cu_seqlens.shape[0] - 1)
-        )
+        batch_size = mO_partial.shape[4] if const_expr(cu_seqlens is None) else Int32(cu_seqlens.shape[0] - 1)
 
         # Create FastDivmodDivisor objects for efficient division
         seqlen_divmod = FastDivmodDivisor(seqlen)
-        head_divmod = FastDivmodDivisor(num_head)
 
         grid_dim = (
             cute.ceil_div(seqlen * num_head, self.tile_m),
@@ -306,7 +240,6 @@ class FlashAttentionForwardCombine:
             self.gmem_tiled_copy_LSE,
             self.s2r_tiled_copy_LSE,
             seqlen_divmod,
-            head_divmod,
             varlen,
         ).launch(
             grid=grid_dim,
@@ -335,7 +268,6 @@ class FlashAttentionForwardCombine:
         gmem_tiled_copy_LSE: cute.TiledCopy,
         s2r_tiled_copy_LSE: cute.TiledCopy,
         seqlen_divmod: FastDivmodDivisor,
-        head_divmod: FastDivmodDivisor,
         varlen: cutlass.Constexpr[bool],
     ):
         # Thread and block indices
@@ -343,11 +275,7 @@ class FlashAttentionForwardCombine:
         m_block, k_block, maybe_virtual_batch = cute.arch.block_idx()
 
         # Map virtual batch index to real batch index (for persistent tile schedulers)
-        batch_idx = (
-            varlen_batch_idx[maybe_virtual_batch]
-            if const_expr(varlen_batch_idx is not None)
-            else maybe_virtual_batch
-        )
+        batch_idx = varlen_batch_idx[maybe_virtual_batch] if const_expr(varlen_batch_idx is not None) else maybe_virtual_batch
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
@@ -370,30 +298,20 @@ class FlashAttentionForwardCombine:
                 semaphore_to_reset[0] = 0
 
         # Get number of splits (use maybe_virtual_batch for per-batch-slot splits)
-        num_splits = (
-            num_splits_dynamic_ptr[maybe_virtual_batch]
-            if const_expr(num_splits_dynamic_ptr is not None)
-            else mLSE_partial.shape[1]
-        )
+        num_splits = num_splits_dynamic_ptr[maybe_virtual_batch] if const_expr(num_splits_dynamic_ptr is not None) else mLSE_partial.shape[1]
         if const_expr(cu_seqlens is None):
             seqlen = mO_partial.shape[0]
             offset = Int32(0)
         else:
             offset = cu_seqlens[batch_idx]
-            seqlen = (
-                seqused[batch_idx]
-                if const_expr(seqused is not None)
-                else cu_seqlens[batch_idx + 1] - offset
-            )
+            seqlen = seqused[batch_idx] if const_expr(seqused is not None) else cu_seqlens[batch_idx + 1] - offset
 
         # Extract number of heads (head index will be determined dynamically)
         num_head = mO_partial.shape[3]
         max_idx = seqlen * num_head
 
         # Early exit for single split if dynamic
-        if (const_expr(num_splits_dynamic_ptr is None) or num_splits > 1) and (
-            const_expr(not varlen) or m_block * self.tile_m < max_idx
-        ):
+        if (const_expr(num_splits_dynamic_ptr is None) or num_splits > 1) and (const_expr(not varlen) or m_block * self.tile_m < max_idx):
             # The BSA wrapper launches pre-schedule, partial attention, and
             # combine on the same stream without CUDA dependent-grid launch
             # attributes. Stream ordering already guarantees producer
@@ -436,7 +354,13 @@ class FlashAttentionForwardCombine:
                             )
                         else:
                             tLSEsLSE[None, s, m].fill(-Float32.inf)
-                # Don't need to zero out the rest of the LSEs, as we will not write the output to gmem
+                else:
+                    # Rows past max_idx never write O/LSE to gmem, but their sLSE slots
+                    # still feed the max-valid-split reduction, which bounds the
+                    # partial-O accumulation loop. Fill them with -inf so such a row
+                    # yields max_valid_split == -1 instead of reading garbage.
+                    for s in cutlass.range(cute.size(tLSEcLSE, mode=[1]), unroll_full=True):
+                        tLSEsLSE[None, s, m].fill(-Float32.inf)
             cute.arch.cp_async_commit_group()
 
             # ===============================
@@ -465,9 +389,7 @@ class FlashAttentionForwardCombine:
                 else:
                     tOhidx[m] = idx // seqlen
                     tOmidx[m] = idx - tOhidx[m] * seqlen
-                tOrOptr[m] = utils.elem_pointer(
-                    mO_partial_cur, (tOmidx[m], k_block * self.k_block_size, 0, tOhidx[m])
-                ).toint()
+                tOrOptr[m] = utils.elem_pointer(mO_partial_cur, (tOmidx[m], k_block * self.k_block_size, 0, tOhidx[m])).toint()
                 if idx >= max_idx:
                     tOhidx[m] = -1
 
@@ -476,7 +398,6 @@ class FlashAttentionForwardCombine:
                 tOpO = cute.make_rmem_tensor(cute.size(tOcO, mode=[2]), Boolean)
                 for k in cutlass.range(cute.size(tOpO), unroll_full=True):
                     tOpO[k] = tOcO[0, 0, k][1] < mO_partial.shape[1] - k_block * self.k_block_size
-                # if cute.arch.thread_idx()[0] == 0 and k_block == 1: cute.print_tensor(tOpO)
 
             load_O_partial = partial(
                 self.load_O_partial,
@@ -502,11 +423,6 @@ class FlashAttentionForwardCombine:
             # Wait for LSE and initial O partial stages to complete
             cute.arch.cp_async_wait_group(self.stages - 1)
             cute.arch.sync_threads()
-            # if cute.arch.thread_idx()[0] == 0:
-            #     # cute.print_tensor(sLSE)
-            #     for i in range(64):
-            #         cute.printf("sLSE[%d, 0] = %f", i, sLSE[i, 0])
-            # cute.arch.sync_threads()
 
             s2r_thr_copy_LSE = s2r_tiled_copy_LSE.get_slice(tidx)
             ts2rsLSE = s2r_thr_copy_LSE.partition_S(sLSE)
@@ -527,41 +443,27 @@ class FlashAttentionForwardCombine:
                 # Find max LSE value across splits
                 threads_per_col = const_expr(self.smem_threads_per_col_lse)
                 lse_max = cute.arch.warp_reduction_max(
-                    ts2rrLSE[None, None, m]
-                    .load()
-                    .reduce(cute.ReductionOp.MAX, init_val=-Float32.inf, reduction_profile=0),
+                    ts2rrLSE[None, None, m].load().reduce(cute.ReductionOp.MAX, init_val=-Float32.inf, reduction_profile=0),
                     threads_in_group=threads_per_col,
                 )
-                # if cute.arch.thread_idx()[0] == 0: cute.printf(lse_max)
                 # Find max valid split index
                 max_valid_idx = -1
                 for s in cutlass.range(cute.size(ts2rrLSE, mode=[1]), unroll_full=True):
                     if ts2rrLSE[0, s, m] != -Float32.inf:
                         max_valid_idx = ts2rcLSE[0, s, 0][0]  # Get split coordinate
-                # if cute.arch.thread_idx()[0] < 32: cute.printf(max_valid_idx)
-                max_valid_split[m] = cute.arch.warp_reduction_max(
-                    max_valid_idx, threads_in_group=threads_per_col
-                )
+                max_valid_split[m] = cute.arch.warp_reduction_max(max_valid_idx, threads_in_group=threads_per_col)
                 # Compute exp scales and sum
-                lse_max_cur = (
-                    0.0 if lse_max == -Float32.inf else lse_max
-                )  # In case all local LSEs are -inf
+                lse_max_cur = 0.0 if lse_max == -Float32.inf else lse_max  # In case all local LSEs are -inf
                 LOG2_E = math.log2(math.e)
                 lse_sum_cur = 0.0
                 for s in cutlass.range(cute.size(ts2rrLSE, mode=[1]), unroll_full=True):
-                    scale = cute.math.exp2(
-                        ts2rrLSE[0, s, m] * LOG2_E - (lse_max_cur * LOG2_E), fastmath=True
-                    )
+                    scale = cute.math.exp2(ts2rrLSE[0, s, m] * LOG2_E - (lse_max_cur * LOG2_E), fastmath=True)
                     lse_sum_cur += scale
                     ts2rrLSE[0, s, m] = scale  # Store scale for later use
-                lse_sum_cur = cute.arch.warp_reduction_sum(
-                    lse_sum_cur, threads_in_group=threads_per_col
-                )
+                lse_sum_cur = cute.arch.warp_reduction_sum(lse_sum_cur, threads_in_group=threads_per_col)
                 lse_sum[m] = cute.math.log(lse_sum_cur, fastmath=True) + lse_max
                 # Normalize scales
-                inv_sum = (
-                    0.0 if (lse_sum_cur == 0.0 or lse_sum_cur != lse_sum_cur) else 1.0 / lse_sum_cur
-                )
+                inv_sum = 0.0 if (lse_sum_cur == 0.0 or lse_sum_cur != lse_sum_cur) else 1.0 / lse_sum_cur
                 ts2rrLSE[None, None, m].store(ts2rrLSE[None, None, m].load() * inv_sum)
             # Store the scales exp(lse - lse_logsum) back to smem
             cute.copy(s2r_tiled_copy_LSE, ts2rrLSE, ts2rsLSE)
@@ -637,10 +539,7 @@ class FlashAttentionForwardCombine:
                 # Accumulate scaled partial results
                 for m in cutlass.range(num_rows, unroll_full=True):
                     if tOhidx[m] >= 0 and scale[m] > 0.0:
-                        tOrO[None, m, None].store(
-                            tOrO[None, m, None].load()
-                            + scale[m] * tOrO_partial[None, m, None].load().to(Float32)
-                        )
+                        tOrO[None, m, None].store(tOrO[None, m, None].load() + scale[m] * tOrO_partial[None, m, None].load().to(Float32))
 
             # ===============================
             # Step 7: Write final O to gmem
@@ -654,14 +553,11 @@ class FlashAttentionForwardCombine:
                 mO_cur = cute.domain_offset((offset, 0, 0), mO)
             mO_cur = utils.domain_offset_aligned((0, k_block * self.k_block_size, 0), mO_cur)
             elems_per_store = const_expr(cute.size(gmem_tiled_copy_O.layout_tv_tiled[1]))
-            # mO_cur_copy = cute.tiled_divide(mO_cur, (1, elems_per_store,))
             gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
             # Write final results
             for m in cutlass.range(num_rows, unroll_full=True):
                 if tOhidx[m] >= 0:
-                    mO_cur_copy = cute.tiled_divide(
-                        mO_cur[tOmidx[m], None, tOhidx[m]], (elems_per_store,)
-                    )
+                    mO_cur_copy = cute.tiled_divide(mO_cur[tOmidx[m], None, tOhidx[m]], (elems_per_store,))
                     for k in cutlass.range(cute.size(tOcO, mode=[2]), unroll_full=True):
                         k_idx = tOcO[0, 0, k][1] // elems_per_store
                         if const_expr(self.is_even_k) or tOpO[k]:
@@ -684,12 +580,8 @@ class FlashAttentionForwardCombine:
         tOsO_partial_cur = tOsO_partial[None, None, None, stage]
         for m in cutlass.range(cute.size(tOcO, [1]), unroll_full=True):
             if tOhidx[m] >= 0:
-                o_gmem_ptr = cute.make_ptr(
-                    tOsO_partial.element_type, tOrOptr[m], cute.AddressSpace.gmem, assumed_align=16
-                )
-                mO_partial_cur = cute.make_tensor(
-                    o_gmem_ptr, cute.slice_(mO_cur_partial_layout, (0, None, None, 0))
-                )
+                o_gmem_ptr = cute.make_ptr(tOsO_partial.element_type, tOrOptr[m], cute.AddressSpace.gmem, assumed_align=16)
+                mO_partial_cur = cute.make_tensor(o_gmem_ptr, cute.slice_(mO_cur_partial_layout, (0, None, None, 0)))
                 mO_partial_cur_copy = cute.tiled_divide(mO_partial_cur, (elems_per_load,))
                 for k in cutlass.range(cute.size(tOcO, mode=[2]), unroll_full=True):
                     k_idx = tOcO[0, 0, k][1] // elems_per_load

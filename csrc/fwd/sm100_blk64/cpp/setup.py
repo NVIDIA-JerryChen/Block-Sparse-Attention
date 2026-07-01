@@ -3,9 +3,9 @@ from pathlib import Path
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-CUTLASS_ROOT = PROJECT_ROOT / "third_party" / "cutlass"
 SRC_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SRC_DIR.parents[3]
+CUTLASS_ROOT = PROJECT_ROOT / "third_party" / "cutlass"
 
 # Kernel instantiation (nvcc, separate TU per (HasBlockSizes, HasVarBlockNums, UseClc)
 # variant for register allocation isolation)

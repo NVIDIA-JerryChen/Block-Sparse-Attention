@@ -4,16 +4,16 @@
 
 **Forward backends:**
 
-| | SM100 blk128 (CuTe DSL / JIT) | SM90 blk64 (CuTe DSL / JIT) | SM100 blk64 (C++ AOT / CUTLASS) |
-|---|---|---|---|
-| Dtype | bf16, fp16 | bf16, fp16 | bf16 only |
-| Head dim | 64, 96, 128, (192, 128) | 64, 96, 128 | 128 only |
-| Attention | MHA, GQA, MQA | MHA, GQA, MQA | MHA only |
-| pack_gqa | Yes | No | No |
-| Persistent scheduling | Static + CLC dynamic | Static | CLC dynamic (built-in) |
-| Variable block counts (`q2k_block_nums`) | Yes (>= 0) | Yes (>= 1) | Yes (>= 1) |
-| KV split (`kv_splits`) | No | Explicit / auto | Explicit / auto |
-| LSE output | Yes | Yes | Yes |
+| | SM100 blk128 (CuTe DSL / JIT) | SM90 blk64 (CuTe DSL / JIT) | SM100 blk64 (C++ AOT / CUTLASS) | SM100 blk64 (CuTe DSL / JIT) |
+|---|---|---|---|---|
+| Dtype | bf16, fp16 | bf16, fp16 | bf16 only | bf16 only |
+| Head dim | 64, 96, 128 | 64, 96, 128 | 128 only | 128 only |
+| Attention | MHA, GQA, MQA | MHA, GQA, MQA | MHA only | MHA only |
+| pack_gqa | Yes | No | No | No |
+| Persistent scheduling | Static + CLC dynamic | Static | CLC dynamic (built-in) | Static + CLC dynamic |
+| Variable block counts (`q2k_block_nums`) | Yes (>= 0) | Yes (>= 0) | Yes (>= 1) | Yes (>= 0) |
+| KV split (`kv_splits`) | No | Explicit / auto | Explicit / auto | Explicit / auto |
+| LSE output | Yes | Yes | Yes | Yes |
 
 **Backward backends:**
 
@@ -42,33 +42,43 @@ BSA/
 │
 ├── csrc/fwd/
 │   ├── sm100_blk128/                 # blk128 — CuTe DSL / JIT compiled
-│   │   └── flash_fwd_sm100.py        # Single-file Blackwell forward kernel
+│   │   └── bsa_fwd_sm100.py          # Single-file Blackwell forward kernel
 │   ├── sm90_blk64/                   # blk64 — SM90 CuTe DSL / JIT compiled
-│   │   └── flash_fwd_sm90.py         # Single-file Hopper forward kernel
+│   │   └── bsa_fwd_sm90.py           # Single-file Hopper forward kernel
+│   ├── sm120_blk64/                  # blk64 — SM120 CuTe DSL / JIT compiled
+│   │   └── bsa_fwd_sm120.py          # Single-file SM120 forward kernel
 │   │
-│   └── sm100_blk64/                  # blk64 — C++ AOT / CUTLASS compiled
-│       ├── bsa_api.cpp                   # PyTorch C++ bindings (returns [out, lse])
-│       ├── bsa_fwd_kernel_sm100.h        # Kernel definition
-│       ├── bsa_fwd_launch_template.h     # Host launch wrapper
-│       ├── mainloop_fwd_sm100.hpp        # Mainloop (load, mma, softmax)
-│       ├── epilogue_fwd_sm100.hpp        # Output epilogue
-│       ├── softmax.h                     # Softmax
-│       ├── pipeline.hpp                  # Pipeline management
-│       ├── tile_scheduler.hpp            # Tile scheduler
-│       ├── instantiations/               # AOT template instantiations
-│       └── setup.py                      # Build script (bdist_wheel + CUDAExtension)
+│   └── sm100_blk64/                  # blk64 — implementation family
+│       ├── cpp/                          # C++ AOT / CUTLASS backend
+│       │   ├── bsa_api.cpp               # PyTorch C++ bindings (returns [out, lse])
+│       │   ├── bsa_fwd_kernel_sm100.h    # Kernel definition
+│       │   ├── bsa_fwd_launch_template.h # Host launch wrapper
+│       │   ├── mainloop_fwd_sm100.hpp    # Mainloop (load, mma, softmax)
+│       │   ├── epilogue_fwd_sm100.hpp    # Output epilogue
+│       │   ├── instantiations/           # AOT template instantiations
+│       │   └── setup.py                  # CUDAExtension build script
+│       └── cutedsl/                      # CuTe DSL / JIT backend
+│           ├── bsa_fwd_sm100.py          # Forward kernel
+│           ├── bsa_fwd_helpers.py        # SM100 device helpers
+│           └── bsa_fwd_combine.py        # Split-KV combine kernel shared by both paths
 │
 ├── csrc/bwd/
+│   ├── bsa_bwd_preprocess.py             # Shared backward preprocess kernel
+│   ├── bsa_bwd_postprocess.py            # Shared backward postprocess kernel
+│   ├── bsa_bwd_prepost.py                # Pre/post compile and launch helpers
 │   ├── sm90_blk64/                       # blk64 backward — SM90 CuTe DSL / JIT compiled
-│   │   └── flash_bwd_sm90.py             # Localized Hopper backward kernel
-│   └── sm100_blk64/                      # blk64 backward — SM100 CuTe DSL / JIT compiled
-│       └── flash_bwd_sm100.py            # Bucketed k2q CSR backward kernel
+│   │   └── bsa_bwd_sm90.py               # Localized Hopper backward kernel
+│   ├── sm100_blk64/                      # blk64 backward — SM100 CuTe DSL / JIT compiled
+│   │   └── bsa_bwd_sm100.py              # Bucketed k2q CSR backward kernel
+│   └── sm100_blk128/                     # blk128 backward — SM100 CuTe DSL / JIT compiled
+│       └── bsa_bwd_sm100.py              # Bucketed k2q CSR backward kernel
 │
 ├── csrc/utils/                            # Shared CuTe DSL device/kernel helpers
 │   ├── kernel_utils.py                    # Math, layout, and tensor utilities
 │   ├── pipeline.py                        # TMA/UMMA pipeline helpers
 │   ├── tile_scheduler.py                  # Shared tile schedulers
 │   ├── block_sparse_tile_scheduler.py     # blk64 CLC persistent scheduler
+│   ├── tcgen05_mma_helpers.py             # Shared SM100 MMA helpers
 │   ├── softmax.py / pack_gqa.py           # Forward attention helpers
 │   └── ...
 │
@@ -111,7 +121,12 @@ make setup
 
 ```python
 import torch
-from bsa_attn_interface import bsa_attn_fwd, bsa_attn_fwd_blk64, bsa_attn_bwd
+from bsa_attn_interface import (
+    bsa_attn_bwd,
+    bsa_attn_fwd,
+    bsa_attn_fwd_blk64,
+    bsa_attn_fwd_blk64_cutedsl,
+)
 
 q = torch.randn(1, 8, 1024, 128, device="cuda", dtype=torch.bfloat16)
 k = torch.randn(1, 8, 1024, 128, device="cuda", dtype=torch.bfloat16)
@@ -225,17 +240,20 @@ block_sizes = [tile_n] * N            # last block adjusted for seqlen remainder
 
 The SM90 and SM100 blk64 forward paths can split each Q block's active KV list:
 
+On SM100, `bsa_attn_fwd_blk64` uses the C++ AOT backend, while
+`bsa_attn_fwd_blk64_cutedsl` selects the independently maintained CuTe DSL
+backend. Both reuse the CuTe DSL split-KV combine kernel.
+
 - `kv_splits=1` uses the legacy single forward kernel without partial-output
   workspace or a combine kernel.
 - `kv_splits=2..256` produces FP32 O/LSE partials for each split and combines
   them into the requested output dtype. Partial workspace grows linearly with
   `kv_splits`.
 - `kv_splits="auto"` selects 1, 2, 4, or 8 splits at KV block-count thresholds
-  256, 450, and 900. On SM90, the 256--449 range stays unsplit for a single Q
-  head. With fixed block counts, the policy uses `block_sparse_num`; otherwise
-  it uses `q2k_block_index.shape[-1]`. Auto lowers the split count if its
-  estimated workspace does not fit; explicit split counts report an error
-  instead.
+  256, 450, and 900. With fixed block counts, the policy uses
+  `block_sparse_num`; otherwise it uses `q2k_block_index.shape[-1]`. Auto lowers
+  the split count if its estimated workspace does not fit; explicit split
+  counts report an error instead.
 
 SM90 split-KV supports the same MHA/GQA/MQA and QK/V dimensions (64, 96, or
 128) as its single-kernel path. SM100 blk64 retains its existing shape

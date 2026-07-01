@@ -29,6 +29,9 @@ from bsa_attn_interface import (
     bsa_attn_fwd_blk64,
     bsa_attn_fwd_blk64_cutedsl,
 )
+from csrc.fwd.sm100_blk128.bsa_fwd_sm100 import (
+    BlockSparseAttnForwardSm100Blk128,
+)
 
 # Optional: blk64 C++ AOT kernel (install via `make setup BLK=64`)
 try:
@@ -415,6 +418,20 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
 
 # ============== Pytest ==============
 
+@pytest.mark.parametrize(
+    "head_dim,head_dim_v,error",
+    [
+        (192, 128, "QK dim"),
+        (128, 192, "value dim"),
+    ],
+)
+def test_sm100_blk128_rejects_unsupported_head_dims(
+    head_dim, head_dim_v, error
+):
+    with pytest.raises(AssertionError, match=error):
+        BlockSparseAttnForwardSm100Blk128(head_dim, head_dim_v)
+
+
 def test_flash_fwd_sm100_blk128_clc_scheduler():
     """Regression test for CTA-wide convergence when consuming CLC responses."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
@@ -539,6 +556,114 @@ def test_sm120_blk64_odd_topk_q_tail_block_sizes():
 
     torch.testing.assert_close(out, ref_out, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(lse, ref_lse, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize("seqlen_q", [1, 63, 65])
+def test_sm100_blk64_cutedsl_partial_tail_rows(seqlen_q):
+    """Cover partial Q tiles in both the producer and split combine."""
+    if (
+        not torch.cuda.is_available()
+        or torch.cuda.get_device_capability()[0] not in (10, 11)
+    ):
+        pytest.skip("SM100/SM110 blk64 CuTe DSL test")
+
+    torch.manual_seed(6)
+    bs, h, sk, d = 1, 1, 256, 128
+    blk = 64
+    device = "cuda"
+    dtype = torch.bfloat16
+    q = torch.randn(bs, h, seqlen_q, d, device=device, dtype=dtype)
+    k = torch.randn(bs, h, sk, d, device=device, dtype=dtype)
+    v = torch.randn_like(k)
+    num_q_blocks = (seqlen_q + blk - 1) // blk
+    num_kv_blocks = sk // blk
+    q2k_block_index = (
+        torch.arange(num_kv_blocks, device=device, dtype=torch.int32)
+        .view(1, 1, 1, num_kv_blocks)
+        .expand(bs, h, num_q_blocks, num_kv_blocks)
+        .contiguous()
+    )
+    q2k_block_nums = torch.full(
+        (bs, h, num_q_blocks),
+        num_kv_blocks,
+        device=device,
+        dtype=torch.int32,
+    )
+    block_sizes = torch.full(
+        (num_kv_blocks,), blk, device=device, dtype=torch.int32
+    )
+
+    scale = 1.0 / math.sqrt(d)
+    scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) * scale
+    ref_out = torch.matmul(torch.softmax(scores, dim=-1), v.float())
+    ref_lse = torch.logsumexp(scores, dim=-1)
+
+    for kv_splits in (1, 2):
+        out, lse = bsa_attn_fwd_blk64_cutedsl(
+            q,
+            k,
+            v,
+            q2k_block_index,
+            block_sizes,
+            q2k_block_nums,
+            softmax_scale=scale,
+            use_clc=False,
+            kv_splits=kv_splits,
+        )
+        torch.testing.assert_close(out.float(), ref_out, rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(lse, ref_lse, rtol=2e-3, atol=2e-3)
+
+
+def test_sm90_blk64_empty_variable_row():
+    """An empty sparse row must produce O=0 and LSE=-inf on SM90."""
+    if (
+        not torch.cuda.is_available()
+        or torch.cuda.get_device_capability()[0] != 9
+    ):
+        pytest.skip("SM90-only coverage")
+
+    torch.manual_seed(7)
+    bs, h, sq, sk, d = 1, 1, 128, 128, 128
+    blk = 64
+    device = "cuda"
+    dtype = torch.bfloat16
+    q = torch.randn(bs, h, sq, d, device=device, dtype=dtype)
+    k = torch.randn(bs, h, sk, d, device=device, dtype=dtype)
+    v = torch.randn_like(k)
+    q2k_block_index = (
+        torch.arange(2, device=device, dtype=torch.int32)
+        .view(1, 1, 1, 2)
+        .expand(bs, h, 2, 2)
+        .contiguous()
+    )
+    q2k_block_nums = torch.tensor([[[0, 2]]], device=device, dtype=torch.int32)
+    block_sizes = torch.full((2,), blk, device=device, dtype=torch.int32)
+
+    out, lse = bsa_attn_fwd(
+        q,
+        k,
+        v,
+        q2k_block_index,
+        0,
+        block_sizes,
+        q2k_block_nums=q2k_block_nums,
+        allow_empty_block_nums=True,
+        return_lse=True,
+    )
+
+    assert torch.count_nonzero(out[:, :, :blk]) == 0
+    assert torch.isneginf(lse[:, :, :blk]).all()
+    scale = 1.0 / math.sqrt(d)
+    scores = (
+        torch.matmul(q[:, :, blk:].float(), k.float().transpose(-1, -2))
+        * scale
+    )
+    ref_out = torch.matmul(torch.softmax(scores, dim=-1), v.float())
+    ref_lse = torch.logsumexp(scores, dim=-1)
+    torch.testing.assert_close(
+        out[:, :, blk:].float(), ref_out, rtol=3e-2, atol=3e-2
+    )
+    torch.testing.assert_close(lse[:, :, blk:], ref_lse, rtol=2e-3, atol=2e-3)
 
 
 # ============== Quick test (make tt) ==============

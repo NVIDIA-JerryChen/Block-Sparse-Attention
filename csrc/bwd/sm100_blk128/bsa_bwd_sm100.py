@@ -9,33 +9,31 @@ import torch
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Int64, const_expr
+from cutlass import Boolean, Float32, Int32, Int64, const_expr
 from cutlass.utils import LayoutEnum
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.pipeline import PipelineAsync
 
-import quack.activation
-from quack import layout_utils
+from csrc.utils import layout_utils
 from csrc.utils import kernel_utils as utils
 from csrc.utils.cute_dsl_utils import (
     assume_tensor_aligned,
     get_broadcast_dims,
     to_cute_tensor,
+    torch2cute_dtype_map,
 )
 from csrc.utils import copy_utils
 from csrc.utils import pipeline
-from csrc.utils.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx
+from csrc.utils.tcgen05_mma_helpers import gemm_w_idx, gemm_ptx_w_idx
 from csrc.utils.seqlen_info import SeqlenInfoQK
 from csrc.utils.block_info import BlockInfo
-from csrc.utils.interface import (
+from csrc.bwd.bsa_bwd_prepost import (
     _bwd_postprocess_convert,
     _bwd_preprocess,
     _get_device_arch,
-    torch2cute_dtype_map,
 )
-from utils.testing import is_fake_mode
-from quack.cute_dsl_utils import ParamsBase
+from csrc.utils.cute_dsl_utils import ParamsBase, sub_packed_f32x2
 from csrc.utils.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
@@ -43,6 +41,7 @@ from csrc.utils.tile_scheduler import (
 
 from csrc.utils.named_barrier import NamedBarrierBwdSm100
 from utils.cache_utils import get_jit_cache
+from utils.testing import is_fake_mode
 
 
 class BsaK2qCsrTensors(NamedTuple):
@@ -172,9 +171,7 @@ def produce_bsa_k2q_csr_q_loads_bwd_sm100(
                 )
             producer_state_Q_LSE.advance()
 
-            pipeline_dO.producer_acquire(
-                producer_state_dO_dPsum, extra_tx_count=tma_copy_bytes_V
-            )
+            pipeline_dO.producer_acquire(producer_state_dO_dPsum, extra_tx_count=tma_copy_bytes_V)
             load_V(tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_dPsum))
             load_dO(m_block_safe, producer_state=producer_state_dO_dPsum)
             pipeline_dO.producer_commit(producer_state_dO_dPsum)
@@ -222,10 +219,7 @@ class BlockSparseAttnBackwardSm100Blk128:
         head_dim: int,
         force_dkv_postprocess: cutlass.Constexpr = False,
     ):
-        assert head_dim in (64, 128), (
-            f"SM100 blk128 bwd supports head_dim in {{64, 128}}, got {head_dim}"
-        )
-        self.head_dim = head_dim
+        assert head_dim in (64, 128), f"SM100 blk128 bwd supports head_dim in {{64, 128}}, got {head_dim}"
         # tile_hdim drives the K reduction of S/P/dV/dK mma's and the dQ accumulator
         # cols-per-stage; tile_hdimv drives the N of PV-style mma's. Both follow
         # head_dim directly (no head_dim_v split for now).
@@ -234,24 +228,22 @@ class BlockSparseAttnBackwardSm100Blk128:
 
         self.tile_m = 128
         self.tile_n = 128
-        self.cta_group_size = 1
 
         # CTA tiler
         self.cta_tiler = (self.tile_n, self.tile_m, self.tile_hdim)
         # S = K @ Q.T
-        self.mma_tiler_kq = (self.cta_group_size * self.tile_n, self.tile_m, self.tile_hdim)
+        self.mma_tiler_kq = (self.tile_n, self.tile_m, self.tile_hdim)
         # dP = V @ dO.T
-        self.mma_tiler_vdo = (self.cta_group_size * self.tile_n, self.tile_m, self.tile_hdimv)
+        self.mma_tiler_vdo = (self.tile_n, self.tile_m, self.tile_hdimv)
         # dV = P.T @ dO
-        self.mma_tiler_pdo = (self.cta_group_size * self.tile_n, self.tile_hdimv, self.tile_m)
+        self.mma_tiler_pdo = (self.tile_n, self.tile_hdimv, self.tile_m)
         # dK = dS.T @ Q
-        self.mma_tiler_dsq = (self.cta_group_size * self.tile_n, self.tile_hdim, self.tile_m)
+        self.mma_tiler_dsq = (self.tile_n, self.tile_hdim, self.tile_m)
         # dQ = dS @ K
-        self.mma_tiler_dsk = (self.tile_m, self.tile_hdim, self.tile_n * self.cta_group_size)
+        self.mma_tiler_dsk = (self.tile_m, self.tile_hdim, self.tile_n)
 
         self.acc_dtype = Float32
 
-        self.cluster_shape_mn = (1, 1)
         self.force_dkv_postprocess = force_dkv_postprocess
 
         self.reduce_warp_ids = (0, 1, 2, 3)
@@ -296,12 +288,7 @@ class BlockSparseAttnBackwardSm100Blk128:
         self.num_regs_mma = self.num_regs_load
         self.num_regs_empty = 24
 
-        assert (
-            self.num_regs_reduce
-            + self.num_regs_compute * 2
-            + max(self.num_regs_load, self.num_regs_mma)
-            <= 512
-        )
+        assert self.num_regs_reduce + self.num_regs_compute * 2 + max(self.num_regs_load, self.num_regs_mma) <= 512
         self.buffer_align_bytes = 1024
 
     def _setup_attributes(self):
@@ -313,11 +300,10 @@ class BlockSparseAttnBackwardSm100Blk128:
         self.dQ_reduce_ncol = 32
         self.sdQaccum_stage = 64 // self.dQ_reduce_ncol
         self.dQ_reduce_ncol_t2r = self.dQ_reduce_ncol
-        assert (self.tile_hdim // self.cta_group_size) % self.dQ_reduce_ncol == 0
+        assert self.tile_hdim % self.dQ_reduce_ncol == 0
         self.dQaccum_reduce_stage = self.tile_hdim // self.dQ_reduce_ncol
         self.dQaccum_reduce_stage_t2r = self.tile_hdim // self.dQ_reduce_ncol_t2r
         self.dK_reduce_ncol = math.gcd(32, self.tile_hdim // 2)
-        self.cta_group = tcgen05.CtaGroup.ONE
 
     def _get_tiled_mma(self):
         # S.T = K @ Q.T
@@ -326,7 +312,7 @@ class BlockSparseAttnBackwardSm100Blk128:
             tcgen05.OperandMajorMode.K,
             tcgen05.OperandMajorMode.K,
             self.acc_dtype,
-            self.cta_group,
+            tcgen05.CtaGroup.ONE,
             self.mma_tiler_kq[:2],
         )
         # dP.T = V @ dO.T
@@ -335,7 +321,7 @@ class BlockSparseAttnBackwardSm100Blk128:
             tcgen05.OperandMajorMode.K,
             tcgen05.OperandMajorMode.K,
             self.acc_dtype,
-            self.cta_group,
+            tcgen05.CtaGroup.ONE,
             self.mma_tiler_vdo[:2],
         )
         # dV += P.T @ dO --> (K, MN) major
@@ -344,7 +330,7 @@ class BlockSparseAttnBackwardSm100Blk128:
             tcgen05.OperandMajorMode.K,  # P_major_mode
             tcgen05.OperandMajorMode.MN,  # dO_major_mode
             self.acc_dtype,
-            self.cta_group,
+            tcgen05.CtaGroup.ONE,
             self.mma_tiler_pdo[:2],
             a_source=tcgen05.OperandSource.TMEM,
         )
@@ -354,7 +340,7 @@ class BlockSparseAttnBackwardSm100Blk128:
             tcgen05.OperandMajorMode.K,  # dS_major_mode
             tcgen05.OperandMajorMode.MN,  # Q_major_mode
             self.acc_dtype,
-            self.cta_group,
+            tcgen05.CtaGroup.ONE,
             self.mma_tiler_dsq[:2],
             a_source=tcgen05.OperandSource.TMEM,
         )
@@ -364,7 +350,7 @@ class BlockSparseAttnBackwardSm100Blk128:
             tcgen05.OperandMajorMode.MN,  # dS_major_mode
             tcgen05.OperandMajorMode.MN,  # Kt_major_mode
             self.acc_dtype,
-            self.cta_group,
+            tcgen05.CtaGroup.ONE,
             self.mma_tiler_dsk[:2],
         )
         return tiled_mma_S, tiled_mma_dP, tiled_mma_dK, tiled_mma_dV, tiled_mma_dQ
@@ -448,12 +434,8 @@ class BlockSparseAttnBackwardSm100Blk128:
             1,
         )
         self.sKt_layout = cute.slice_(sKt_layout, (None, None, None, 0))
-        self.sdQaccum_layout = cute.make_layout(
-            (self.tile_m * self.dQ_reduce_ncol, self.sdQaccum_stage)
-        )
-        self.sLSE_layout = cute.make_layout(
-            shape=(self.tile_m, self.Q_stage), stride=(1, cute.round_up(self.tile_m, 64))
-        )
+        self.sdQaccum_layout = cute.make_layout((self.tile_m * self.dQ_reduce_ncol, self.sdQaccum_stage))
+        self.sLSE_layout = cute.make_layout(shape=(self.tile_m, self.Q_stage), stride=(1, cute.round_up(self.tile_m, 64)))
         self.sdPsum_layout = cute.make_layout(
             shape=(self.tile_m, self.dO_stage),
             stride=(1, cute.round_up(self.tile_m, 64)),
@@ -531,10 +513,7 @@ class BlockSparseAttnBackwardSm100Blk128:
         mK, mV = [layout_utils.select(t, mode=KV_layout_transpose) for t in (mK, mV)]
 
         LSE_dPsum_dQaccum_transpose = [2, 1, 0]
-        mLSE, mdPsum, mdQaccum = [
-            layout_utils.select(t, mode=LSE_dPsum_dQaccum_transpose)
-            for t in (mLSE, mdPsum, mdQaccum)
-        ]
+        mLSE, mdPsum, mdQaccum = [layout_utils.select(t, mode=LSE_dPsum_dQaccum_transpose) for t in (mLSE, mdPsum, mdQaccum)]
 
         if const_expr(not self.dKV_postprocess):
             layout_dKV_transpose = KV_layout_transpose
@@ -554,13 +533,10 @@ class BlockSparseAttnBackwardSm100Blk128:
         ) = self._get_tiled_mma()
         self._setup_smem_layout()
 
-        self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
-        self.cluster_layout_vmnk = cute.tiled_divide(
-            cute.make_layout(self.cluster_shape_mnk),
+        cluster_layout_vmnk = cute.tiled_divide(
+            cute.make_layout((1, 1, 1)),
             (self.tiled_mma_S.thr_id.shape,),
         )
-        self.num_mcast_ctas_b = cute.size(self.cluster_layout_vmnk.shape[1])
-        self.is_q_do_mcast = self.num_mcast_ctas_b > 1
 
         if const_expr(not self.dKV_postprocess):
             self.mdK_layout_enum = LayoutEnum.from_tensor(mdK)
@@ -596,23 +572,17 @@ class BlockSparseAttnBackwardSm100Blk128:
 
         if const_expr(not self.dKV_postprocess):
             thr_layout_r2s_dKV = cute.make_ordered_layout((128, 1), order=(1, 0))  # 128 threads
-            val_layout_r2s_dKV = cute.make_ordered_layout(
-                (1, 128 // self.dk_dtype.width), order=(1, 0)
-            )  # 4 or 8 vals for 16 byte store
+            val_layout_r2s_dKV = cute.make_ordered_layout((1, 128 // self.dk_dtype.width), order=(1, 0))  # 4 or 8 vals for 16 byte store
             copy_atom_r2s_dKV = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(),
                 self.dk_dtype,
                 num_bits_per_copy=128,
             )
-            tiled_copy_r2s_dKV = cute.make_tiled_copy_tv(
-                copy_atom_r2s_dKV, thr_layout_r2s_dKV, val_layout_r2s_dKV
-            )
+            tiled_copy_r2s_dKV = cute.make_tiled_copy_tv(copy_atom_r2s_dKV, thr_layout_r2s_dKV, val_layout_r2s_dKV)
         else:
-            tiled_copy_r2s_dKV = copy_utils.tiled_copy_1d(
-                Float32, 128, num_copy_elems=128 // Float32.width
-            )
+            tiled_copy_r2s_dKV = copy_utils.tiled_copy_1d(Float32, 128, num_copy_elems=128 // Float32.width)
 
-        tma_load_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
+        tma_load_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
         # S.T = K @ Q.T
         tma_atom_K, tma_tensor_K = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
@@ -620,18 +590,15 @@ class BlockSparseAttnBackwardSm100Blk128:
             cute.select(self.sK_layout, mode=[0, 1, 2]),
             self.mma_tiler_kq,
             self.tiled_mma_S,
-            self.cluster_layout_vmnk.shape,
-        )
-        Q_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_B(
-            self.cluster_shape_mnk, self.tiled_mma_S.thr_id
+            cluster_layout_vmnk.shape,
         )
         tma_atom_Q, tma_tensor_Q = cute.nvgpu.make_tiled_tma_atom_B(
-            Q_tma_op,
+            tma_load_op,
             mQ,
             cute.select(self.sQ_layout, mode=[0, 1, 2]),
             self.mma_tiler_kq,
             self.tiled_mma_S,
-            self.cluster_layout_vmnk.shape,
+            cluster_layout_vmnk.shape,
         )
         # dP.T = V @ dO.T
         tma_atom_V, tma_tensor_V = cute.nvgpu.make_tiled_tma_atom_A(
@@ -640,23 +607,19 @@ class BlockSparseAttnBackwardSm100Blk128:
             cute.select(self.sV_layout, mode=[0, 1, 2]),
             self.mma_tiler_vdo,
             self.tiled_mma_dP,
-            self.cluster_layout_vmnk.shape,
+            cluster_layout_vmnk.shape,
         )
         # dV = P.T @ dO
-        dO_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_B(
-            self.cluster_shape_mnk, self.tiled_mma_dV.thr_id
-        )
         tma_atom_dO, tma_tensor_dO = cute.nvgpu.make_tiled_tma_atom_B(
-            dO_tma_op,
+            tma_load_op,
             mdO,
             cute.select(self.sdO_layout, mode=[0, 1, 2]),
             self.mma_tiler_pdo,
             self.tiled_mma_dV,
-            self.cluster_layout_vmnk.shape,
+            cluster_layout_vmnk.shape,
         )
         self.tma_copy_bytes = {
-            name: self.cta_group_size
-            * cute.size_in_bytes(mX.element_type, cute.select(layout, mode=[0, 1, 2]))
+            name: cute.size_in_bytes(mX.element_type, cute.select(layout, mode=[0, 1, 2]))
             for name, mX, layout in [
                 ("Q", mQ, self.sQ_layout),
                 ("K", mK, self.sK_layout),
@@ -671,10 +634,7 @@ class BlockSparseAttnBackwardSm100Blk128:
 
         TileScheduler = SingleTileScheduler
         bucketed_k2q_offsets, _ = bsa_k2q_csr_tensors
-        num_sched_n_blocks = (
-            (cute.size(bucketed_k2q_offsets.shape[3]) - 1)
-            * cute.size(bucketed_k2q_offsets.shape[2])
-        )
+        num_sched_n_blocks = (cute.size(bucketed_k2q_offsets.shape[3]) - 1) * cute.size(bucketed_k2q_offsets.shape[2])
         tile_sched_args = TileSchedulerArguments(
             num_sched_n_blocks,  # num_blocks
             cute.size(mQ.shape[2]),  # num_heads = num_query_heads
@@ -685,7 +645,6 @@ class BlockSparseAttnBackwardSm100Blk128:
             mV.shape[1],  # headdim_v
             total_q=cute.size(mK.shape[0]) * cute.size(mK.shape[3]),
             tile_shape_mn=self.cta_tiler[:2],  # (tile_n, tile_m)
-            cluster_shape_mn=self.cluster_shape_mnk[:2],
             qhead_per_kvhead_packgqa=1,
             element_size=self.k_dtype.width // 8,
             lpt=False,
@@ -711,6 +670,7 @@ class BlockSparseAttnBackwardSm100Blk128:
         sdV_bytes = cute.size_in_bytes(self.dv_dtype, self.sdV_layout)
         assert sdV_bytes <= sdO_alloc_bytes, "sdV doesn't fit in sdO storage allocation"
         assert sdK_bytes <= sQ_alloc_bytes, "sdK doesn't fit in sQ storage allocation"
+
         @cute.struct
         class SharedStorage:
             Q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.Q_stage]
@@ -722,14 +682,7 @@ class BlockSparseAttnBackwardSm100Blk128:
             dS_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.single_stage]
             dKV_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.sdKVaccum_stage]
             dQ_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-            dQ_cluster_full_mbar_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.dQaccum_reduce_stage // 2
-            ]
-            dQ_cluster_empty_mbar_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.dQaccum_reduce_stage // 2
-            ]
             tmem_holding_buf: Int32
-            tmem_dealloc_mbar_ptr: Int64
 
             sQ: cute.struct.Align[
                 cute.struct.MemRange[cute.Uint8, sQ_alloc_bytes],
@@ -816,7 +769,6 @@ class BlockSparseAttnBackwardSm100Blk128:
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
-            cluster=self.cluster_shape_mnk if cute.size(self.cluster_shape_mnk) > 1 else None,
             smem=self.shared_storage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
@@ -870,9 +822,6 @@ class BlockSparseAttnBackwardSm100Blk128:
         bsa_k2q_csr_tensors: Optional[BsaK2qCsrTensors] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        bidx, _, _ = cute.arch.block_idx()
-        mma_tile_coord_v = bidx % self.cta_group_size
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
 
         # Prefetch tma descriptor
         if warp_idx == self.load_warp_id:
@@ -887,7 +836,7 @@ class BlockSparseAttnBackwardSm100Blk128:
                     cpasync.prefetch_descriptor(tma_atom_dK)
 
         cluster_layout_vmnk = cute.tiled_divide(
-            cute.make_layout(self.cluster_shape_mnk),
+            cute.make_layout((1, 1, 1)),
             (tiled_mma_S.thr_id.shape,),
         )
 
@@ -897,24 +846,17 @@ class BlockSparseAttnBackwardSm100Blk128:
 
         tmem_alloc_barrier = cutlass.pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierBwdSm100.TmemPtr),
-            num_threads=cute.arch.WARP_SIZE
-            * len((self.mma_warp_id, *self.compute_warp_ids, *self.reduce_warp_ids)),
+            num_threads=cute.arch.WARP_SIZE * len((self.mma_warp_id, *self.compute_warp_ids, *self.reduce_warp_ids)),
         )
         tmem = cutlass.utils.TmemAllocator(
             storage.tmem_holding_buf,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
-            is_two_cta=False,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
         )
 
         # UMMA producers and AsyncThread consumers
-        pipeline_producer_group_MMA_AsyncThread = cutlass.pipeline.CooperativeGroup(
-            cutlass.pipeline.Agent.Thread, len([self.mma_warp_id])
-        )
-        pipeline_consumer_group_MMA_AsyncThread = cutlass.pipeline.CooperativeGroup(
-            cutlass.pipeline.Agent.Thread, len(self.compute_warp_ids) * self.cta_group_size
-        )
+        pipeline_producer_group_MMA_AsyncThread = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, len([self.mma_warp_id]))
+        pipeline_consumer_group_MMA_AsyncThread = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, len(self.compute_warp_ids))
         pipeline_S_P = cutlass.pipeline.PipelineUmmaAsync.create(
             num_stages=1,
             producer_group=pipeline_producer_group_MMA_AsyncThread,
@@ -938,7 +880,7 @@ class BlockSparseAttnBackwardSm100Blk128:
         )
         pipeline_consumer_group_MMA_AsyncThread_dQ = cutlass.pipeline.CooperativeGroup(
             cutlass.pipeline.Agent.Thread,
-            len(self.reduce_warp_ids) * self.cta_group_size,
+            len(self.reduce_warp_ids),
         )  # Compute
         pipeline_dQ = cutlass.pipeline.PipelineUmmaAsync.create(
             num_stages=1,
@@ -952,11 +894,9 @@ class BlockSparseAttnBackwardSm100Blk128:
         # Only 1 thread per warp will signal
         pipeline_PdS_producer_group = cutlass.pipeline.CooperativeGroup(
             cutlass.pipeline.Agent.Thread,
-            len(self.compute_warp_ids) * self.cta_group_size,
+            len(self.compute_warp_ids),
         )  # Compute
-        pipeline_PdS_consumer_group = cutlass.pipeline.CooperativeGroup(
-            cutlass.pipeline.Agent.Thread, len([self.mma_warp_id])
-        )  # MMA
+        pipeline_PdS_consumer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, len([self.mma_warp_id]))  # MMA
         pipeline_dS = cutlass.pipeline.PipelineAsyncUmma.create(
             num_stages=1,
             producer_group=pipeline_PdS_producer_group,
@@ -966,13 +906,8 @@ class BlockSparseAttnBackwardSm100Blk128:
         )
 
         # TMA producer and UMMA consumers
-        pipeline_producer_group = cutlass.pipeline.CooperativeGroup(
-            cutlass.pipeline.Agent.Thread, len([self.load_warp_id])
-        )
-        # The arrive count is the number of mcast size
-        pipeline_consumer_group = cutlass.pipeline.CooperativeGroup(
-            cutlass.pipeline.Agent.Thread, len([self.mma_warp_id]) * self.num_mcast_ctas_b
-        )
+        pipeline_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, len([self.load_warp_id]))
+        pipeline_consumer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, len([self.mma_warp_id]))
         pipeline_consumer_group_compute = cutlass.pipeline.CooperativeGroup(
             cutlass.pipeline.Agent.Thread,
             len(self.compute_warp_ids) * 1,
@@ -1014,18 +949,14 @@ class BlockSparseAttnBackwardSm100Blk128:
         )
 
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner, dtype=self.q_dtype)
-        sQt = cute.make_tensor(
-            cute.recast_ptr(sQ.iterator, sQt_layout.inner, dtype=self.q_dtype), sQt_layout.outer
-        )
+        sQt = cute.make_tensor(cute.recast_ptr(sQ.iterator, sQt_layout.inner, dtype=self.q_dtype), sQt_layout.outer)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         sKt = cute.make_tensor(cute.recast_ptr(sK.iterator, sKt_layout.inner), sKt_layout.outer)
         sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
         sdSt = storage.sdS.get_tensor(sdSt_layout.outer, swizzle=sdSt_layout.inner)
         sdS = cute.make_tensor(cute.recast_ptr(sdSt.iterator, sdS_layout.inner), sdS_layout.outer)
 
-        sdO = storage.sdO.get_tensor(
-            sdO_layout.outer, swizzle=sdO_layout.inner, dtype=self.do_dtype
-        )
+        sdO = storage.sdO.get_tensor(sdO_layout.outer, swizzle=sdO_layout.inner, dtype=self.do_dtype)
         sdOt = cute.make_tensor(
             cute.recast_ptr(sdO.iterator, sdOt_layout.inner, dtype=self.do_dtype),
             sdOt_layout.outer,
@@ -1034,12 +965,8 @@ class BlockSparseAttnBackwardSm100Blk128:
         sLSE = storage.sLSE.get_tensor(sLSE_layout)
         sdPsum = storage.sdPsum.get_tensor(sdPsum_layout)
         if const_expr(not self.dKV_postprocess):
-            sdV = storage.sdO.get_tensor(
-                sdV_layout.outer, swizzle=sdV_layout.inner, dtype=self.dv_dtype
-            )
-            sdK = storage.sQ.get_tensor(
-                sdK_layout.outer, swizzle=sdK_layout.inner, dtype=self.dk_dtype
-            )
+            sdV = storage.sdO.get_tensor(sdV_layout.outer, swizzle=sdV_layout.inner, dtype=self.dv_dtype)
+            sdK = storage.sQ.get_tensor(sdK_layout.outer, swizzle=sdK_layout.inner, dtype=self.dk_dtype)
         else:
             sdV = storage.sdO.get_tensor(sdV_layout, dtype=self.dv_dtype)
             sdK = storage.sQ.get_tensor(sdK_layout, dtype=self.dk_dtype)
@@ -1053,34 +980,30 @@ class BlockSparseAttnBackwardSm100Blk128:
         # request 512 columns of tmem, so we know that it starts at 0.
         tmem_ptr = cute.make_ptr(Float32, 0, mem_space=cute.AddressSpace.tmem, assumed_align=16)
         # S
-        thr_mma_S = tiled_mma_S.get_slice(mma_tile_coord_v)
+        thr_mma_S = tiled_mma_S.get_slice(0)
         Sacc_shape = thr_mma_S.partition_shape_C(self.mma_tiler_kq[:2])  # (M, N)
         tStS = thr_mma_S.make_fragment_C(Sacc_shape)
         # (MMA, MMA_M, MMA_N)
         tStS = cute.make_tensor(tmem_ptr + self.tmem_S_offset, tStS.layout)
         # dP
-        thr_mma_dP = tiled_mma_dP.get_slice(mma_tile_coord_v)
+        thr_mma_dP = tiled_mma_dP.get_slice(0)
         dPacc_shape = thr_mma_dP.partition_shape_C(self.mma_tiler_vdo[:2])
         tdPtdP = thr_mma_dP.make_fragment_C(dPacc_shape)
         tdPtdP = cute.make_tensor(tmem_ptr + self.tmem_dP_offset, tdPtdP.layout)
         # dV
-        thr_mma_dV = tiled_mma_dV.get_slice(mma_tile_coord_v)
+        thr_mma_dV = tiled_mma_dV.get_slice(0)
         dvacc_shape = thr_mma_dV.partition_shape_C(self.mma_tiler_pdo[:2])
         tdVtdV = thr_mma_dV.make_fragment_C(dvacc_shape)
         tdVtdV = cute.make_tensor(tmem_ptr + self.tmem_dV_offset, tdVtdV.layout)
-        tP = cute.make_tensor(
-            cute.recast_ptr(tmem_ptr + self.tmem_P_offset, dtype=self.do_dtype), tP_layout.outer
-        )
+        tP = cute.make_tensor(cute.recast_ptr(tmem_ptr + self.tmem_P_offset, dtype=self.do_dtype), tP_layout.outer)
         # dK
-        thr_mma_dK = tiled_mma_dK.get_slice(mma_tile_coord_v)
+        thr_mma_dK = tiled_mma_dK.get_slice(0)
         dkacc_shape = thr_mma_dK.partition_shape_C(self.mma_tiler_dsq[:2])
         tdKtdK = thr_mma_dK.make_fragment_C(dkacc_shape)
         tdKtdK = cute.make_tensor(tmem_ptr + self.tmem_dK_offset, tdKtdK.layout)
-        tdS = cute.make_tensor(
-            cute.recast_ptr(tmem_ptr + self.tmem_dS_offset, dtype=self.ds_dtype), tdS_layout.outer
-        )
+        tdS = cute.make_tensor(cute.recast_ptr(tmem_ptr + self.tmem_dS_offset, dtype=self.ds_dtype), tdS_layout.outer)
         # dQ
-        thr_mma_dQ = tiled_mma_dQ.get_slice(mma_tile_coord_v)
+        thr_mma_dQ = tiled_mma_dQ.get_slice(0)
         dQacc_shape = thr_mma_dQ.partition_shape_C(self.mma_tiler_dsk[:2])
         tdQtdQ = thr_mma_dQ.make_fragment_C(dQacc_shape)
         tdQtdQ = cute.make_tensor(tmem_ptr + self.tmem_dQ_offset, tdQtdQ.layout)
@@ -1142,7 +1065,6 @@ class BlockSparseAttnBackwardSm100Blk128:
                 pipeline_dO,
                 pipeline_LSE,
                 pipeline_dPsum,
-                cluster_layout_vmnk,
                 block_info,
                 SeqlenInfoCls,
                 TileSchedulerCls,
@@ -1173,7 +1095,6 @@ class BlockSparseAttnBackwardSm100Blk128:
                 sdO,
                 sdOt,
                 tP,
-                sdSt,
                 sdS,
                 tdS,
                 tStS,
@@ -1287,54 +1208,31 @@ class BlockSparseAttnBackwardSm100Blk128:
         pipeline_dO: PipelineAsync,
         pipeline_LSE: PipelineAsync,
         pipeline_dPsum: PipelineAsync,
-        cluster_layout_vmnk: cute.Layout,
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         bsa_k2q_csr_tensors: Optional[BsaK2qCsrTensors] = None,
     ):
-        producer_state_Q_LSE = cutlass.pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Producer, self.Q_stage
-        )
-        producer_state_dO_dPsum = cutlass.pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Producer, self.dO_stage
-        )
-
-        # Compute multicast mask for Q & dO buffer full
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
-        q_do_mcast_mask = None
-        if const_expr(self.is_q_do_mcast):
-            q_do_mcast_mask = cpasync.create_tma_multicast_mask(
-                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
-            )
+        producer_state_Q_LSE = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, self.Q_stage)
+        producer_state_dO_dPsum = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, self.dO_stage)
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
-            q_group, n_block = get_bsa_k2q_csr_tile_coord(
-                n_block, bsa_k2q_csr_tensors
-            )
+            q_group, n_block = get_bsa_k2q_csr_tile_coord(n_block, bsa_k2q_csr_tensors)
             seqlen = SeqlenInfoCls(batch_idx)
-            _, m_block_max = block_info.get_m_block_min_max(
-                seqlen, n_block // self.cluster_shape_mnk[0]
-            )
-            n_block_cta_group = n_block // self.cta_group_size
+            _, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
 
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
             mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx]
             mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx]
             mdO_cur = mdO[None, None, head_idx, batch_idx]
             mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2, padded=True)[None, head_idx]
-            mdPsum_cur = seqlen.offset_batch_Q(mdPsum, batch_idx, dim=2, padded=True)[
-                None, head_idx
-            ]
+            mdPsum_cur = seqlen.offset_batch_Q(mdPsum, batch_idx, dim=2, padded=True)[None, head_idx]
 
             # (1) S.T = K @ Q.T
-            gK = cute.local_tile(
-                mK_cur, cute.select(self.mma_tiler_kq, mode=[0, 2]), (n_block_cta_group, 0)
-            )
+            gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_kq, mode=[0, 2]), (n_block, 0))
             tSgK = thr_mma_S.partition_A(gK)
 
             gQ = cute.local_tile(mQ_cur, cute.select(self.mma_tiler_kq, mode=[1, 2]), (None, 0))
@@ -1344,31 +1242,26 @@ class BlockSparseAttnBackwardSm100Blk128:
             gdO = cute.local_tile(mdO_cur, cute.select(self.mma_tiler_pdo, mode=[1, 2]), (0, None))
             tdPgdO = thr_mma_dV.partition_B(gdO)
 
-            a_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape)
             load_K, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_K,
-                block_in_cluster_coord_vmnk[2],
-                a_cta_layout,
+                0,
+                cute.make_layout(1),
                 tSgK,
                 sK,
                 single_stage=True,
             )
 
-            b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
             load_Q, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_Q,
-                cta_coord=block_in_cluster_coord_vmnk[1],
-                cta_layout=b_cta_layout,
+                cta_coord=0,
+                cta_layout=cute.make_layout(1),
                 src_tensor=tSgQ,
                 dst_tensor=sQ,
-                mcast_mask=q_do_mcast_mask,
             )
             load_Q = copy_utils.tma_producer_copy_fn(load_Q, pipeline_Q)
 
             # (2) dP = V @ dO.T
-            gV = cute.local_tile(
-                mV_cur, cute.select(self.mma_tiler_vdo, mode=[0, 2]), (n_block_cta_group, 0)
-            )
+            gV = cute.local_tile(mV_cur, cute.select(self.mma_tiler_vdo, mode=[0, 2]), (n_block, 0))
             tdPgV = thr_mma_dP.partition_A(gV)
 
             load_V, _, _ = copy_utils.tma_get_copy_fn(
@@ -1385,11 +1278,10 @@ class BlockSparseAttnBackwardSm100Blk128:
             tdVgdO = thr_mma_dV.partition_B(gdO)
             load_dO, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_dO,
-                cta_coord=block_in_cluster_coord_vmnk[1],
-                cta_layout=b_cta_layout,
+                cta_coord=0,
+                cta_layout=cute.make_layout(1),
                 src_tensor=tdVgdO,
                 dst_tensor=sdO,
-                mcast_mask=q_do_mcast_mask,
             )
             load_dO = copy_utils.tma_producer_copy_fn(load_dO, pipeline_dO)
 
@@ -1406,32 +1298,30 @@ class BlockSparseAttnBackwardSm100Blk128:
             process_tile = total_m_block_cnt > Int32(0)
 
             if process_tile:
-                producer_state_Q_LSE, producer_state_dO_dPsum = (
-                    produce_bsa_k2q_csr_q_loads_bwd_sm100(
-                        bsa_k2q_csr_tensors,
-                        batch_idx,
-                        head_idx,
-                        q_group,
-                        n_block,
-                        producer_state_Q_LSE,
-                        producer_state_dO_dPsum,
-                        pipeline_Q,
-                        pipeline_LSE,
-                        pipeline_dO,
-                        pipeline_dPsum,
-                        load_K,
-                        load_V,
-                        load_Q,
-                        load_dO,
-                        copy_stats,
-                        gLSE,
-                        sLSE,
-                        gdPsum,
-                        sdPsum,
-                        self.tma_copy_bytes["K"],
-                        self.tma_copy_bytes["V"],
-                        m_block_max=m_block_max,
-                    )
+                producer_state_Q_LSE, producer_state_dO_dPsum = produce_bsa_k2q_csr_q_loads_bwd_sm100(
+                    bsa_k2q_csr_tensors,
+                    batch_idx,
+                    head_idx,
+                    q_group,
+                    n_block,
+                    producer_state_Q_LSE,
+                    producer_state_dO_dPsum,
+                    pipeline_Q,
+                    pipeline_LSE,
+                    pipeline_dO,
+                    pipeline_dPsum,
+                    load_K,
+                    load_V,
+                    load_Q,
+                    load_dO,
+                    copy_stats,
+                    gLSE,
+                    sLSE,
+                    gdPsum,
+                    sdPsum,
+                    self.tma_copy_bytes["K"],
+                    self.tma_copy_bytes["V"],
+                    m_block_max=m_block_max,
                 )
 
                 pipeline_Q.producer_tail(producer_state_Q_LSE.clone())
@@ -1459,7 +1349,6 @@ class BlockSparseAttnBackwardSm100Blk128:
         sdO: cute.Tensor,
         sdOt: cute.Tensor,
         tP: cute.Tensor,
-        sdSt: cute.Tensor,
         sdS: cute.Tensor,
         tdS: cute.Tensor,
         tStS: cute.Tensor,
@@ -1505,7 +1394,6 @@ class BlockSparseAttnBackwardSm100Blk128:
             sA=sK,
             sB=sQ,
             zero_init=True,
-            cta_group=self.cta_group_size,
         )
         mma_dov_fn = partial(
             gemm_ptx_w_idx,
@@ -1516,7 +1404,6 @@ class BlockSparseAttnBackwardSm100Blk128:
             sA=sV,
             sB=sdOt,
             zero_init=True,
-            cta_group=self.cta_group_size,
         )
         mma_pdo_fn = partial(
             gemm_ptx_w_idx,
@@ -1527,7 +1414,6 @@ class BlockSparseAttnBackwardSm100Blk128:
             sA=None,
             sB=sdO,
             tA_addr=self.tmem_P_offset,
-            cta_group=self.cta_group_size,
         )
         mma_dsk_fn = partial(
             gemm_w_idx,
@@ -1547,21 +1433,14 @@ class BlockSparseAttnBackwardSm100Blk128:
             sA=None,
             sB=sQt,
             tA_addr=self.tmem_dS_offset,
-            cta_group=self.cta_group_size,
         )
 
         pipeline_Q_consumer = pipeline_Q.make_consumer()
 
-        consumer_state_Q = cutlass.pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Consumer, self.Q_stage
-        )
-        consumer_state_dO = cutlass.pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Consumer, self.dO_stage
-        )
+        consumer_state_Q = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, self.Q_stage)
+        consumer_state_dO = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, self.dO_stage)
         producer_phase_acc = Int32(1)  # For S & P, dP, dQ
-        consumer_state_dS = cutlass.pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Consumer, 1
-        )
+        consumer_state_dS = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, 1)
         producer_phase_dKV = Int32(1)
         cta_group = pipeline_S_P.cta_group
 
@@ -1569,13 +1448,9 @@ class BlockSparseAttnBackwardSm100Blk128:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
-            q_group, n_block = get_bsa_k2q_csr_tile_coord(
-                n_block, bsa_k2q_csr_tensors
-            )
+            q_group, n_block = get_bsa_k2q_csr_tile_coord(n_block, bsa_k2q_csr_tensors)
             seqlen = SeqlenInfoCls(batch_idx)  # must be seqlen_k
-            _, m_block_max = block_info.get_m_block_min_max(
-                seqlen, n_block // self.cluster_shape_mnk[0]
-            )
+            _, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
 
             block_iter_count = get_total_q_block_count_bsa_k2q_csr(
                 bsa_k2q_csr_tensors,
@@ -1587,7 +1462,10 @@ class BlockSparseAttnBackwardSm100Blk128:
             process_tile = block_iter_count > Int32(0)
 
             if process_tile:
-                accumulate_dK = False
+                # Loop-carried runtime flag: Python `not` on it would bake a constant
+                # accumulate predicate at trace time, so carry the zero_init value
+                # itself as a dynamic Boolean and pass it straight to the MMA helper.
+                zero_init_dK = Boolean(True)
 
                 # 1) S = K @ Q
                 handle_Q = pipeline_Q_consumer.wait_and_advance()
@@ -1616,14 +1494,12 @@ class BlockSparseAttnBackwardSm100Blk128:
                     # (1) S.T = K @ Q.T
                     handle_Q_next = pipeline_Q_consumer.wait_and_advance()
                     mma_qk_fn(B_idx=handle_Q_next.index)
-                    pipeline_S_P.sync_object_full.arrive(
-                        0, pipeline_S_P.producer_mask, cta_group
-                    )
+                    pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
 
                     # (2) dK += dS.T @ Q
                     pipeline_dS.consumer_wait(consumer_state_dS)
-                    mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
-                    accumulate_dK = True
+                    mma_dsq_fn(B_idx=handle_Q.index, zero_init=zero_init_dK)
+                    zero_init_dK = Boolean(False)
                     handle_Q.release()
 
                     # (3) dQ = dS @ K
@@ -1655,7 +1531,7 @@ class BlockSparseAttnBackwardSm100Blk128:
 
                 # Tail: remaining dK and dQ.
                 pipeline_dS.consumer_wait(consumer_state_dS)
-                mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
+                mma_dsq_fn(B_idx=handle_Q.index, zero_init=zero_init_dK)
                 pipeline_dKV.sync_object_full.arrive(1, pipeline_dKV.producer_mask, cta_group)
                 producer_phase_dKV ^= 1
 
@@ -1685,14 +1561,14 @@ class BlockSparseAttnBackwardSm100Blk128:
         else:
             assert rank >= 3, "Need rank >= 3 for t in split_wg"
             if const_expr(rank == 3):
-                t = cute.logical_divide(
-                    t, (reduced_shape[0], reduced_shape[1], reduced_shape[2] // num_wg)
-                )
+                t = cute.logical_divide(t, (reduced_shape[0], reduced_shape[1], reduced_shape[2] // num_wg))
                 coord = (
                     None,
                     None,
                     (None, wg_idx),
-                ) + (None,) * (rank - 3)
+                ) + (
+                    None,
+                ) * (rank - 3)
             else:
                 t = cute.logical_divide(
                     t,
@@ -1708,7 +1584,9 @@ class BlockSparseAttnBackwardSm100Blk128:
                     None,
                     None,
                     (None, wg_idx),
-                ) + (None,) * (rank - 4)
+                ) + (
+                    None,
+                ) * (rank - 4)
         return t[coord]
 
     @cute.jit
@@ -1801,12 +1679,8 @@ class BlockSparseAttnBackwardSm100Blk128:
         tdPcdS = cute.composition(tdPcdP, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
 
         # Fixed repetition for the blk128 path.
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
-        )
-        tmem_store_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), Float32
-        )
+        tmem_load_atom = cute.make_copy_atom(tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32)
+        tmem_store_atom = cute.make_copy_atom(tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), Float32)
 
         # tmem -> rmem
         thr_copy_t2r = copy_utils.make_tmem_copy(tmem_load_atom, num_wg).get_slice(tidx)
@@ -1824,49 +1698,30 @@ class BlockSparseAttnBackwardSm100Blk128:
         tdPtdS_r2t = thr_copy_r2t.partition_D(tdPtdS)
         # rmem -> smem
         # This part is a bit iffy, we might be making a lot of assumptions here
-        copy_atom_r2s = sm100_utils_basic.get_smem_store_op(
-            LayoutEnum.ROW_MAJOR, self.ds_dtype, Float32, thr_copy_t2r
-        )
+        copy_atom_r2s = sm100_utils_basic.get_smem_store_op(LayoutEnum.ROW_MAJOR, self.ds_dtype, Float32, thr_copy_t2r)
         thr_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, thr_copy_t2r).get_slice(tidx)
 
         # We assume the swizzle (i.e. layout.inner) stays the same
-        sdS_epi_layout = sm100_utils_basic.make_smem_layout_epi(
-            self.ds_dtype, LayoutEnum.ROW_MAJOR, (self.tile_n, self.tile_m), 1
-        )
+        sdS_epi_layout = sm100_utils_basic.make_smem_layout_epi(self.ds_dtype, LayoutEnum.ROW_MAJOR, (self.tile_n, self.tile_m), 1)
         sdS_layout = cute.slice_(sdS_epi_layout.outer, (None, None, 0))  # ((8,16), (64,2))
         # Need to group into 1 mode to be compatible w thr_copy_r2s
         sdS_layout = cute.make_layout((sdS_layout.shape,), stride=(sdS_layout.stride,))
         sdS_epi = cute.make_tensor(sdS.iterator, sdS_layout)
         tRS_sdS = thr_copy_r2s.partition_D(sdS_epi)
 
-        consumer_state_S_P_dP = pipeline.make_pipeline_state(  # Our impl has shortcut for stage==1
-            cutlass.pipeline.PipelineUserType.Consumer, 1
-        )
-        producer_state_dS = pipeline.make_pipeline_state(  # Our impl has shortcut for stage==1
-            cutlass.pipeline.PipelineUserType.Producer, 1
-        )
-        consumer_state_dKV = cutlass.pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Consumer, 2
-        )
-        consumer_state_LSE = cutlass.pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Consumer, self.Q_stage
-        )
-        consumer_state_dPsum = pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Consumer, self.dO_stage
-        )
+        consumer_state_S_P_dP = pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, 1)
+        producer_state_dS = pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, 1)
+        consumer_state_dKV = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, 2)
+        consumer_state_LSE = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, self.Q_stage)
+        consumer_state_dPsum = pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, self.dO_stage)
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
-            q_group, n_block = get_bsa_k2q_csr_tile_coord(
-                n_block, bsa_k2q_csr_tensors
-            )
+            q_group, n_block = get_bsa_k2q_csr_tile_coord(n_block, bsa_k2q_csr_tensors)
             seqlen = SeqlenInfoCls(batch_idx)
-            _, m_block_max = block_info.get_m_block_min_max(
-                seqlen, n_block // self.cluster_shape_mnk[0]
-            )
-            n_block_for_cluster = n_block // self.cta_group_size
+            _, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
 
             (
                 curr_q_cnt,
@@ -1890,7 +1745,7 @@ class BlockSparseAttnBackwardSm100Blk128:
                 tSrS_t2r = cute.make_rmem_tensor(tScS_t2r.shape, Float32)
                 cute.copy(thr_copy_t2r, tStS_t2r, tSrS_t2r)
 
-                self.apply_seqlen_k_mask(tSrS_t2r, tScS_t2r, n_block_for_cluster, seqlen)
+                self.apply_seqlen_k_mask(tSrS_t2r, tScS_t2r, n_block, seqlen)
                 num_stages = cute.size(tScS_t2r, mode=[1])
                 tSrP_r2t_f32 = cute.make_rmem_tensor(tScP_r2t.shape, Float32)  # 64
                 tSrP_r2t = cute.recast_tensor(tSrP_r2t_f32, self.q_dtype)
@@ -1940,21 +1795,17 @@ class BlockSparseAttnBackwardSm100Blk128:
                     tdPrdP_cur = tdPrdP_t2r[None, 0, 0]
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
                     tSsdPsum_cur = tSsdPsum[None, stage, 0, 0, consumer_state_dPsum.index]
-                    tSrdPsum = cute.make_fragment_like(tSsdPsum_cur, Float32)
+                    tSrdPsum = cute.make_rmem_tensor_like(tSsdPsum_cur, Float32)
                     cute.autovec_copy(tSsdPsum_cur, tSrdPsum)
                     for v in cutlass.range_constexpr(cute.size(tdPrdP_t2r, mode=[0]) // 2):
                         dPsum_pair = (tSrdPsum[2 * v], tSrdPsum[2 * v + 1])
-                        tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = (
-                            quack.activation.sub_packed_f32x2(
-                                (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]), dPsum_pair
-                            )
-                        )
+                        tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = sub_packed_f32x2((tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]), dPsum_pair)
                         tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.mul_packed_f32x2(
                             (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
                             (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
                         )
 
-                    tdPrdS_cvt = cute.make_fragment_like(tdPrdP_cur, self.ds_dtype)
+                    tdPrdS_cvt = cute.make_rmem_tensor_like(tdPrdP_cur, self.ds_dtype)
                     utils.cvt_f16(tdPrdP_cur, tdPrdS_cvt)
                     if const_expr(stage == 0):
                         pipeline_dS.producer_acquire(producer_state_dS)
@@ -1985,7 +1836,6 @@ class BlockSparseAttnBackwardSm100Blk128:
                     batch_idx,
                     head_idx,
                     n_block,
-                    seqlen,
                     thr_mma_dV,
                     tdVtdV,
                     mdV_tma_tensor,
@@ -2003,7 +1853,6 @@ class BlockSparseAttnBackwardSm100Blk128:
                     batch_idx,
                     head_idx,
                     n_block,
-                    seqlen,
                     thr_mma_dK,
                     tdKtdK,
                     mdK_tma_tensor,
@@ -2020,47 +1869,47 @@ class BlockSparseAttnBackwardSm100Blk128:
                 should_zero_dKV = not process_tile
 
                 if should_zero_dKV:
-                    cluster_tile_n = self.tile_n * self.cta_group_size
-                    n_block_for_tile = n_block // self.cta_group_size
+                    zero_dk_major = math.gcd(64, self.tile_hdim)
+                    zero_dv_major = math.gcd(64, self.tile_hdimv)
+                    zero_dk_copy_elems = math.gcd(zero_dk_major, 128 // self.dk_dtype.width)
+                    zero_dv_copy_elems = math.gcd(zero_dv_major, 128 // self.dv_dtype.width)
                     gmem_tiled_copy_zero_dK = copy_utils.tiled_copy_2d(
                         self.dk_dtype,
-                        math.gcd(64, self.tile_hdim),
+                        zero_dk_major // zero_dk_copy_elems,
                         128,  # num_threads
+                        zero_dk_copy_elems,
                     )
                     gmem_tiled_copy_zero_dV = copy_utils.tiled_copy_2d(
                         self.dv_dtype,
-                        math.gcd(64, self.tile_hdimv),
+                        zero_dv_major // zero_dv_copy_elems,
                         128,  # num_threads
+                        zero_dv_copy_elems,
                     )
                     gmem_thr_copy_zero_dK = gmem_tiled_copy_zero_dK.get_slice(dp_idx)
                     gmem_thr_copy_zero_dV = gmem_tiled_copy_zero_dV.get_slice(dp_idx)
                     mdV_cur = seqlen.offset_batch_K(mdV, batch_idx, dim=3)[None, None, head_idx]
                     mdK_cur = seqlen.offset_batch_K(mdK, batch_idx, dim=3)[None, None, head_idx]
-                    gdK = cute.local_tile(
-                        mdK_cur, (cluster_tile_n, self.tile_hdim), (n_block_for_tile, 0)
-                    )
-                    gdV = cute.local_tile(
-                        mdV_cur, (cluster_tile_n, self.tile_hdimv), (n_block_for_tile, 0)
-                    )
+                    gdK = cute.local_tile(mdK_cur, (self.tile_n, self.tile_hdim), (n_block, 0))
+                    gdV = cute.local_tile(mdV_cur, (self.tile_n, self.tile_hdimv), (n_block, 0))
                     tdKgdK = gmem_thr_copy_zero_dK.partition_D(gdK)
                     tdVgdV = gmem_thr_copy_zero_dV.partition_D(gdV)
-                    cdK = cute.make_identity_tensor((cluster_tile_n, self.tile_hdim))
-                    cdV = cute.make_identity_tensor((cluster_tile_n, self.tile_hdimv))
+                    cdK = cute.make_identity_tensor((self.tile_n, self.tile_hdim))
+                    cdV = cute.make_identity_tensor((self.tile_n, self.tile_hdimv))
                     tdKcdK = gmem_thr_copy_zero_dK.partition_D(cdK)
                     tdVcdV = gmem_thr_copy_zero_dV.partition_D(cdV)
                     assert cute.size(tdKgdK[None, 0, 0]) == cute.size(tdVgdV[None, 0, 0])
-                    zero = cute.make_fragment_like(tdKgdK[None, 0, 0])
+                    zero = cute.make_rmem_tensor_like(tdKgdK[None, 0, 0])
                     zero.fill(0.0)
                     if tidx < 128:
                         for i in cutlass.range_constexpr(tdKgdK.shape[1]):
                             row_idx = tdKcdK[0, i, 0][0]
-                            if row_idx < seqlen.seqlen_k - cluster_tile_n * n_block_for_tile:
+                            if row_idx < seqlen.seqlen_k - self.tile_n * n_block:
                                 for j in cutlass.range_constexpr(tdKgdK.shape[2]):
                                     cute.copy(gmem_tiled_copy_zero_dK, zero, tdKgdK[None, i, j])
                     else:
                         for i in cutlass.range_constexpr(tdVgdV.shape[1]):
                             row_idx = tdVcdV[0, i, 0][0]
-                            if row_idx < seqlen.seqlen_k - cluster_tile_n * n_block_for_tile:
+                            if row_idx < seqlen.seqlen_k - self.tile_n * n_block:
                                 for j in cutlass.range_constexpr(tdVgdV.shape[2]):
                                     cute.copy(gmem_tiled_copy_zero_dV, zero, tdVgdV[None, i, j])
 
@@ -2085,45 +1934,30 @@ class BlockSparseAttnBackwardSm100Blk128:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx() % len(self.reduce_warp_ids))
         is_tma_warp = warp_idx == 0
         # TMEM -> RMEM
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dQ_reduce_ncol_t2r)), Float32
-        )
+        tmem_load_atom = cute.make_copy_atom(tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dQ_reduce_ncol_t2r)), Float32)
         thr_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdQtdQ).get_slice(tidx)
         tdQtdQ_t2r = thr_copy_t2r.partition_S(tdQtdQ)
         tdQcdQ = thr_mma_dQ.partition_C(cute.make_identity_tensor(self.mma_tiler_dsk[:2]))
         tdQrdQ_t2r_shape = thr_copy_t2r.partition_D(tdQcdQ).shape
         expected_reduce_stages_t2r = self.dQaccum_reduce_stage_t2r
-        assert cute.size(tdQrdQ_t2r_shape, mode=[1]) == expected_reduce_stages_t2r, (
-            "dQaccum t2r reduce stage mismatch"
-        )
+        assert cute.size(tdQrdQ_t2r_shape, mode=[1]) == expected_reduce_stages_t2r, "dQaccum t2r reduce stage mismatch"
 
-        thr_copy_dQaccum_r2s = copy_utils.tiled_copy_1d(
-            self.dqaccum_dtype, num_reduce_threads, num_copy_elems=128 // self.dqaccum_dtype.width
-        ).get_slice(tidx)
+        thr_copy_dQaccum_r2s = copy_utils.tiled_copy_1d(self.dqaccum_dtype, num_reduce_threads, num_copy_elems=128 // self.dqaccum_dtype.width).get_slice(tidx)
         tdQsdQ = thr_copy_dQaccum_r2s.partition_D(sdQaccum)
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
-        dQ_consumer_state = pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Consumer, 1
-        )
-        dQ_tma_store_producer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer, self.sdQaccum_stage
-        )
+        dQ_consumer_state = pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, 1)
+        dQ_tma_store_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.sdQaccum_stage)
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
-            q_group, n_block = get_bsa_k2q_csr_tile_coord(
-                n_block, bsa_k2q_csr_tensors
-            )
-            n_block_cta_group = n_block // self.cta_group_size
+            q_group, n_block = get_bsa_k2q_csr_tile_coord(n_block, bsa_k2q_csr_tensors)
             seqlen = SeqlenInfoCls(batch_idx)
-            _, m_block_max = block_info.get_m_block_min_max(seqlen, n_block_cta_group)
+            _, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
             mdQaccum_cur = mdQaccum[None, head_idx, batch_idx]
             gdQaccum_ = cute.local_tile(mdQaccum_cur, (self.tile_m * self.tile_hdim,), (None,))
             # (M * K / STAGE, STAGE, _)
-            gdQaccum = cute.flat_divide(
-                gdQaccum_, (self.tile_m * self.tile_hdim // self.dQaccum_reduce_stage,)
-            )
+            gdQaccum = cute.flat_divide(gdQaccum_, (self.tile_m * self.tile_hdim // self.dQaccum_reduce_stage,))
 
             (
                 curr_q_cnt,
@@ -2156,7 +1990,7 @@ class BlockSparseAttnBackwardSm100Blk128:
 
                 tdQrdQ_shape = (
                     self.dQ_reduce_ncol,
-                    self.tile_hdim // self.cta_group_size // self.dQ_reduce_ncol,
+                    self.tile_hdim // self.dQ_reduce_ncol,
                 )
                 tdQrdQ = cute.make_tensor(tdQrdQ_t2r.iterator, tdQrdQ_shape)
 
@@ -2175,9 +2009,7 @@ class BlockSparseAttnBackwardSm100Blk128:
                                 self.tma_copy_bytes["dQ"] // 1,
                             )
                         cute.arch.cp_async_bulk_commit_group()
-                        cute.arch.cp_async_bulk_wait_group(
-                            self.sdQaccum_stage - 1, read=True
-                        )
+                        cute.arch.cp_async_bulk_wait_group(self.sdQaccum_stage - 1, read=True)
                     self.reduce_sync_barrier.arrive_and_wait()
                     dQ_tma_store_producer_state.advance()
             if process_tile:
@@ -2197,7 +2029,6 @@ class BlockSparseAttnBackwardSm100Blk128:
         batch_idx: Int32,
         head_idx: Int32,
         n_block: Int32,
-        seqlen,
         thr_mma: cute.ThrMma,
         tdKVtdKV: cute.Tensor,
         mdKV: cute.Tensor,
@@ -2214,15 +2045,11 @@ class BlockSparseAttnBackwardSm100Blk128:
         tile_hdim = self.tile_hdim if const_expr(K_or_V == "K") else self.tile_hdimv
         dtype = self.dk_dtype if const_expr(K_or_V == "K") else self.dv_dtype
         epi_tile = self.sdK_epi_tile if const_expr(K_or_V == "K") else self.sdV_epi_tile
-        flat_epi_tile = (
-            self.sdK_flat_epi_tile if const_expr(K_or_V == "K") else self.sdV_flat_epi_tile
-        )
+        flat_epi_tile = self.sdK_flat_epi_tile if const_expr(K_or_V == "K") else self.sdV_flat_epi_tile
         num_compute_threads = cute.arch.WARP_SIZE * len(self.compute_warp_ids)
         wg_idx = (cute.arch.thread_idx()[0] % num_compute_threads) // 128
         num_wg = num_compute_threads // 128
         leader_warp = (cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4) == 0
-
-        cta_group_tile_n = const_expr(self.tile_n * self.cta_group_size)
 
         if const_expr(not self.dKV_postprocess):
             sdKV = sdKV[None, None, wg_idx]  # (tile_n, 64) for bf16
@@ -2234,24 +2061,14 @@ class BlockSparseAttnBackwardSm100Blk128:
 
         if const_expr(not self.dKV_postprocess):
             mdKV_cur = mdKV[None, None, head_idx, batch_idx]  # (seqlen, hdim)
-            gdKV_p = cute.local_tile(
-                mdKV_cur, (self.tile_n, tile_hdim), (n_block, 0)
-            )  # (tile_n, hdim) - per CTA
+            gdKV_p = cute.local_tile(mdKV_cur, (self.tile_n, tile_hdim), (n_block, 0))  # (tile_n, hdim) - per CTA
             gdKV = self.split_wg(gdKV_p, wg_idx, num_wg)  # (tile_n, hdim / 2)
-            gdKV_epi = cute.local_tile(
-                gdKV, epi_tile, (0, None)
-            )  # (tile_n, 64, epi_stage = (hdim / 2) / 64)
+            gdKV_epi = cute.local_tile(gdKV, epi_tile, (0, None))  # (tile_n, 64, epi_stage = (hdim / 2) / 64)
         else:
             mdKV_cur = mdKV[None, head_idx, batch_idx]  # (seqlen * hdim)
-            gdKV_p = cute.local_tile(
-                mdKV_cur, (self.tile_n * tile_hdim,), (n_block,)
-            )  # (tile_n * hdim)
-            gdKV = cute.logical_divide(gdKV_p, (self.tile_n * tile_hdim // num_wg,))[
-                ((None, wg_idx),)
-            ]  # (tile_n * hdim / 2)
-            gdKV_epi = cute.flat_divide(
-                gdKV, (flat_epi_tile,)
-            )  # (tile_n * hdim / 2 / epi_stage, epi_stage)
+            gdKV_p = cute.local_tile(mdKV_cur, (self.tile_n * tile_hdim,), (n_block,))  # (tile_n * hdim)
+            gdKV = cute.logical_divide(gdKV_p, (self.tile_n * tile_hdim // num_wg,))[((None, wg_idx),)]  # (tile_n * hdim / 2)
+            gdKV_epi = cute.flat_divide(gdKV, (flat_epi_tile,))  # (tile_n * hdim / 2 / epi_stage, epi_stage)
 
         if const_expr(not self.dKV_postprocess):
             tdKVsdKV, tdKVgdKV = cpasync.tma_partition(
@@ -2269,13 +2086,9 @@ class BlockSparseAttnBackwardSm100Blk128:
             else:
                 assert num_epi_stages == self.num_epi_stages_v, "Epi stage calculation is wrong (V)"
         else:
-            num_epi_stages = (
-                self.num_epi_stages if const_expr(K_or_V == "K") else self.num_epi_stages_v
-            )
+            num_epi_stages = self.num_epi_stages if const_expr(K_or_V == "K") else self.num_epi_stages_v
 
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dK_reduce_ncol)), Float32
-        )
+        tmem_load_atom = cute.make_copy_atom(tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dK_reduce_ncol)), Float32)
 
         pipeline_dKV.consumer_wait(consumer_state_dKV)
 
@@ -2287,7 +2100,7 @@ class BlockSparseAttnBackwardSm100Blk128:
             if const_expr(num_epi_stages > 1):
                 tdKVtdKV_t2r = tdKVtdKV_t2r[None, epi_stage]
 
-            cdKV = cute.make_identity_tensor((cta_group_tile_n, tile_hdim))
+            cdKV = cute.make_identity_tensor((self.tile_n, tile_hdim))
             tdKVcdKV = thr_mma.partition_C(cdKV)
             tdKVcdKV_t2r_p = thr_copy_t2r.partition_D(tdKVcdKV)
             tdKVcdKV_t2r = self.split_wg(tdKVcdKV_t2r_p, wg_idx, num_wg)[None, None, 0, 0]
@@ -2296,9 +2109,7 @@ class BlockSparseAttnBackwardSm100Blk128:
 
             tdKVrdKV_t2r = cute.make_rmem_tensor(tdKVcdKV_t2r.shape, Float32)
 
-            assert cute.size(tdKVrdKV_t2r) == cute.size(tdKVtdKV_t2r) // cute.arch.WARP_SIZE, (
-                "RMEM<->TMEM fragment size mismatch"
-            )
+            assert cute.size(tdKVrdKV_t2r) == cute.size(tdKVtdKV_t2r) // cute.arch.WARP_SIZE, "RMEM<->TMEM fragment size mismatch"
 
             # TMEM -> RMEM -- copy and fence
             cute.copy(thr_copy_t2r, tdKVtdKV_t2r, tdKVrdKV_t2r)
@@ -2307,9 +2118,7 @@ class BlockSparseAttnBackwardSm100Blk128:
             # RMEM -- scale and convert
             if const_expr(scale is not None):
                 for i in cutlass.range(cute.size(tdKVrdKV_t2r.shape) // 2, unroll_full=True):
-                    tdKVrdKV_t2r[2 * i], tdKVrdKV_t2r[2 * i + 1] = cute.arch.mul_packed_f32x2(
-                        (tdKVrdKV_t2r[2 * i], tdKVrdKV_t2r[2 * i + 1]), (scale, scale)
-                    )
+                    tdKVrdKV_t2r[2 * i], tdKVrdKV_t2r[2 * i + 1] = cute.arch.mul_packed_f32x2((tdKVrdKV_t2r[2 * i], tdKVrdKV_t2r[2 * i + 1]), (scale, scale))
             tdKVrdKV = cute.make_rmem_tensor(tdKVrdKV_t2r.shape, dtype)  # (32 columns)
             tdKVrdKV.store(tdKVrdKV_t2r.load().to(dtype))
 
@@ -2333,15 +2142,11 @@ class BlockSparseAttnBackwardSm100Blk128:
                 if const_expr(epi_stage < num_epi_stages - 1):
                     cute.arch.cp_async_bulk_commit_group()
                     cute.arch.cp_async_bulk_wait_group(0, read=True)
-                cute.arch.barrier_arrive(
-                    barrier_id=barrier_id + wg_idx, number_of_threads=128 + cute.arch.WARP_SIZE
-                )
+                cute.arch.barrier_arrive(barrier_id=barrier_id + wg_idx, number_of_threads=128 + cute.arch.WARP_SIZE)
 
             # Barrier since all warps need to wait for SMEM to be freed
             cute.arch.fence_view_async_shared()
-            cute.arch.barrier(
-                barrier_id=barrier_id + wg_idx, number_of_threads=128 + cute.arch.WARP_SIZE
-            )
+            cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128 + cute.arch.WARP_SIZE)
 
         cute.arch.sync_warp()
         with cute.arch.elect_one():
@@ -2394,9 +2199,7 @@ def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
 
     batch_size, num_heads, seqlen_q, head_dim = q.shape
     seqlen_k = k.shape[2]
-    assert head_dim in (64, SM100_BWD_HEAD_DIM), (
-        f"SM100 blk128 bwd supports head_dim in {{64, {SM100_BWD_HEAD_DIM}}}, got {head_dim}"
-    )
+    assert head_dim in (64, SM100_BWD_HEAD_DIM), f"SM100 blk128 bwd supports head_dim in {{64, {SM100_BWD_HEAD_DIM}}}, got {head_dim}"
     assert k.shape == v.shape == (batch_size, num_heads, seqlen_k, head_dim)
     assert out.shape == dout.shape == q.shape
     assert lse.shape == (batch_size, num_heads, seqlen_q)
@@ -2496,16 +2299,11 @@ def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
     )
     cache = bsa_sm100_blk128_bwd_bucketed_k2q_csr.compile_cache
     if compile_key not in cache:
-        q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor = [
-            to_cute_tensor(t)
-            for t in (q_bshd, k_bshd, v_bshd, dout_bshd, dq_bshd)
-        ]
+        q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor = [to_cute_tensor(t) for t in (q_bshd, k_bshd, v_bshd, dout_bshd, dq_bshd)]
         dk_runtime = dk_accum if use_dkv_postprocess else dk_bshd
         dv_runtime = dv_accum if use_dkv_postprocess else dv_bshd
         dk_tensor, dv_tensor = [to_cute_tensor(t) for t in (dk_runtime, dv_runtime)]
-        dq_accum_tensor, dpsum_tensor, lse_log2_tensor = [
-            to_cute_tensor(t) for t in (dq_accum, dpsum, lse_log2)
-        ]
+        dq_accum_tensor, dpsum_tensor, lse_log2_tensor = [to_cute_tensor(t) for t in (dq_accum, dpsum, lse_log2)]
         bsa_csr_tensors = BsaK2qCsrTensors(
             to_cute_tensor(bucketed_k2q_offsets, assumed_align=4),
             to_cute_tensor(bucketed_k2q_indices, assumed_align=4),
@@ -2557,11 +2355,7 @@ def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
         dtype,
         head_dim,
         SM100_BLK128_BWD_SPARSE_BLOCK_SIZE,
-        128,
-        1,
         False,
-        False,
-        1,
     )
     if use_dkv_postprocess:
         _bwd_postprocess_convert(
@@ -2574,11 +2368,7 @@ def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
             dtype,
             head_dim,
             SM100_BLK128_BWD_SPARSE_BLOCK_SIZE,
-            128,
-            2,
             False,
-            False,
-            1,
         )
         _bwd_postprocess_convert(
             dv_accum,
@@ -2590,11 +2380,7 @@ def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
             dtype,
             head_dim,
             SM100_BLK128_BWD_SPARSE_BLOCK_SIZE,
-            128,
-            2,
             False,
-            False,
-            1,
         )
     return dq, dk, dv
 
