@@ -9,7 +9,7 @@ from cutlass.cutlass_dsl import T
 from cutlass._mlir.dialects import llvm
 
 from csrc.utils import mma_sm100_desc as sm100_desc
-from csrc.utils.tcgen05_mma_helpers import i64_to_i32x2
+from csrc.utils.tcgen05_mma_helpers import i64_to_i32x2, _tcgen05_mma_kind
 
 
 @cute.jit
@@ -67,6 +67,19 @@ def tcgen05_fence_after_thread_sync() -> None:
         None,
         [],
         "tcgen05.fence::after_thread_sync;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def tcgen05_fence_before_thread_sync() -> None:
+    llvm.inline_asm(
+        None,
+        [],
+        "tcgen05.fence::before_thread_sync;",
         "",
         has_side_effects=True,
         is_align_stack=False,
@@ -149,6 +162,34 @@ def cvt_f32x2_to_bf16x2(a: Float32, b: Float32) -> Int32:
 
 
 @cute.jit
+def cvt_f32x4_to_e4m3x4(
+    a: Float32, b: Float32, c: Float32, d: Float32
+) -> Int32:
+    """Pack four FP32 values into one E4M3x4 register."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Float32(a).ir_value(),
+                Float32(b).ir_value(),
+                Float32(c).ir_value(),
+                Float32(d).ir_value(),
+            ],
+            "{\n\t"
+            ".reg .b16 out01, out23;\n\t"
+            "cvt.rn.satfinite.e4m3x2.f32 out01, $2, $1;\n\t"
+            "cvt.rn.satfinite.e4m3x2.f32 out23, $4, $3;\n\t"
+            "mov.b32 $0, {out01, out23};\n\t"
+            "}",
+            "=r,f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
 def shr_u32(x: Uint32, shift: Uint32) -> Uint32:
     return Uint32(
         llvm.inline_asm(
@@ -216,6 +257,23 @@ def tmem_store_bf16x16(tmem_addr: Int32, vals: cute.Tensor) -> None:
         [Int32(cute.arch.make_warp_uniform(tmem_addr)).ir_value()] + [Int32(vals[i]).ir_value() for i in range(16)],
         f"tcgen05.st.sync.aligned.32x32b.x16.b32 [$0], {{{regs}}};",
         ",".join(["r"] * 17),
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def tmem_store_e4m3x8(tmem_addr: Int32, vals: cute.Tensor) -> None:
+    """Store 32 packed E4M3 values (8 b32 registers) into TMEM."""
+    assert cute.size(vals) == 8
+    regs = ", ".join(f"${i + 1}" for i in range(8))
+    llvm.inline_asm(
+        None,
+        [Int32(cute.arch.make_warp_uniform(tmem_addr)).ir_value()]
+        + [Int32(vals[i]).ir_value() for i in range(8)],
+        f"tcgen05.st.sync.aligned.32x32b.x8.b32 [$0], {{{regs}}};",
+        ",".join(["r"] * 9),
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -504,7 +562,8 @@ def gemm_ptx_partial(
     pred_str = "p" if zero_init_is_dynamic else "0" if zero_init else "1"
     pred_input = zero_init if zero_init_is_dynamic else not zero_init
     pred_setp = "setp.eq.b32" if zero_init_is_dynamic else "setp.ne.b32"
-    mma_instr = "tcgen05.mma.ws.cta_group::1.kind::f16"
+    mma_kind = _tcgen05_mma_kind(op)
+    mma_instr = f"tcgen05.mma.ws.cta_group::1.kind::{mma_kind}"
     mma_suffix = ", 0"
     if const_expr(not is_ts):
         assert mbar_ptr is None, "mbar_ptr must be None when a_src is not TMEM"
@@ -575,6 +634,11 @@ def gemm_ptx_partial(
                 "@P1 bra.uni DONE; \n\t"
                 "bra.uni LAB_WAIT; \n\t"
                 "DONE: \n\t"
+                + (
+                    "tcgen05.fence::after_thread_sync; \n\t"
+                    if const_expr(op.a_dtype.width == 8)
+                    else ""
+                )
             )
         else:
             split_arrive_idx = 0
