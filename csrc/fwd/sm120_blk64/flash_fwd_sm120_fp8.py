@@ -319,15 +319,17 @@ class BlockSparseAttnForwardFp8Sm120Blk64(BatchedStaticSchedulerMixin):
         max_m_layout = cute.make_layout(cute.size(layout_utils.reshape_acc_to_mn(tOrO).layout, mode=[0]))
         max_m = cute.make_rmem_tensor_like(max_m_layout, cutlass.Float32)
         sum_m = cute.make_rmem_tensor_like(max_m, cutlass.Float32)
-        q_scale_m = cute.make_rmem_tensor_like(max_m, cutlass.Float32)
+        q_softmax_scale_log2e_m = cute.make_rmem_tensor_like(
+            max_m, cutlass.Float32
+        )
         tScS_mn = layout_utils.reshape_acc_to_mn(tScS)
-        for m in cutlass.range_constexpr(cute.size(q_scale_m)):
+        for m in cutlass.range_constexpr(cute.size(q_softmax_scale_log2e_m)):
             row_idx = (
                 work_desc.qo_tile_idx * self.tile_size
                 + tScS_mn[m, 0][0]
             )
-            q_scale_m[m] = (
-                gQScale[row_idx]
+            q_softmax_scale_log2e_m[m] = (
+                gQScale[row_idx] * scale_softmax_log2e
                 if row_idx < mQ.shape[0]
                 else cutlass.Float32(0.0)
             )
@@ -442,10 +444,9 @@ class BlockSparseAttnForwardFp8Sm120Blk64(BatchedStaticSchedulerMixin):
                 B_uses_fp8_ldsm=True,
             )
 
-            apply_sage_qk_scales(
+            apply_sage_k_scales(
                 tSrS,
                 tScS,
-                q_scale_m,
                 gKScale,
                 n_tile_idx,
                 self.tile_size,
@@ -477,7 +478,7 @@ class BlockSparseAttnForwardFp8Sm120Blk64(BatchedStaticSchedulerMixin):
                 tSrS,
                 max_m,
                 sum_m,
-                scale_softmax_log2e,
+                q_softmax_scale_log2e_m,
                 self.softmax_p_scale_log2,
             )
 
@@ -549,7 +550,7 @@ class BlockSparseAttnForwardFp8Sm120Blk64(BatchedStaticSchedulerMixin):
         final_ratio, lse = finalize_softmax(
             max_m,
             sum_m,
-            scale_softmax_log2e,
+            q_softmax_scale_log2e_m,
             self.softmax_p_scale_log2,
         )
         rescale_o_with_sage_v_scale(
@@ -939,15 +940,18 @@ def gemm_rs_smem(
 
 
 @cute.jit
-def apply_sage_qk_scales(
+def apply_sage_k_scales(
     tSrS: cute.Tensor,
     tScS: cute.Tensor,
-    q_scale_m: cute.Tensor,
     gKScale: cute.Tensor,
     k_tile_idx: cutlass.Int32,
     tile_size: cutlass.Constexpr[int],
 ) -> None:
-    """Apply per-row Q and per-16-token K descales to QK scores."""
+    """Apply per-16-token K descales to QK scores.
+
+    The per-row Q descale is folded into the softmax scale, avoiding one
+    multiply for every score element.
+    """
     tSrS_mn = layout_utils.reshape_acc_to_mn(tSrS)
     tScS_mn = layout_utils.reshape_acc_to_mn(tScS)
     k_scale_base = k_tile_idx * (tile_size // 16)
@@ -955,7 +959,7 @@ def apply_sage_qk_scales(
         k_scale_idx = k_scale_base + tScS_mn[0, n][1] // 16
         k_scale = gKScale[k_scale_idx]
         for m in cutlass.range(cute.size(tSrS_mn, mode=[0]), unroll_full=True):
-            tSrS_mn[m, n] *= q_scale_m[m] * k_scale
+            tSrS_mn[m, n] *= k_scale
 
 
 @cute.jit
@@ -980,13 +984,14 @@ def online_softmax(
     tSrS: cute.ThrMma,
     row_max: cute.Tensor,
     row_sum: cute.Tensor,
-    softmax_scale_log2e: cutlass.Float32,
+    softmax_scale_log2e_m: cute.Tensor,
     exp_scale_log2: cutlass.Float32,
 ) -> cute.Tensor:
     tSrS_mn = layout_utils.reshape_acc_to_mn(tSrS)
     row_scale = cute.make_rmem_tensor_like(row_max, cutlass.Float32)
 
     for m in cutlass.range(cute.size(row_max), unroll_full=True):
+        softmax_scale_log2e = softmax_scale_log2e_m[m]
         acc_S_row = tSrS_mn[m, None].load()
         row_max_cur = fa_utils.fmax_reduce(
             acc_S_row,
@@ -1023,7 +1028,7 @@ def online_softmax(
 def finalize_softmax(
     row_max: cute.Tensor,
     row_sum: cute.Tensor,
-    softmax_scale_log2e: cutlass.Float32,
+    softmax_scale_log2e_m: cute.Tensor,
     exp_scale_log2: cutlass.Float32,
 ) -> cute.Tensor:
     row_sum.store(fa_utils.warp_reduce(row_sum.load(), operator.add, width=4))
@@ -1031,6 +1036,7 @@ def finalize_softmax(
     lse = cute.make_rmem_tensor_like(row_sum, cutlass.Float32)
 
     for m in cutlass.range(cute.size(row_sum), unroll_full=True):
+        softmax_scale_log2e = softmax_scale_log2e_m[m]
         final_sum = row_sum[m]
         is_zero_or_nan = final_sum == 0.0 or final_sum != final_sum
         final_ratio[m] = cute.arch.rcp_approx(final_sum if not is_zero_or_nan else 1.0)
