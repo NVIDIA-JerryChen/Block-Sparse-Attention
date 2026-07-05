@@ -31,6 +31,9 @@ from csrc.fwd.sm120_blk64.flash_fwd_sm120 import (
     BlockSparseAttnForwardSm120Blk64,
     SM120_FWD_BLOCK_SIZE,
 )
+from csrc.fwd.sm120_blk64.flash_fwd_sm120_fp8 import (
+    BlockSparseAttnForwardFp8Sm120Blk64,
+)
 try:
     from csrc.fwd.sm100_blk64.bsa_fwd_combine import FlashAttentionForwardCombine
 except ImportError:
@@ -125,6 +128,7 @@ torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
     torch.float32: cutlass.Float32,
+    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
 }
 
 _SM100_BLK64_INT32_MAX = torch.iinfo(torch.int32).max
@@ -492,9 +496,16 @@ def _bsa_attn_fwd_sm120_blk64(
     q2k_block_nums: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Launch the SM120 blk64 sparse forward kernel on BHSD tensors."""
-    assert q.dtype in (torch.float16, torch.bfloat16), "SM120 blk64 fwd supports fp16/bf16"
+    assert q.dtype in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+    ), "SM120 blk64 fwd supports fp16/bf16/fp8_e4m3fn"
     assert q.dtype == k.dtype == v.dtype
     assert q.is_cuda and k.is_cuda and v.is_cuda
     assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
@@ -507,6 +518,36 @@ def _bsa_attn_fwd_sm120_blk64(
     assert v.shape[-1] == 128, "SM120 blk64 fwd currently requires value dim 128"
     assert q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
     assert num_q_heads % num_kv_heads == 0, "num_q_heads must be divisible by num_kv_heads"
+
+    is_fp8 = q.dtype == torch.float8_e4m3fn
+    if is_fp8:
+        assert q_descale is not None and k_descale is not None and v_descale is not None, (
+            "SM120 FP8 requires q_descale, k_descale, and v_descale tensors"
+        )
+        for name, scale in (
+            ("q_descale", q_descale),
+            ("k_descale", k_descale),
+            ("v_descale", v_descale),
+        ):
+            assert isinstance(scale, torch.Tensor), f"{name} must be a CUDA tensor"
+            assert scale.dtype == torch.float32, f"{name} must be float32"
+            assert scale.is_cuda and scale.device == q.device, (
+                f"{name} must be on the same CUDA device as q"
+            )
+            assert scale.is_contiguous(), f"{name} must be contiguous"
+        assert q_descale.shape == (batch, num_q_heads, seqlen_q), (
+            "q_descale must have shape (batch, num_q_heads, seqlen_q)"
+        )
+        assert k_descale.shape == (batch, num_kv_heads, _ceil_div_int(seqlen_k, 16)), (
+            "k_descale must have shape (batch, num_kv_heads, ceil_div(seqlen_k, 16))"
+        )
+        assert v_descale.shape == (num_kv_heads * v.shape[-1],), (
+            "v_descale must be flattened (num_kv_heads * value_dim,)"
+        )
+    else:
+        assert q_descale is None and k_descale is None and v_descale is None, (
+            "q_descale/k_descale/v_descale are only accepted for FP8 inputs"
+        )
 
     gqa_ratio = num_q_heads // num_kv_heads
     num_q_blocks = _ceil_div_int(seqlen_q, SM120_FWD_BLOCK_SIZE)
@@ -542,13 +583,14 @@ def _bsa_attn_fwd_sm120_blk64(
 
     if softmax_scale is None:
         softmax_scale = head_dim ** -0.5
+    out_dtype = torch.bfloat16 if is_fp8 else q.dtype
     if out is None:
         out = torch.empty(
-            (batch, num_q_heads, seqlen_q, v.shape[-1]), dtype=q.dtype, device=q.device
+            (batch, num_q_heads, seqlen_q, v.shape[-1]), dtype=out_dtype, device=q.device
         )
     else:
         assert out.shape == (batch, num_q_heads, seqlen_q, v.shape[-1])
-        assert out.dtype == q.dtype and out.is_cuda
+        assert out.dtype == out_dtype and out.is_cuda
 
     lse = torch.empty((batch, num_q_heads, seqlen_q), dtype=torch.float32, device=q.device)
 
@@ -567,6 +609,16 @@ def _bsa_attn_fwd_sm120_blk64(
     v_cute = from_dlpack(v_t.detach(), assumed_align=128)
     out_cute = from_dlpack(out_t.detach(), assumed_align=128)
     lse_cute = from_dlpack(lse_t.detach(), assumed_align=4)
+    if is_fp8:
+        q_descale_t = q_descale.permute(2, 1, 0)
+        k_descale_t = k_descale.permute(2, 1, 0)
+        v_descale_t = v_descale.view(num_kv_heads, v.shape[-1]).permute(1, 0)
+        q_descale_cute = from_dlpack(q_descale_t.detach(), assumed_align=4)
+        k_descale_cute = from_dlpack(k_descale_t.detach(), assumed_align=4)
+        v_descale_cute = from_dlpack(v_descale_t.detach(), assumed_align=4)
+    else:
+        q_descale_t = k_descale_t = v_descale_t = None
+        q_descale_cute = k_descale_cute = v_descale_cute = None
     q2k_cute = from_dlpack(q2k_t.detach())
     q2k_nums_cute = from_dlpack(q2k_nums_t.detach())
     block_sizes_cute = (
@@ -574,7 +626,12 @@ def _bsa_attn_fwd_sm120_blk64(
     )
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    fwd_kernel = BlockSparseAttnForwardSm120Blk64(
+    kernel_cls = (
+        BlockSparseAttnForwardFp8Sm120Blk64
+        if is_fp8
+        else BlockSparseAttnForwardSm120Blk64
+    )
+    fwd_kernel = kernel_cls(
         gqa_ratio=gqa_ratio,
         head_dim=head_dim,
         value_dim=v.shape[-1],
@@ -599,6 +656,9 @@ def _bsa_attn_fwd_sm120_blk64(
         _tensor_compile_key(v_t),
         _tensor_compile_key(out_t),
         _tensor_compile_key(lse_t),
+        _tensor_compile_key(q_descale_t) if is_fp8 else None,
+        _tensor_compile_key(k_descale_t) if is_fp8 else None,
+        _tensor_compile_key(v_descale_t) if is_fp8 else None,
         _tensor_compile_key(q2k_t),
         _tensor_compile_key(q2k_nums_t) if has_block_nums else None,
         has_block_nums,
@@ -606,18 +666,27 @@ def _bsa_attn_fwd_sm120_blk64(
         block_sizes_mode,
         _tensor_compile_key(block_sizes_t) if has_block_sizes else None,
     )
-    args = (
+    common_args = (
         q_cute,
         k_cute,
         v_cute,
         out_cute,
         lse_cute,
+    )
+    sparse_args = (
         q2k_cute,
         q2k_nums_cute,
         block_sparse_num,
         block_sizes_cute,
         softmax_scale,
         current_stream,
+    )
+    args = (
+        common_args
+        + (q_descale_cute, k_descale_cute, v_descale_cute)
+        + sparse_args
+        if is_fp8
+        else common_args + sparse_args
     )
     if compile_key not in bsa_attn_fwd.compile_cache:
         t0 = time.time()
@@ -810,6 +879,9 @@ def bsa_attn_fwd_blk64(
     use_clc: bool = False,
     kv_splits: int | str = 1,
     block_sparse_num: Optional[int] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ):
     """BSA forward attention (blk64 backend).
 
@@ -835,12 +907,25 @@ def bsa_attn_fwd_blk64(
             the estimated K/V working set and device L2 cache size.
         block_sparse_num: fixed number of valid KV blocks per Q block when
             q2k_block_nums is empty. Defaults to q2k_block_index.shape[-1].
+        q_descale: SM120 FP8 Q descales with shape (B, Hq, Sq), one per token.
+        k_descale: SM120 FP8 K descales with shape (B, Hkv, ceil(Sk / 16)).
+        v_descale: SM120 FP8 V descales flattened to (Hkv * Dv,), one per channel.
     """
-    assert q.dtype == torch.bfloat16, "blk64 requires bf16"
     assert q.is_cuda and k.is_cuda and v.is_cuda
     assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
 
     arch = _get_device_arch()
+    if arch // 10 == 12:
+        assert q.dtype in (torch.bfloat16, torch.float8_e4m3fn), (
+            "SM120 blk64 requires bf16 or fp8_e4m3fn"
+        )
+    else:
+        assert q.dtype == torch.bfloat16, "blk64 requires bf16"
+    assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
+    if q.dtype != torch.float8_e4m3fn:
+        assert q_descale is None and k_descale is None and v_descale is None, (
+            "q_descale/k_descale/v_descale are only accepted for SM120 FP8 inputs"
+        )
     auto_kv_splits = isinstance(kv_splits, str)
     if auto_kv_splits:
         assert kv_splits == "auto", "kv_splits string value must be 'auto'"
@@ -935,6 +1020,9 @@ def bsa_attn_fwd_blk64(
             block_sizes=block_sizes_sm120,
             q2k_block_nums=block_nums_sm120,
             softmax_scale=softmax_scale,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         if layout == "bshd":
             out = out.transpose(1, 2)
@@ -1013,8 +1101,11 @@ def bsa_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     layout: str = "bhsd",
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Forward pass for BSA block-sparse attention (SM90/SM100, non-causal, non-varlen).
+    """Forward pass for BSA block-sparse attention (SM90/SM100/SM120, non-causal, non-varlen).
 
     Args:
         q: Query tensor. Shape is (batch, num_heads, seqlen_q, head_dim)
@@ -1041,6 +1132,9 @@ def bsa_attn_fwd(
         out: Pre-allocated output tensor
         lse: Pre-allocated LSE tensor
         layout: "bhsd" (default) or "bshd". Output follows the same layout as input.
+        q_descale: SM120 FP8 Q descales with shape (B, Hq, Sq), one per token.
+        k_descale: SM120 FP8 K descales with shape (B, Hkv, ceil(Sk / 16)).
+        v_descale: SM120 FP8 V descales flattened to (Hkv * Dv,), one per channel.
     """
     assert layout in ("bhsd", "bshd"), f"layout must be 'bhsd' or 'bshd', got {layout!r}"
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
@@ -1056,14 +1150,22 @@ def bsa_attn_fwd(
     assert batch_k == batch_size and batch_v == batch_size
     assert seqlen_k_v == seqlen_k and num_head_kv_v == num_head_kv
     assert head_dim_k == head_dim
-    assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
-    assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
-
     if not is_fake_mode():
         assert all(t.is_cuda for t in (q, k, v)), "inputs must be on CUDA device"
 
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "BSA only supports SM90/SM100/SM110/SM120"
+    supported_dtypes = [torch.float16, torch.bfloat16]
+    if arch // 10 == 12:
+        supported_dtypes.append(torch.float8_e4m3fn)
+    assert q.dtype in supported_dtypes, (
+        "inputs must be float16/bfloat16, or fp8_e4m3fn on SM120"
+    )
+    assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
+    if q.dtype != torch.float8_e4m3fn:
+        assert q_descale is None and k_descale is None and v_descale is None, (
+            "q_descale/k_descale/v_descale are only accepted for SM120 FP8 inputs"
+        )
     assert num_head % num_head_kv == 0
 
     # Block-sparse parameter validation
@@ -1149,7 +1251,11 @@ def bsa_attn_fwd(
         return out, lse
 
     if arch // 10 == 12:
-        assert q.dtype in (torch.float16, torch.bfloat16), "SM120 blk64 fwd supports fp16/bf16"
+        assert q.dtype in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+        ), "SM120 blk64 fwd supports fp16/bf16/fp8_e4m3fn"
         assert head_dim == 128, "SM120 blk64 fwd currently requires QK dim 128"
         assert head_dim_v == 128, "SM120 blk64 fwd currently requires value dim 128"
         assert num_head % num_head_kv == 0, "num_q_heads must be divisible by num_kv_heads"
@@ -1158,13 +1264,14 @@ def bsa_attn_fwd(
             f"SM120 blk64 fwd expects q2k_block_index shape prefix "
             f"{(batch_size, num_head, num_q_blocks_sm120)}, got {tuple(q2k_block_index.shape[:3])}"
         )
+        out_dtype = torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
         if out is None:
             out_shape = (
                 (batch_size, num_head, seqlen_q, head_dim_v)
                 if layout == "bhsd"
                 else (batch_size, seqlen_q, num_head, head_dim_v)
             )
-            out = torch.empty(out_shape, dtype=q.dtype, device=q.device)
+            out = torch.empty(out_shape, dtype=out_dtype, device=q.device)
         else:
             expected_out_shape = (
                 (batch_size, num_head, seqlen_q, head_dim_v)
@@ -1172,7 +1279,7 @@ def bsa_attn_fwd(
                 else (batch_size, seqlen_q, num_head, head_dim_v)
             )
             assert out.shape == expected_out_shape
-            assert out.dtype == q.dtype and out.is_cuda
+            assert out.dtype == out_dtype and out.is_cuda
             assert out.stride(-1) == 1, "SM120 blk64 fwd requires output head_dim to be contiguous"
         if layout == "bhsd":
             q_bhsd, k_bhsd, v_bhsd = q, k, v
@@ -1198,6 +1305,9 @@ def bsa_attn_fwd(
             q2k_block_nums=block_nums_sm120,
             softmax_scale=softmax_scale,
             out=out_bhsd,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         if lse is not None:
             lse.copy_(lse_sm120)
