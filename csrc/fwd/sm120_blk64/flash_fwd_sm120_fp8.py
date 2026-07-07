@@ -444,8 +444,7 @@ class BlockSparseAttnForwardFp8Sm120Blk64(BatchedStaticSchedulerMixin):
                 B_uses_fp8_ldsm=True,
             )
 
-            apply_sage_k_scales(
-                tSrS,
+            tKScale = load_sage_k_scales(
                 tScS,
                 gKScale,
                 n_tile_idx,
@@ -480,6 +479,7 @@ class BlockSparseAttnForwardFp8Sm120Blk64(BatchedStaticSchedulerMixin):
                 sum_m,
                 q_softmax_scale_log2e_m,
                 self.softmax_p_scale_log2,
+                tKScale,
             )
 
             # Compute P @ V.
@@ -940,26 +940,29 @@ def gemm_rs_smem(
 
 
 @cute.jit
-def apply_sage_k_scales(
-    tSrS: cute.Tensor,
+def load_sage_k_scales(
     tScS: cute.Tensor,
     gKScale: cute.Tensor,
     k_tile_idx: cutlass.Int32,
     tile_size: cutlass.Constexpr[int],
-) -> None:
-    """Apply per-16-token K descales to QK scores.
-
-    The per-row Q descale is folded into the softmax scale, avoiding one
-    multiply for every score element.
-    """
-    tSrS_mn = layout_utils.reshape_acc_to_mn(tSrS)
+) -> cute.Tensor:
+    """Load the four per-token-group K descales for one KV tile."""
     tScS_mn = layout_utils.reshape_acc_to_mn(tScS)
-    k_scale_base = k_tile_idx * (tile_size // 16)
-    for n in cutlass.range(cute.size(tSrS_mn, mode=[1]), unroll_full=True):
-        k_scale_idx = k_scale_base + tScS_mn[0, n][1] // 16
-        k_scale = gKScale[k_scale_idx]
-        for m in cutlass.range(cute.size(tSrS_mn, mode=[0]), unroll_full=True):
-            tSrS_mn[m, n] *= k_scale
+    num_k_scales = tile_size // 16
+    tKScale = cute.make_rmem_tensor(
+        cute.make_layout(num_k_scales),
+        cutlass.Float32,
+    )
+    k_scale_base = k_tile_idx * num_k_scales
+    scores_per_k_scale = (
+        cute.size(tScS_mn, mode=[1]) // num_k_scales
+    )
+    for k_scale_group in cutlass.range_constexpr(num_k_scales):
+        scale_idx = (
+            tScS_mn[0, k_scale_group * scores_per_k_scale][1] // 16
+        )
+        tKScale[k_scale_group] = gKScale[k_scale_base + scale_idx]
+    return tKScale
 
 
 @cute.jit
@@ -986,19 +989,37 @@ def online_softmax(
     row_sum: cute.Tensor,
     softmax_scale_log2e_m: cute.Tensor,
     exp_scale_log2: cutlass.Float32,
+    tKScale: cute.Tensor,
 ) -> cute.Tensor:
     tSrS_mn = layout_utils.reshape_acc_to_mn(tSrS)
     row_scale = cute.make_rmem_tensor_like(row_max, cutlass.Float32)
+    num_k_scales = cute.size(tKScale)
+    scores_per_k_scale = (
+        cute.size(tSrS_mn, mode=[1]) // num_k_scales
+    )
 
     for m in cutlass.range(cute.size(row_max), unroll_full=True):
         softmax_scale_log2e = softmax_scale_log2e_m[m]
-        acc_S_row = tSrS_mn[m, None].load()
-        row_max_cur = fa_utils.fmax_reduce(
-            acc_S_row,
-            init_val=row_max[m],
-            arch=80,
+        row_max_local = row_max[m]
+        # K descales are positive and shared by each score group, so reduce
+        # unscaled scores first and apply one descale to the group maximum.
+        for k_scale_group in cutlass.range_constexpr(num_k_scales):
+            k_scale = tKScale[k_scale_group]
+            group_begin = k_scale_group * scores_per_k_scale
+            group_max = tSrS_mn[m, group_begin]
+            for n in cutlass.range_constexpr(
+                group_begin + 1,
+                (k_scale_group + 1) * scores_per_k_scale,
+            ):
+                group_max = cute.arch.fmax(group_max, tSrS_mn[m, n])
+            row_max_local = cute.arch.fmax(
+                row_max_local,
+                group_max * k_scale,
+            )
+        row_max_cur = cute.arch.warp_reduction_max(
+            row_max_local,
+            threads_in_group=4,
         )
-        row_max_cur = cute.arch.warp_reduction_max(row_max_cur, threads_in_group=4)
 
         row_max_prev = row_max[m]
         row_max[m] = row_max_cur
@@ -1007,10 +1028,19 @@ def online_softmax(
         # row_sum in the same scale removes a vector multiply from every tile.
         row_max_scaled = row_max_safe * softmax_scale_log2e - exp_scale_log2
 
-        acc_S_row_exp = cute.math.exp2(
-            acc_S_row * softmax_scale_log2e - row_max_scaled,
-            fastmath=True,
-        )
+        for k_scale_group in cutlass.range_constexpr(num_k_scales):
+            score_scale_log2e = (
+                tKScale[k_scale_group] * softmax_scale_log2e
+            )
+            for n in cutlass.range_constexpr(
+                k_scale_group * scores_per_k_scale,
+                (k_scale_group + 1) * scores_per_k_scale,
+            ):
+                tSrS_mn[m, n] = cute.math.exp2(
+                    tSrS_mn[m, n] * score_scale_log2e - row_max_scaled,
+                    fastmath=True,
+                )
+        acc_S_row_exp = tSrS_mn[m, None].load()
         row_scale[m] = cute.math.exp2(
             (row_max_prev - row_max_safe) * softmax_scale_log2e,
             fastmath=True,
