@@ -34,8 +34,10 @@ AGENT_SPACE := agent/agent_space
 AGENT_PROFILES := agent/agent_profiles
 WHEEL_DIR := $(AGENT_SPACE)/wheels/dist
 NCU_DIR := $(AGENT_PROFILES)/ncu
+SM120_AOT_DIR ?= $(AGENT_SPACE)/sm120_aot
+SM120_AOT_ARGS ?=
 
-.PHONY: setup tt vt ttb vtb bb bbb profile bm bm-cli clean help
+.PHONY: setup aot-sm120 tt vt ttb vtb bb bbb profile bm bm-cli clean help
 
 setup:
 	@if [ ! -f third_party/cutlass/include/cutlass/cutlass.h ]; then \
@@ -49,6 +51,10 @@ setup:
 		echo "=== Installing blk64 wheel ===" && \
 		pip install --force-reinstall --no-deps $(WHEEL_DIR)/bsa_fwd_blk64_ext-*.whl; \
 	fi
+
+aot-sm120:
+	$(PYTHON) -m csrc.fwd.sm120_blk64.aot_build \
+		--output-dir $(SM120_AOT_DIR) $(SM120_AOT_ARGS)
 
 tt:
 	BSA_BLK=$(BLK) $(PYTHON) -u $(TEST_FILE)
@@ -110,6 +116,7 @@ help:
 	@echo "BSA (Block Sparse Attention) — Development Targets"
 	@echo ""
 	@echo "  make setup [BLK=64]             Build blk64 C++ extension"
+	@echo "  make aot-sm120                  Build SM120 CuTe DSL AOT artifacts"
 	@echo "  make tt    [BLK=64|128|64,128]  Quick correctness test (default: both)"
 	@echo "  make vt    [BLK=64|128|64,128]  Full pytest suite (default: both)"
 	@echo "  make ttb                         Quick bwd correctness (blk64)"
@@ -124,3 +131,4 @@ help:
 	@echo ""
 	@echo "  Profile toggles: VAR_BN=0|1  BLKSZ=0|1"
 	@echo "    e.g. make bm-cli BLK=64 VAR_BN=1 BLKSZ=1"
+	@echo "  SM120 AOT: SM120_AOT_DIR=<root> SM120_AOT_ARGS='<builder args>'"

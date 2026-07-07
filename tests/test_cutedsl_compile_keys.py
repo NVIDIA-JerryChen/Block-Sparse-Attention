@@ -6,8 +6,10 @@ import torch
 from bsa_attn_interface import (
     _bsa_fwd_blk64_kv_bucketed_combine_compile_key,
     _bsa_attn_fwd_sm90_blk64,
+    _bsa_attn_fwd_sm120_blk64,
     _dynamic_tensors_compile_key,
     _sm90_bwd_compile_key,
+    _sm120_fwd_compile_key,
     bsa_attn_fwd,
 )
 from csrc.bwd.bsa_bwd_prepost import _bwd_preprocess_compile_key
@@ -92,6 +94,69 @@ def test_dynamic_tensor_compile_key_tracks_static_type_parts():
     assert contiguous_key != broadcast_key
     assert contiguous_key != float_key
     assert contiguous_key != non_unit_key
+
+
+def _make_sm120_fwd_tensors(
+    batch: int,
+    q_heads: int,
+    kv_heads: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    capacity: int,
+):
+    q = torch.empty((batch, q_heads, seqlen_q, 128), dtype=torch.bfloat16)
+    k = torch.empty((batch, kv_heads, seqlen_k, 128), dtype=torch.bfloat16)
+    v = torch.empty_like(k)
+    out = torch.empty_like(q)
+    lse = torch.empty((batch, q_heads, seqlen_q), dtype=torch.float32)
+    num_q_blocks = math.ceil(seqlen_q / 64)
+    num_kv_blocks = math.ceil(seqlen_k / 64)
+    q2k = torch.empty(
+        (batch, q_heads, num_q_blocks, capacity), dtype=torch.int32
+    )
+    q2k_nums = torch.empty((batch, q_heads, num_q_blocks), dtype=torch.int32)
+    block_sizes = torch.empty((num_kv_blocks,), dtype=torch.int32)
+    return (
+        q.permute(2, 3, 1, 0),
+        k.permute(2, 3, 1, 0),
+        v.permute(3, 2, 1, 0),
+        out.permute(2, 3, 1, 0),
+        lse.permute(2, 1, 0),
+        q2k.permute(3, 2, 1, 0),
+        q2k_nums.permute(2, 1, 0),
+        block_sizes,
+    )
+
+
+def test_sm120_fwd_compile_key_ignores_runtime_shapes():
+    first = _make_sm120_fwd_tensors(1, 4, 2, 64, 128, 2)
+    second = _make_sm120_fwd_tensors(3, 8, 4, 257, 513, 11)
+
+    first_key = _sm120_fwd_compile_key(
+        120, torch.bfloat16, 128, 128, 2, True, True, 1, first
+    )
+    second_key = _sm120_fwd_compile_key(
+        120, torch.bfloat16, 128, 128, 2, True, True, 1, second
+    )
+
+    assert first_key == second_key
+
+
+def test_sm120_fwd_compile_key_tracks_static_features():
+    tensors = _make_sm120_fwd_tensors(1, 4, 2, 64, 128, 2)
+    base = _sm120_fwd_compile_key(
+        120, torch.bfloat16, 128, 128, 2, True, True, 1, tensors
+    )
+
+    assert base != _sm120_fwd_compile_key(
+        120, torch.bfloat16, 128, 128, 1, True, True, 1, tensors
+    )
+    assert base != _sm120_fwd_compile_key(
+        120, torch.bfloat16, 128, 128, 2, False, True, 1, tensors
+    )
+    assert base != _sm120_fwd_compile_key(
+        120, torch.bfloat16, 128, 128, 2, True, True, 2, tensors
+    )
 
 
 def test_arch_specific_helper_keys_do_not_cross_devices():
@@ -191,4 +256,75 @@ def test_sm90_fwd_reuses_compiled_kernel_across_runtime_shapes(monkeypatch):
     assert len(compile_cache.cache) == 1
 
     _run_sm90_fwd_case(2, 4, 192, 256, 6)
+    assert len(compile_cache.cache) == 1
+
+
+def _run_sm120_fwd_case(
+    batch: int,
+    q_heads: int,
+    kv_heads: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    capacity: int,
+):
+    head_dim = 128
+    block_sparse_num = 2
+    q = torch.randn(
+        (batch, q_heads, seqlen_q, head_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    k = torch.randn(
+        (batch, kv_heads, seqlen_k, head_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    v = torch.randn_like(k)
+    num_q_blocks = math.ceil(seqlen_q / 64)
+    q2k_block_index = torch.full(
+        (batch, q_heads, num_q_blocks, capacity),
+        -1,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    q2k_block_index[..., 0] = 0
+    q2k_block_index[..., 1] = 1
+
+    out, lse = _bsa_attn_fwd_sm120_blk64(
+        q,
+        k,
+        v,
+        q2k_block_index,
+        block_sparse_num,
+        block_sizes=None,
+    )
+
+    gqa_ratio = q_heads // kv_heads
+    k_expanded = k.float().repeat_interleave(gqa_ratio, dim=1)
+    v_expanded = v.float().repeat_interleave(gqa_ratio, dim=1)
+    scale = 1.0 / math.sqrt(head_dim)
+    scores = torch.einsum("bhqd,bhkd->bhqk", q.float(), k_expanded) * scale
+    ref_lse = torch.logsumexp(scores, dim=-1)
+    ref_out = torch.einsum(
+        "bhqk,bhkd->bhqd",
+        torch.softmax(scores, dim=-1),
+        v_expanded,
+    )
+    torch.testing.assert_close(out.float(), ref_out, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(lse, ref_lse, rtol=0.0, atol=2e-3)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12,
+    reason="SM120 is required",
+)
+def test_sm120_fwd_reuses_compiled_kernel_across_runtime_shapes(monkeypatch):
+    torch.manual_seed(0)
+    compile_cache = JITCache()
+    monkeypatch.setattr(bsa_attn_fwd, "compile_cache", compile_cache)
+
+    _run_sm120_fwd_case(1, 4, 2, 64, 128, 2)
+    assert len(compile_cache.cache) == 1
+
+    _run_sm120_fwd_case(2, 8, 4, 130, 100, 7)
     assert len(compile_cache.cache) == 1

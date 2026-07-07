@@ -304,15 +304,14 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         Q_consumer_state.advance()
 
         for load_count in cutlass.range(0, num_n_tiles, 1, unroll=1):
-            if cutlass.const_expr(self.need_k_mask):
-                n_tile_ind = num_n_tiles - 1 - load_count
-                n_tile_idx = gIndices[n_tile_ind]
-                if cutlass.const_expr(self.has_block_sizes):
-                    varblk = gBSZ[n_tile_idx]
-                else:
-                    varblk = cutlass.Int32(self.tile_size)
-                    if n_tile_idx == num_compute_tiles - 1:
-                        varblk = seqlen - n_tile_idx * self.tile_size
+            n_tile_ind = num_n_tiles - 1 - load_count
+            n_tile_idx = gIndices[n_tile_ind]
+            if cutlass.const_expr(self.has_block_sizes):
+                varblk = gBSZ[n_tile_idx]
+            else:
+                varblk = cutlass.Int32(self.tile_size)
+                if n_tile_idx == num_compute_tiles - 1:
+                    varblk = seqlen - n_tile_idx * self.tile_size
 
             K_wait_status = K_pipeline.consumer_try_wait(K_consumer_state)
             K_pipeline.consumer_wait(K_consumer_state, K_wait_status)
@@ -346,9 +345,8 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
                 K_pipeline.producer_commit(K_producer_state)
                 K_producer_state.advance()
 
-            if cutlass.const_expr(self.need_k_mask):
-                if varblk < self.tile_size:
-                    mask(tSrS, tScS, varblk)
+            if varblk < self.tile_size:
+                mask(tSrS, tScS, varblk)
             row_scale = online_softmax(tSrS, max_m, sum_m, scale_softmax_log2e)
 
             # Compute P @ V.
@@ -439,6 +437,35 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         softmax_scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
+        # Restore compile-time head dimensions while keeping runtime tensor modes dynamic.
+        mQ = cute.make_tensor(
+            mQ.iterator,
+            cute.make_layout(
+                (mQ.shape[0], self.qk_dim, mQ.shape[2], mQ.shape[3]),
+                stride=mQ.stride,
+            ),
+        )
+        mK = cute.make_tensor(
+            mK.iterator,
+            cute.make_layout(
+                (mK.shape[0], self.qk_dim, mK.shape[2], mK.shape[3]),
+                stride=mK.stride,
+            ),
+        )
+        mV = cute.make_tensor(
+            mV.iterator,
+            cute.make_layout(
+                (self.value_dim, mV.shape[1], mV.shape[2], mV.shape[3]),
+                stride=mV.stride,
+            ),
+        )
+        mO = cute.make_tensor(
+            mO.iterator,
+            cute.make_layout(
+                (mO.shape[0], self.value_dim, mO.shape[2], mO.shape[3]),
+                stride=mO.stride,
+            ),
+        )
         self.check_dim([mQ, mK, mO], 1)
         self.check_dim(mV, 0)
 
@@ -455,7 +482,6 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         self.K_layout = K_layout
         self.V_layout = V_layout
         self.O_layout = O_layout
-        self.need_k_mask = self.has_block_sizes or mK.shape[0] % self.tile_size != 0
 
         self.Q_smem_layout = sm90_utils.make_smem_layout_a(
             Q_layout,

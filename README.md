@@ -4,16 +4,16 @@
 
 **Forward backends:**
 
-| | SM100 blk128 (CuTe DSL / JIT) | SM90 blk64 (CuTe DSL / JIT) | SM100 blk64 (C++ AOT / CUTLASS) | SM100 blk64 (CuTe DSL / JIT) |
-|---|---|---|---|---|
-| Dtype | bf16, fp16 | bf16, fp16 | bf16 only | bf16 only |
-| Head dim | 64, 96, 128 | 64, 96, 128 | 128 only | 128 only |
-| Attention | MHA, GQA, MQA | MHA, GQA, MQA | MHA only | MHA only |
-| pack_gqa | Yes | No | No | No |
-| Persistent scheduling | Static + CLC dynamic | Static | CLC dynamic (built-in) | Static + CLC dynamic |
-| Variable block counts (`q2k_block_nums`) | Yes (>= 0) | Yes (>= 0) | Yes (>= 1) | Yes (>= 0) |
-| KV split (`kv_splits`) | No | Explicit / auto | Explicit / auto | Explicit / auto |
-| LSE output | Yes | Yes | Yes | Yes |
+| | SM120 blk64 (CuTe DSL / AOT + JIT) | SM100 blk128 (CuTe DSL / JIT) | SM90 blk64 (CuTe DSL / JIT) | SM100 blk64 (C++ AOT / CUTLASS) | SM100 blk64 (CuTe DSL / JIT) |
+|---|---|---|---|---|---|
+| Dtype | bf16, fp16 | bf16, fp16 | bf16, fp16 | bf16 only | bf16 only |
+| Head dim | 128 only | 64, 96, 128 | 64, 96, 128 | 128 only | 128 only |
+| Attention | MHA, GQA, MQA | MHA, GQA, MQA | MHA, GQA, MQA | MHA only | MHA only |
+| pack_gqa | No | Yes | No | No | No |
+| Persistent scheduling | Static | Static + CLC dynamic | Static | CLC dynamic (built-in) | Static + CLC dynamic |
+| Variable block counts (`q2k_block_nums`) | Yes (>= 1) | Yes (>= 0) | Yes (>= 0) | Yes (>= 1) | Yes (>= 0) |
+| KV split (`kv_splits`) | No | No | Explicit / auto | Explicit / auto | Explicit / auto |
+| LSE output | Yes | Yes | Yes | Yes | Yes |
 
 **Backward backends:**
 
@@ -26,8 +26,9 @@
 
 **Not supported (current sparse kernels):** causal, local, mask_mod, score_mod, paged_kv, softcap, varlen
 
-Split-KV is supported by the SM90/SM100 blk64 forward paths. The blk128 and
-backward paths do not support it.
+Split-KV is supported by the SM90/SM100 blk64 forward paths. SM120 deliberately
+keeps `kv_splits=1`; explicit split counts are rejected so no FP32 partial
+workspace is allocated. The blk128 and backward paths do not support split-KV.
 
 ## Directory Structure
 
@@ -45,8 +46,11 @@ BSA/
 │   │   └── bsa_fwd_sm100.py          # Single-file Blackwell forward kernel
 │   ├── sm90_blk64/                   # blk64 — SM90 CuTe DSL / JIT compiled
 │   │   └── bsa_fwd_sm90.py           # Single-file Hopper forward kernel
-│   ├── sm120_blk64/                  # blk64 — SM120 CuTe DSL / JIT compiled
-│   │   └── bsa_fwd_sm120.py          # Single-file SM120 forward kernel
+│   ├── sm120_blk64/                  # blk64 — SM120 CuTe DSL / AOT + JIT
+│   │   ├── bsa_fwd_sm120.py          # SM120 forward kernel
+│   │   ├── aot_build.py              # Offline native-ABI artifact builder
+│   │   ├── aot_runtime.py            # Manifest validation and runtime loader
+│   │   └── aot_utils.py              # Variant and artifact metadata
 │   │
 │   └── sm100_blk64/                  # blk64 — implementation family
 │       ├── cpp/                          # C++ AOT / CUTLASS backend
@@ -100,7 +104,7 @@ BSA/
 - Python 3.10+
 - PyTorch 2.5+ with CUDA support
 - CUDA 13.0+
-- CuTe DSL (`nvidia-cutlass-dsl>=4.4.1`)
+- CuTe DSL (`nvidia-cutlass-dsl>=4.5.2` for the SM120 dynamic AOT ABI)
 - CUTLASS headers (for blk64 C++ AOT build)
 
 ### Setup
@@ -116,6 +120,151 @@ pip install -r requirements.txt
 # Build blk64 C++ extension (builds wheel + pip installs it)
 make setup
 ```
+
+### SM120 CuTe DSL AOT
+
+SM120 blk64 forward can be compiled offline and loaded through the CuTe native
+ABI. This removes `cute.compile()` from the deployment process and avoids its
+first-call memory peak. The Python attention API remains unchanged.
+
+#### Supported configurations
+
+- Target: `sm_120f`
+- Dtype: BF16 and FP16
+- QK/value head dimension: 128
+- Attention: MHA, GQA, and MQA
+- Block counts: fixed `block_sparse_num` or runtime `q2k_block_nums`
+- `block_sizes`: absent, `[N]`, `[B, N]`, or `[B, Hq, N]`
+- Split-KV: disabled; SM120 only accepts `kv_splits=1`
+- Minimum DSL version: `nvidia-cutlass-dsl>=4.5.2`
+
+Batch size, absolute head counts, sequence lengths, sparse index capacity,
+active topK, and non-leading tensor strides are runtime dynamic. Dtype, D=128,
+GQA ratio, fixed/variable block-count mode, and `block_sizes` rank select the
+static AOT variant. For example, one `gqa2` artifact can run both `Hq/Hkv=4/2`
+and `8/4`, but ratio 6 requires a `gqa6` artifact.
+
+#### Build artifacts
+
+Build the final artifacts with the same CPU architecture, CUDA runtime, CUTLASS
+DSL version, and BSA source revision as the deployment environment.
+
+```bash
+# Default matrix: bf16/fp16, GQA ratios 1/2/4/8/16/32/64,
+# fixed/variable block counts, and block_sizes modes 0/1/2/3.
+make aot-sm120 SM120_AOT_DIR=/shared/bsa-sm120-aot
+
+# A smaller deployment-specific matrix is usually preferable.
+make aot-sm120 \
+  SM120_AOT_DIR=/shared/bsa-sm120-aot \
+  SM120_AOT_ARGS='--dtypes bf16,fp16 --gqa-ratios 1,2,6 --block-nums both --block-sizes-modes 0,1,2,3'
+
+# List the default variants without compiling them.
+python -m csrc.fwd.sm120_blk64.aot_build --dry-run
+```
+
+The default matrix contains 112 variants. A deployment-specific subset is
+recommended to reduce build time and package size.
+
+The output bundle is self-describing:
+
+```text
+/shared/bsa-sm120-aot/
+└── x86_64/
+    └── sm_120f/
+        ├── manifest.json
+        ├── bsa_sm120_blk64_bf16_gqa1_bn0_bs0_dyn.o
+        ├── bsa_sm120_blk64_bf16_gqa1_bn0_bs0_dyn.h
+        ├── bsa_sm120_blk64_bf16_gqa1_bn0_bs0_dyn.so
+        └── ...
+```
+
+The manifest records the CPU/GPU target, CUTLASS DSL and CUDA runtime versions,
+BSA source fingerprint, variant metadata, filenames, and `.so` SHA256 values.
+
+#### Deploy and load
+
+Set the artifact root before importing or calling BSA:
+
+```bash
+export BSA_SM120_AOT_DIR=/shared/bsa-sm120-aot
+
+# Recommended for memory-constrained production deployments.
+export BSA_SM120_AOT_ONLY=1
+```
+
+`BSA_SM120_AOT_DIR` may point either to the bundle root shown above or directly
+to the directory containing `manifest.json`. If it is unset, BSA searches
+`csrc/fwd/sm120_blk64/aot_artifacts/<cpu-arch>/sm_120f/`.
+
+With `BSA_SM120_AOT_ONLY=1`, a missing artifact, missing variant, or unsupported
+layout fails before JIT and `cute.compile()` is never called. Without this flag,
+a missing manifest or variant falls back to the existing JIT cache. Version,
+source-fingerprint, and checksum failures always report an error.
+
+#### Call the SM120 kernel
+
+Use the existing `bsa_attn_fwd_blk64` API. For fixed block counts, pass an empty
+`q2k_block_nums`; for variable counts, pass a `[B, Hq, Q_blocks]` int32 tensor.
+
+```python
+import torch
+
+from bsa_attn_interface import bsa_attn_fwd_blk64
+
+# q: [B, Hq, Sq, 128], k/v: [B, Hkv, Sk, 128]
+q = torch.randn(1, 8, 1024, 128, device="cuda", dtype=torch.bfloat16)
+k = torch.randn(1, 2, 2048, 128, device="cuda", dtype=torch.bfloat16)
+v = torch.randn_like(k)
+
+# [B, Hq, Q_blocks, index_capacity], int32
+q2k_block_index = ...
+block_sizes = ...
+q2k_block_nums = torch.empty(0, device="cuda", dtype=torch.int32)
+
+out, lse = bsa_attn_fwd_blk64(
+    q,
+    k,
+    v,
+    q2k_block_index,
+    block_sizes,
+    q2k_block_nums,
+    block_sparse_num=16,
+    kv_splits=1,
+)
+```
+
+Current AOT artifacts use the `dynamic_strided_nonbroadcast` layout class.
+The head dimension must have stride 1, and stride-0 tensors produced by
+`expand()` must be materialized with `.contiguous()` before an AOT-only call.
+
+#### Validate a deployment
+
+Run the AOT-only matrix after building the variants required by the test:
+
+```bash
+BSA_SM120_AOT_DIR=/shared/bsa-sm120-aot \
+BSA_SM120_AOT_ONLY=1 \
+BSA_TEST_SM120_AOT_RUNTIME=1 \
+python -m pytest tests/test_sm120_aot.py -q
+```
+
+The validation monkeypatches `cute.compile()` to fail, so every passing launch
+must come from a precompiled `.so`. The validated CUDA 13 configuration was
+PyTorch CUDA 13.2, CUDA runtime 13.3, CUTLASS DSL 4.5.2, and a 16 GB SM120 GPU.
+
+Common deployment errors:
+
+| Error text | Resolution |
+|---|---|
+| `requires ... manifest.json` | Correct `BSA_SM120_AOT_DIR` or install the artifact bundle. |
+| `missing variant` | Build the required dtype/GQA/block-count/block_sizes combination. |
+| `CUTLASS DSL version mismatch` | Use the build-time CUTLASS DSL version or rebuild. |
+| `CUDA version mismatch` | Rebuild under the deployment CUDA runtime. |
+| `source fingerprint mismatch` | Use artifacts built from the delivered BSA source revision. |
+| `checksum mismatch` | Replace the damaged or modified `.so`. |
+| `stride-0 broadcast layouts` | Materialize expanded tensors with `.contiguous()`. |
+| `does not support split-KV` | Set `kv_splits=1`. |
 
 ### Usage
 
@@ -134,7 +283,7 @@ v = torch.randn(1, 8, 1024, 128, device="cuda", dtype=torch.bfloat16)
 
 out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes)
 
-# Split long KV lists across partial forward kernels and combine their results.
+# Split long KV lists on SM90/SM100. SM120 must keep kv_splits=1.
 out, lse = bsa_attn_fwd_blk64(
     q, k, v, q2k_block_index, block_sizes, q2k_block_nums,
     kv_splits="auto", block_sparse_num=block_sparse_num,
@@ -258,7 +407,9 @@ backend. Both reuse the CuTe DSL split-KV combine kernel.
 SM90 split-KV supports the same MHA/GQA/MQA and QK/V dimensions (64, 96, or
 128) as its single-kernel path. SM100 blk64 retains its existing shape
 constraints, and its split path does not use the CLC scheduler; auto split
-selection disables CLC for that path.
+selection disables CLC for that path. SM120 does not build or dispatch a
+split-KV variant: `kv_splits=1` is the only accepted value, avoiding the
+split-dependent FP32 O/LSE workspace on memory-constrained devices.
 
 ### `bsa_attn_bwd(dout, q, k, v, out, lse, q2k_block_index, block_sparse_num, block_sizes, ...)`
 
@@ -331,6 +482,7 @@ Default bucket sizing is backend-owned: SM90 uses the SM90 blk64 backward defaul
 
 ```bash
 make setup                      # Build blk64 C++ extension
+make aot-sm120                  # Build the default SM120 native-ABI AOT matrix
 make tt                         # Quick correctness test (default: blk128)
 make tt BLK=64                  # Quick test blk64 only
 make tt BLK=64,128              # Quick test both backends
@@ -346,4 +498,10 @@ make help                       # Show all targets
 
 python test_flash_bwd.py                    # Backward quick correctness tests
 python test_flash_bwd.py benchmark          # Backward benchmark
+
+# On an SM120 deployment host after building the required AOT variants:
+BSA_SM120_AOT_DIR=/shared/bsa-sm120-aot \
+BSA_SM120_AOT_ONLY=1 \
+BSA_TEST_SM120_AOT_RUNTIME=1 \
+python -m pytest tests/test_sm120_aot.py -q
 ```
