@@ -195,6 +195,71 @@ def expand_kv_token_indices(
     return token_indices[valid_tokens]
 
 
+def fp8_fa3_row_reference(
+    q_row: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    selected_blocks: torch.Tensor,
+    block_sizes: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    softmax_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Emulate FA3's blockwise online softmax and E4M3 P conversion."""
+    token_offsets = torch.arange(
+        BLOCK_SIZE,
+        device=selected_blocks.device,
+        dtype=torch.int64,
+    )
+    block_indices = selected_blocks.long()
+    token_indices = block_indices[:, None] * BLOCK_SIZE + token_offsets[None, :]
+    valid_tokens = token_offsets[None, :] < block_sizes[block_indices, None]
+    valid_tokens &= token_indices < k.shape[0]
+    safe_token_indices = token_indices.clamp(0, k.shape[0] - 1)
+
+    k_scale_indices = (safe_token_indices // 16).clamp_max(k_descale.numel() - 1)
+    k_rows = k[safe_token_indices].float() * k_descale[k_scale_indices, None]
+    v_rows = v[safe_token_indices].float() * v_descale[None, None, :]
+    scores = torch.einsum("btd,d->bt", k_rows, q_row) * softmax_scale
+    scores = scores.masked_fill(~valid_tokens, float("-inf"))
+
+    # The kernel consumes selected KV tiles in reverse order. Each tile is
+    # converted to FP8 against the maximum known at that point, while earlier
+    # O contributions are rescaled when the running maximum grows.
+    scores = scores.flip(0)
+    v_rows = v_rows.flip(0)
+    valid_tokens = valid_tokens.flip(0)
+    tile_max = scores.amax(dim=1)
+    running_max = torch.cummax(tile_max, dim=0).values
+    running_max_safe = torch.where(
+        torch.isfinite(running_max),
+        running_max,
+        torch.zeros_like(running_max),
+    )
+    scaled_probabilities = torch.exp(
+        scores - running_max_safe[:, None]
+    ) * 256.0
+    scaled_probabilities = scaled_probabilities.masked_fill(~valid_tokens, 0.0)
+    probabilities_fp8 = scaled_probabilities.to(torch.float8_e4m3fn).float()
+
+    final_max = running_max[-1]
+    final_max_safe = running_max_safe[-1]
+    tile_rescale = torch.exp(running_max_safe - final_max_safe)
+    tile_rescale = torch.where(
+        torch.isfinite(running_max),
+        tile_rescale,
+        torch.zeros_like(tile_rescale),
+    )
+    output_weights = probabilities_fp8 * tile_rescale[:, None]
+    row_sum = (scaled_probabilities * tile_rescale[:, None]).sum()
+    if row_sum == 0.0:
+        return torch.zeros_like(q_row), torch.full_like(final_max, float("-inf"))
+
+    output = torch.einsum("bt,btd->d", output_weights, v_rows) / row_sum
+    lse = final_max + torch.log(row_sum) - math.log(256.0)
+    return output, lse
+
+
 def sampled_attention_reference(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -207,7 +272,12 @@ def sampled_attention_reference(
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute independent PyTorch references for selected query rows."""
+    """Compute independent PyTorch references for selected query rows.
+
+    The FP8 reference follows FA3 by scaling the unnormalized probabilities
+    by 2**8, converting them to E4M3, and normalizing with the pre-conversion
+    row sum.
+    """
     is_fp8 = q_descale is not None
     if is_fp8 != (k_descale is not None and v_descale is not None):
         raise ValueError("q_descale, k_descale, and v_descale must be provided together")
@@ -236,33 +306,32 @@ def sampled_attention_reference(
                     query_tile,
                     :block_sparse_num,
                 ]
-                kv_token_indices = expand_kv_token_indices(
-                    selected_blocks,
-                    block_sizes,
-                )
-
                 q_row = q[batch_idx, head_idx, query_idx].float()
-                k_rows = k[batch_idx, head_idx, kv_token_indices].float()
-                v_rows = v[batch_idx, head_idx, kv_token_indices].float()
                 if is_fp8:
                     q_row = q_row * q_descale[batch_idx, head_idx, query_idx]
-                    k_rows = k_rows * k_descale[
-                        batch_idx,
-                        head_idx,
-                        kv_token_indices // 16,
-                    ][:, None]
-                    v_rows = v_rows * v_descale_hd[head_idx][None, :]
-
-                scores = torch.mv(k_rows, q_row) * softmax_scale
-                probabilities = torch.softmax(scores, dim=0)
-                reference_out[batch_idx, head_idx, sample_idx] = torch.matmul(
-                    probabilities,
-                    v_rows,
-                )
-                reference_lse[batch_idx, head_idx, sample_idx] = torch.logsumexp(
-                    scores,
-                    dim=0,
-                )
+                    output_row, lse_row = fp8_fa3_row_reference(
+                        q_row,
+                        k[batch_idx, head_idx],
+                        v[batch_idx, head_idx],
+                        selected_blocks,
+                        block_sizes,
+                        k_descale[batch_idx, head_idx],
+                        v_descale_hd[head_idx],
+                        softmax_scale,
+                    )
+                else:
+                    kv_token_indices = expand_kv_token_indices(
+                        selected_blocks,
+                        block_sizes,
+                    )
+                    k_rows = k[batch_idx, head_idx, kv_token_indices].float()
+                    v_rows = v[batch_idx, head_idx, kv_token_indices].float()
+                    scores = torch.mv(k_rows, q_row) * softmax_scale
+                    probabilities = torch.softmax(scores, dim=0)
+                    output_row = torch.matmul(probabilities, v_rows)
+                    lse_row = torch.logsumexp(scores, dim=0)
+                reference_out[batch_idx, head_idx, sample_idx] = output_row
+                reference_lse[batch_idx, head_idx, sample_idx] = lse_row
 
     return reference_out, reference_lse
 

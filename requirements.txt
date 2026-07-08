@@ -1,6 +1,6 @@
-nvidia-cutlass-dsl>=4.4.1
+nvidia-cutlass-dsl>=4.6.0
 torch
 einops
-quack-kernels>=0.2.10
+quack-kernels>=0.6.1
 pytest
 apache-tvm-ffi

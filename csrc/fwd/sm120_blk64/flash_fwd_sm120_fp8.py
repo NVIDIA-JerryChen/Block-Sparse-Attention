@@ -431,7 +431,7 @@ class BlockSparseAttnForwardFp8Sm120Blk64(BatchedStaticSchedulerMixin):
 
             k_stage = K_consumer_state.index
 
-            gemm_smem_zero_acc(
+            _gemm_smem_zero_acc_fp8(
                 tiled_mma_qk,
                 tSrS,
                 tSrQ,
@@ -444,7 +444,7 @@ class BlockSparseAttnForwardFp8Sm120Blk64(BatchedStaticSchedulerMixin):
                 B_uses_fp8_ldsm=True,
             )
 
-            tKScale = load_sage_k_scales(
+            tKScale = _load_sage_k_scales_fp8(
                 tScS,
                 gKScale,
                 n_tile_idx,
@@ -471,8 +471,8 @@ class BlockSparseAttnForwardFp8Sm120Blk64(BatchedStaticSchedulerMixin):
 
             if cutlass.const_expr(self.need_k_mask):
                 if varblk < self.tile_size:
-                    mask(tiled_mma_qk, tSrS, tScS, varblk)
-            row_scale = online_softmax(
+                    _mask_fp8(tiled_mma_qk, tSrS, tScS, varblk)
+            row_scale = _online_softmax_fp8(
                 tiled_mma_qk,
                 tSrS,
                 max_m,
@@ -483,8 +483,8 @@ class BlockSparseAttnForwardFp8Sm120Blk64(BatchedStaticSchedulerMixin):
             )
 
             # Compute P @ V.
-            rescale_o_for_next_acc(tiled_mma_pv, tOrO, row_scale)
-            tOrP = make_acc_into_fp8_op(
+            _rescale_o_for_next_acc_fp8(tiled_mma_pv, tOrO, row_scale)
+            tOrP = _make_acc_into_fp8_op(
                 tSrS,
                 tiled_mma_pv.tv_layout_A,
                 self.V_dtype,
@@ -494,8 +494,9 @@ class BlockSparseAttnForwardFp8Sm120Blk64(BatchedStaticSchedulerMixin):
             V_pipeline.consumer_wait(V_consumer_state, V_wait_status)
 
             # Load each 16x32 N-major V subtile with the native 8-bit
-            # transpose path. The destination layout places the four
-            # returned u32 registers directly in the FP8 B fragment.
+            # transpose path. Hopper WGMMA writes the transposed values back
+            # to K-major SMEM, but SM120 warp MMA consumes B from registers,
+            # so the LDSM.T result can directly form the FP8 B fragment.
             destination_layout = cute.make_layout(
                 ((4, (2, 2)),),
                 stride=((1, (16, 4)),),
@@ -524,7 +525,7 @@ class BlockSparseAttnForwardFp8Sm120Blk64(BatchedStaticSchedulerMixin):
                         destination,
                     )
 
-            gemm_rs_smem(
+            _gemm_rs_fp8(
                 tiled_mma_pv,
                 tOrO,
                 tOrP,
@@ -547,13 +548,13 @@ class BlockSparseAttnForwardFp8Sm120Blk64(BatchedStaticSchedulerMixin):
                 V_pipeline.producer_commit(V_producer_state)
                 V_producer_state.advance()
 
-        final_ratio, lse = finalize_softmax(
+        final_ratio, lse = _finalize_softmax_fp8(
             max_m,
             sum_m,
             q_softmax_scale_log2e_m,
             self.softmax_p_scale_log2,
         )
-        rescale_o_with_sage_v_scale(
+        _rescale_o_with_sage_v_scale_fp8(
             tOrO,
             tOcO,
             final_ratio,
@@ -790,7 +791,7 @@ class BlockSparseAttnForwardFp8Sm120Blk64(BatchedStaticSchedulerMixin):
 # =============================================================================
 
 
-def convert_c_layout_to_a_layout(c: cute.Layout, a: cute.Layout) -> cute.Layout:
+def _convert_c_layout_to_a_layout_fp8(c: cute.Layout, a: cute.Layout) -> cute.Layout:
     """Reinterpret a C fragment with the logical shape of an A operand."""
     a_layout = cute.make_layout(a)
     c_atom_size = cute.size(c, mode=[0])
@@ -806,14 +807,14 @@ def convert_c_layout_to_a_layout(c: cute.Layout, a: cute.Layout) -> cute.Layout:
 
 
 @cute.jit
-def make_acc_into_fp8_op(
+def _make_acc_into_fp8_op(
     acc: cute.Tensor,
     operand_layout_tv: cute.Layout,
     element: type[cutlass.Numeric],
 ) -> cute.Tensor:
-    """Convert an FP32 C fragment to the FP8 A-fragment lane layout."""
+    """Apply FA3's C-layout reinterpretation, E4M3 cast, and A-reg permutation."""
     operand = cute.make_rmem_tensor_like(
-        convert_c_layout_to_a_layout(acc.layout, operand_layout_tv.shape[1]),
+        _convert_c_layout_to_a_layout_fp8(acc.layout, operand_layout_tv.shape[1]),
         element,
     )
     operand_as_acc = cute.make_tensor(operand.iterator, acc.layout)
@@ -855,7 +856,7 @@ def make_acc_into_fp8_op(
     return operand
 
 @cute.jit
-def gemm_smem_zero_acc(
+def _gemm_smem_zero_acc_fp8(
     tiled_mma: cute.TiledMma,
     acc: cute.Tensor,
     tCrA: cute.Tensor,
@@ -908,7 +909,7 @@ def gemm_smem_zero_acc(
 
 
 @cute.jit
-def gemm_rs_smem(
+def _gemm_rs_fp8(
     tiled_mma: cute.TiledMma,
     acc: cute.Tensor,
     tCrA: cute.Tensor,
@@ -940,7 +941,7 @@ def gemm_rs_smem(
 
 
 @cute.jit
-def load_sage_k_scales(
+def _load_sage_k_scales_fp8(
     tScS: cute.Tensor,
     gKScale: cute.Tensor,
     k_tile_idx: cutlass.Int32,
@@ -958,15 +959,21 @@ def load_sage_k_scales(
         cute.size(tScS_mn, mode=[1]) // num_k_scales
     )
     for k_scale_group in cutlass.range_constexpr(num_k_scales):
-        scale_idx = (
+        tile_scale_idx = (
             tScS_mn[0, k_scale_group * scores_per_k_scale][1] // 16
         )
-        tKScale[k_scale_group] = gKScale[k_scale_base + scale_idx]
+        scale_idx = k_scale_base + tile_scale_idx
+        scale_idx = (
+            scale_idx
+            if scale_idx < gKScale.shape[0]
+            else gKScale.shape[0] - 1
+        )
+        tKScale[k_scale_group] = gKScale[scale_idx]
     return tKScale
 
 
 @cute.jit
-def mask(
+def _mask_fp8(
     qk_tiled_mma: cute.TiledMma,
     tSrS: cute.ThrMma,
     tScS: cute.Tensor,
@@ -982,7 +989,7 @@ def mask(
 
 
 @cute.jit
-def online_softmax(
+def _online_softmax_fp8(
     tiled_mma_qk: cute.TiledMma,
     tSrS: cute.ThrMma,
     row_max: cute.Tensor,
@@ -1055,7 +1062,7 @@ def online_softmax(
     return row_scale
 
 @cute.jit
-def finalize_softmax(
+def _finalize_softmax_fp8(
     row_max: cute.Tensor,
     row_sum: cute.Tensor,
     softmax_scale_log2e_m: cute.Tensor,
@@ -1087,7 +1094,7 @@ def finalize_softmax(
 
 
 @cute.jit
-def rescale_o_for_next_acc(
+def _rescale_o_for_next_acc_fp8(
     pv_tiled_mma: cute.TiledMma,
     tOrO: cute.ThrMma,
     prev_ratio_m: cute.Tensor,
@@ -1098,7 +1105,7 @@ def rescale_o_for_next_acc(
 
 
 @cute.jit
-def rescale_o_with_sage_v_scale(
+def _rescale_o_with_sage_v_scale_fp8(
     tOrO: cute.Tensor,
     tOcO: cute.Tensor,
     final_ratio_m: cute.Tensor,
