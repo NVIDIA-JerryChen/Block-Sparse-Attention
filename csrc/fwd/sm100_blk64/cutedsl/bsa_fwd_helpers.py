@@ -438,6 +438,89 @@ def smem_exchange_reduce_store_bf16x32(
 
 
 @cute.jit
+def smem_exchange_reduce_scale_store_bf16x32(
+    own_exchange_smem_addr: Int32,
+    partner_exchange_smem_addr: Int32,
+    sO_smem_addr0: Int32,
+    sO_smem_addr1: Int32,
+    sO_smem_addr2: Int32,
+    sO_smem_addr3: Int32,
+    scale_smem_addr0: Int32,
+    scale_smem_addr1: Int32,
+    scale_smem_addr2: Int32,
+    scale_smem_addr3: Int32,
+) -> None:
+    """Reduce two FP32 exchange tiles, apply V scale, then convert once."""
+    load_ops = "\n\t".join(
+        f"add.u32 addr_own, own, {group * 32 * 4 * 4};\n\t"
+        f"add.u32 addr_partner, partner, {group * 32 * 4 * 4};\n\t"
+        f"ld.shared.v4.b32 {{a{group * 4 + 0}, a{group * 4 + 1}, a{group * 4 + 2}, a{group * 4 + 3}}}, [addr_own];\n\t"
+        f"ld.shared.v4.b32 {{b{group * 4 + 0}, b{group * 4 + 1}, b{group * 4 + 2}, b{group * 4 + 3}}}, [addr_partner];"
+        for group in range(8)
+    )
+    scale_load_ops = "\n\t".join(
+        f"ld.shared.b32 v{group * 8 + item}, [${6 + group}+{item * 4}];"
+        for group in range(4)
+        for item in range(8)
+    )
+    add_scale_ops = "\n\t".join(
+        f"mov.b64 la, {{a{i}, a{i + 1}}};\n\t"
+        f"mov.b64 lb, {{b{i}, b{i + 1}}};\n\t"
+        f"mov.b64 lv, {{v{i}, v{i + 1}}};\n\t"
+        "add.rn.f32x2 la, la, lb;\n\t"
+        "mul.rn.f32x2 la, la, lv;\n\t"
+        f"mov.b64 {{a{i}, a{i + 1}}}, la;"
+        for i in range(0, 32, 2)
+    )
+    store_ops = "\n\t".join(
+        f"cvt.rn.satfinite.bf16x2.f32 p0, a{j + 1}, a{j + 0};\n\t"
+        f"cvt.rn.satfinite.bf16x2.f32 p1, a{j + 3}, a{j + 2};\n\t"
+        f"cvt.rn.satfinite.bf16x2.f32 p2, a{j + 5}, a{j + 4};\n\t"
+        f"cvt.rn.satfinite.bf16x2.f32 p3, a{j + 7}, a{j + 6};\n\t"
+        f"st.shared.v4.b32 [${2 + j // 8}], {{p0, p1, p2, p3}};"
+        for j in range(0, 32, 8)
+    )
+    llvm.inline_asm(
+        None,
+        [
+            Int32(own_exchange_smem_addr).ir_value(),
+            Int32(partner_exchange_smem_addr).ir_value(),
+            Int32(sO_smem_addr0).ir_value(),
+            Int32(sO_smem_addr1).ir_value(),
+            Int32(sO_smem_addr2).ir_value(),
+            Int32(sO_smem_addr3).ir_value(),
+            Int32(scale_smem_addr0).ir_value(),
+            Int32(scale_smem_addr1).ir_value(),
+            Int32(scale_smem_addr2).ir_value(),
+            Int32(scale_smem_addr3).ir_value(),
+        ],
+        "{\n\t"
+        ".reg .b32 own;\n\t"
+        ".reg .b32 partner;\n\t"
+        ".reg .b32 addr_own;\n\t"
+        ".reg .b32 addr_partner;\n\t"
+        ".reg .b32 a<32>;\n\t"
+        ".reg .b32 b<32>;\n\t"
+        ".reg .b32 v<32>;\n\t"
+        ".reg .b32 p<4>;\n\t"
+        ".reg .b64 la;\n\t"
+        ".reg .b64 lb;\n\t"
+        ".reg .b64 lv;\n\t"
+        "mov.b32 own, $0;\n\t"
+        "mov.b32 partner, $1;\n\t"
+        f"{load_ops}\n\t"
+        f"{scale_load_ops}\n\t"
+        f"{add_scale_ops}\n\t"
+        f"{store_ops}\n\t"
+        "}\n",
+        "r,r,r,r,r,r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
 def smem_exchange_reduce_store_f32x32(
     own_exchange_smem_addr: Int32,
     partner_exchange_smem_addr: Int32,

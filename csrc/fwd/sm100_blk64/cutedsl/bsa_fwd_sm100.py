@@ -46,8 +46,9 @@ from csrc.utils.block_sparse_tile_scheduler import (
 from csrc.utils.tile_scheduler import SingleTileScheduler
 
 
-SAGE_P_QUANT_SCALE = 448.0
+SAGE_P_QUANT_SCALE = 256.0
 SAGE_P_QUANT_LOG2_SCALE = math.log2(SAGE_P_QUANT_SCALE)
+SAGE_P_RESCALE_THRESHOLD = math.log2(448.0 / SAGE_P_QUANT_SCALE)
 
 
 class BlockSparseAttnForwardSm100Blk64:
@@ -194,8 +195,11 @@ class BlockSparseAttnForwardSm100Blk64:
 
         # Sage keeps both P and V in E4M3 for one native FP8 PV MMA.  Map the
         # unnormalized softmax probabilities from [0, 1] to the full E4M3
-        # range [0, 448].  The same factor is carried by the softmax sum, so it
-        # cancels during normalization and only V's per-channel scale remains.
+        # nominal range [0, 256]. Values may use the remaining E4M3 headroom up
+        # to 448 while online softmax keeps its old reference maximum across
+        # small increases, avoiding an O TMEM rescale. The same factor is carried
+        # by the softmax sum, so it cancels during normalization and only V's
+        # per-channel scale remains.
         self.kv_stage = 3
         # self.s_stage is defined in __init__ (always 2)
         assert self.s_stage >= self.q_stage
@@ -723,7 +727,12 @@ class BlockSparseAttnForwardSm100Blk64:
 
         clc_response_size = self.sched_stages * 4 if self.use_clc_scheduler else 0
         clc_mbar_size = self.sched_stages * 2 if self.use_clc_scheduler else 0
-        v_scale_cache_size = self.head_dim_v_padded if self.is_sage_fp8 else 0
+        v_scale_cache_size = (
+            self.head_dim_v_padded * len(self.correction_warp_ids)
+            if self.is_sage_fp8
+            else 0
+        )
+        k_scale_cache_size = self.s_stage * 16 if self.is_sage_fp8 else 0
 
         @cute.struct
         class SharedStorage:
@@ -743,10 +752,11 @@ class BlockSparseAttnForwardSm100Blk64:
             # store row max and row sum
             sScale: cute.struct.MemRange[Float32, self.s_stage * self.stats_stride * 2]
             oStats: cute.struct.MemRange[Float32, 4 * 32 * 2]
-            # The FP8 epilogue reuses one 128-wide V-scale vector for every
-            # output row in a tile. Cache it once per work tile instead of
-            # reloading it for each row.
+            # One 128-wide V-scale cache per correction warp. Separate slices
+            # avoid cross-tile overwrite between the two correction warp pairs.
             sVScale: cute.struct.MemRange[Float32, v_scale_cache_size]
+            # One 16-value Sage K-scale vector per alternating score stage.
+            sKScale: cute.struct.MemRange[Float32, k_scale_cache_size]
             # CLC buffers (mbarriers + response storage)
             clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, clc_mbar_size]
             clc_response: cute.struct.Align[
@@ -976,6 +986,11 @@ class BlockSparseAttnForwardSm100Blk64:
             if const_expr(self.is_sage_fp8)
             else sScale
         )
+        sKScale = (
+            storage.sKScale.get_tensor(cute.make_layout(self.s_stage * 16))
+            if const_expr(self.is_sage_fp8)
+            else sScale
+        )
         oExchange = cute.make_tensor(
             cute.recast_ptr(sKV_ptr, dtype=Float32),
             cute.make_layout(self.epi_exchange_f32_count),
@@ -1114,6 +1129,7 @@ class BlockSparseAttnForwardSm100Blk64:
                 sQ,
                 sK,
                 sV,
+                sKScale,
                 tOtO,
                 tOrP,
                 pipeline_q,
@@ -1122,6 +1138,8 @@ class BlockSparseAttnForwardSm100Blk64:
                 pipeline_p_lastsplit,
                 pipeline_o_acc,
                 tile_scheduler,
+                mBlockIndex,
+                mKScale,
                 block_sparse_num,
                 mBlockNums,
                 mSplitOffsets,
@@ -1177,6 +1195,7 @@ class BlockSparseAttnForwardSm100Blk64:
                 mBlockSizes=mBlockSizes,
                 mQScale=mQScale,
                 mKScale=mKScale,
+                sKScale=sKScale,
                 block_sparse_num=block_sparse_num,
                 mBlockNums=mBlockNums,
                 mSplitOffsets=mSplitOffsets,
@@ -1218,6 +1237,8 @@ class BlockSparseAttnForwardSm100Blk64:
                 Float32(1.0) if const_expr(self.is_sage_fp8) else softmax_scale_log2,
                 oStats,
                 oExchange,
+                mVScale,
+                sVScale,
                 SeqlenInfoCls,
                 tile_scheduler,
                 num_q_heads,
@@ -1498,6 +1519,7 @@ class BlockSparseAttnForwardSm100Blk64:
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
+        sKScale: cute.Tensor,
         tOtO: cute.Tensor,
         tOrP: cute.Tensor,
         pipeline_q: pipeline.PipelineAsync,
@@ -1506,10 +1528,13 @@ class BlockSparseAttnForwardSm100Blk64:
         pipeline_p_lastsplit: pipeline.PipelineAsync,
         pipeline_o_acc: pipeline.PipelineAsync,
         tile_scheduler: TileSchedulerProtocol,
+        mBlockIndex: cute.Tensor,
+        mKScale: Optional[cute.Tensor],
         block_sparse_num: Int32,
         mBlockNums: Optional[cute.Tensor],
         mSplitOffsets: Optional[cute.Tensor],
     ):
+        tidx = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
         tOrV = tiled_mma_pv.make_fragment_B(sV)
@@ -1537,7 +1562,7 @@ class BlockSparseAttnForwardSm100Blk64:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
 
-            raw_block_count, _ = self.get_tile_block_count_and_offset(
+            raw_block_count, split_offset = self.get_tile_block_count_and_offset(
                 mSplitOffsets,
                 mBlockNums,
                 batch_idx,
@@ -1548,6 +1573,15 @@ class BlockSparseAttnForwardSm100Blk64:
             )
             process_tile = raw_block_count > Int32(0) if const_expr(self.allow_empty_block_nums) else True
             block_iter_count = ((raw_block_count + 7) & ~7) // self.sparse_blocks_per_kv
+            tile_block_indices_base = mBlockIndex[batch_idx, head_idx, m_block, None]
+            tile_block_indices = self.offset_tile_block_indices(
+                tile_block_indices_base, split_offset, mSplitOffsets
+            )
+            n_block = partial(
+                self.get_tile_n_block_idx,
+                tile_block_indices,
+                max_i=cutlass.max(raw_block_count - 1, Int32(0)),
+            )
 
             if process_tile:
                 # ================================================================
@@ -1562,6 +1596,17 @@ class BlockSparseAttnForwardSm100Blk64:
                 mma_q_consumer_phase ^= 1
 
                 # S0 = Q @ K0
+                if const_expr(self.is_sage_fp8 and not self.is_split_kv):
+                    self.publish_k_scales(
+                        mKScale,
+                        sKScale,
+                        n_block,
+                        block_iter_count - 1,
+                        0,
+                        batch_idx,
+                        head_idx,
+                        tidx,
+                    )
                 bsa_fwd_helpers.mbar_wait(
                     Int32(pipeline_kv.sync_object_full.get_barrier(mma_kv_consumer_state.index).toint()),
                     mma_kv_consumer_state.phase,
@@ -1575,6 +1620,17 @@ class BlockSparseAttnForwardSm100Blk64:
                 mma_kv_consumer_state.advance()
 
                 # S1 = Q @ K1
+                if const_expr(self.is_sage_fp8 and not self.is_split_kv):
+                    self.publish_k_scales(
+                        mKScale,
+                        sKScale,
+                        n_block,
+                        block_iter_count - 2,
+                        1,
+                        batch_idx,
+                        head_idx,
+                        tidx,
+                    )
                 bsa_fwd_helpers.mbar_wait(
                     Int32(pipeline_kv.sync_object_full.get_barrier(mma_kv_consumer_state.index).toint()),
                     mma_kv_consumer_state.phase,
@@ -1611,6 +1667,17 @@ class BlockSparseAttnForwardSm100Blk64:
                             spo_empty_mbar = spo_empty_mbar1
                             tOrP_stage = tOrP1
                         bsa_fwd_helpers.mbar_wait(spo_empty_mbar, phase_cur)
+                        if const_expr(self.is_sage_fp8 and not self.is_split_kv):
+                            self.publish_k_scales(
+                                mKScale,
+                                sKScale,
+                                n_block,
+                                block_iter_count - 3 - (i * self.s_stage + stage),
+                                stage,
+                                batch_idx,
+                                head_idx,
+                                tidx,
+                            )
                         # Wait V
                         bsa_fwd_helpers.mbar_wait(
                             Int32(pipeline_kv.sync_object_full.get_barrier(mma_kv_consumer_state.index).toint()),
@@ -1707,6 +1774,33 @@ class BlockSparseAttnForwardSm100Blk64:
         # pipeline_o_acc.producer_acquire() inside the loop.
 
     @cute.jit
+    def publish_k_scales(
+        self,
+        mKScale: cute.Tensor,
+        sKScale: cute.Tensor,
+        n_block: Callable,
+        kv_block_idx: Int32,
+        score_stage: int,
+        batch_idx: Int32,
+        head_idx: Int32,
+        tidx: Int32,
+    ):
+        """Load one KV tile's 16 K scales once for all softmax rows."""
+        if tidx < 16:
+            logical_sub = tidx // 4
+            scale_group = tidx % 4
+            key_block = n_block(
+                kv_block_idx * self.sparse_blocks_per_kv + logical_sub
+            )
+            sKScale[score_stage * 16 + tidx] = mKScale[
+                batch_idx,
+                head_idx,
+                key_block * 4 + scale_group,
+            ]
+        cute.arch.sync_warp()
+        cute.arch.fence_view_async_shared()
+
+    @cute.jit
     def ws_pv_gemm(
         self,
         pv_mma_op: cute.nvgpu.tcgen05.mma.MmaOp,
@@ -1770,6 +1864,7 @@ class BlockSparseAttnForwardSm100Blk64:
         mBlockSizes: Optional[cute.Tensor],
         mQScale: Optional[cute.Tensor],
         mKScale: Optional[cute.Tensor],
+        sKScale: cute.Tensor,
         block_sparse_num: Int32,
         mBlockNums: Optional[cute.Tensor],
         mSplitOffsets: Optional[cute.Tensor],
@@ -1820,7 +1915,11 @@ class BlockSparseAttnForwardSm100Blk64:
 
             softmax = SoftmaxSm100.create(
                 Float32(1.0) if const_expr(self.is_sage_fp8) else softmax_scale_log2,
-                rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0,
+                rescale_threshold=(
+                    SAGE_P_RESCALE_THRESHOLD
+                    if const_expr(self.is_sage_fp8)
+                    else 8.0 if const_expr(self.q_dtype.width == 16) else 0.0
+                ),
                 softmax_scale=softmax_scale,
             )
             softmax.reset()
@@ -1835,6 +1934,7 @@ class BlockSparseAttnForwardSm100Blk64:
                 sScale=sScale,
                 stage=stage,
                 mKScale=mKScale,
+                sKScale=sKScale,
                 batch_idx=batch_idx,
                 head_idx=head_idx,
                 score_scale_log2=softmax_scale_log2,
@@ -1962,6 +2062,7 @@ class BlockSparseAttnForwardSm100Blk64:
         n_block_hi: Int32,
         q_scale: Float32,
         mKScale: Optional[cute.Tensor],
+        sKScale: cute.Tensor,
         batch_idx: Int32,
         head_idx: Int32,
         score_scale_log2: Float32,
@@ -1986,11 +2087,30 @@ class BlockSparseAttnForwardSm100Blk64:
         5. Computing row sums for normalization
         6. Coordinating pipeline synchronization between different processing stages
         """
+        if const_expr(self.is_sage_fp8 and not self.is_split_kv):
+            qk_scales = cute.make_rmem_tensor((8,), Float32)
+            q_log2_scale = q_scale * score_scale_log2
+
         # Wait for Si
         bsa_fwd_helpers.mbar_wait(
             Int32(pipeline_s_p_o.sync_object_full.get_barrier(stage).toint()),
             mma_si_consumer_phase,
         )
+
+        if const_expr(self.is_sage_fp8 and not self.is_split_kv):
+            warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
+            warp_col = warp_idx // 2
+            for block_idx in cutlass.range_constexpr(2):
+                for key_scale_group in cutlass.range_constexpr(4):
+                    scale_idx = block_idx * 4 + key_scale_group
+                    cache_idx = (
+                        stage * 16
+                        + (warp_col + block_idx * 2) * 4
+                        + key_scale_group
+                    )
+                    qk_scales[scale_idx] = (
+                        q_log2_scale * sKScale[cache_idx]
+                    )
 
         tSrS_t2r = cute.make_rmem_tensor((128,), Float32)
         for c in cutlass.range_constexpr(4):
@@ -2008,25 +2128,37 @@ class BlockSparseAttnForwardSm100Blk64:
             # block.  Max-reduce the raw scores within each group first, then
             # scale only the eight group maxima.  The score scale is fused into
             # the later subtract-row-max FMA, avoiding a full extra score pass.
-            qk_scales = cute.make_rmem_tensor((8,), Float32)
             scaled_group_max = cute.make_rmem_tensor((8,), Float32)
             tSrS_groups = cute.logical_divide(tSrS_t2r, cute.make_layout(16))
-            q_log2_scale = q_scale * score_scale_log2
-            for block_idx in cutlass.range_constexpr(2):
-                key_block = n_block_lo if const_expr(block_idx == 0) else n_block_hi
-                for key_scale_group in cutlass.range_constexpr(4):
-                    scale_idx = block_idx * 4 + key_scale_group
-                    k_scale = mKScale[
-                        batch_idx,
-                        head_idx,
-                        key_block * 4 + key_scale_group,
-                    ]
-                    qk_scale = q_log2_scale * k_scale
-                    qk_scales[scale_idx] = qk_scale
+            if const_expr(not self.is_split_kv):
+                for scale_idx in cutlass.range_constexpr(8):
                     group_max = softmax._compute_row_max(
                         tSrS_groups[None, scale_idx].load()
                     )
-                    scaled_group_max[scale_idx] = group_max * qk_scale
+                    scaled_group_max[scale_idx] = (
+                        group_max * qk_scales[scale_idx]
+                    )
+            else:
+                qk_scales = cute.make_rmem_tensor((8,), Float32)
+                q_log2_scale = q_scale * score_scale_log2
+                for block_idx in cutlass.range_constexpr(2):
+                    key_block = (
+                        n_block_lo
+                        if const_expr(block_idx == 0)
+                        else n_block_hi
+                    )
+                    for key_scale_group in cutlass.range_constexpr(4):
+                        scale_idx = block_idx * 4 + key_scale_group
+                        qk_scale = q_log2_scale * mKScale[
+                            batch_idx,
+                            head_idx,
+                            key_block * 4 + key_scale_group,
+                        ]
+                        qk_scales[scale_idx] = qk_scale
+                        group_max = softmax._compute_row_max(
+                            tSrS_groups[None, scale_idx].load()
+                        )
+                        scaled_group_max[scale_idx] = group_max * qk_scale
             row_max, acc_scale = softmax.update_row_max(
                 scaled_group_max.load(), is_first
             )
@@ -2039,7 +2171,7 @@ class BlockSparseAttnForwardSm100Blk64:
         sm_stats_barrier.arrive_w_index(index=sm_stats_bar_index)
 
         if const_expr(self.is_sage_fp8):
-            # Generate P * 448 directly in exp2.  The softmax numerator and
+            # Generate P * 256 directly in exp2.  The softmax numerator and
             # denominator carry the same fixed factor, so normalization is
             # unchanged while the separate per-element multiply disappears.
             p_log2_scale = Float32(SAGE_P_QUANT_LOG2_SCALE)
@@ -2170,6 +2302,8 @@ class BlockSparseAttnForwardSm100Blk64:
         softmax_scale_log2: Float32,
         oStats: cute.Tensor,
         oExchange: cute.Tensor,
+        mVScale: Optional[cute.Tensor],
+        sVScale: cute.Tensor,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
         num_heads: Int32,
@@ -2196,6 +2330,17 @@ class BlockSparseAttnForwardSm100Blk64:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             out_head_idx = head_idx + split_idx * num_heads if const_expr(self.is_split_kv) else head_idx
+
+            if const_expr(self.is_sage_fp8 and not self.is_split_kv):
+                lane_idx = tidx % cute.arch.WARP_SIZE
+                for vec in cutlass.range_constexpr(
+                    self.head_dim_v_padded // cute.arch.WARP_SIZE
+                ):
+                    col = lane_idx + vec * cute.arch.WARP_SIZE
+                    sVScale[warp_idx * self.head_dim_v_padded + col] = mVScale[
+                        head_idx, col
+                    ]
+                cute.arch.sync_warp()
 
             mO_cur = mO[None, None, None, batch_idx][None, None, out_head_idx]
             # For q_stage=1, gO tiles span 1*m_block_size rows (single Q, combine writes one O)
@@ -2297,6 +2442,8 @@ class BlockSparseAttnForwardSm100Blk64:
                     sO[None, None, 0],
                     oStats,
                     oExchange,
+                    sVScale,
+                    warp_idx * self.head_dim_v_padded,
                     reduce_mbar_addr,
                     mLSE_cur,
                 )
@@ -2332,6 +2479,8 @@ class BlockSparseAttnForwardSm100Blk64:
                     sO[None, None, 0],
                     oStats,
                     oExchange,
+                    sVScale,
+                    warp_idx * self.head_dim_v_padded,
                     reduce_mbar_addr,
                     mLSE_cur,
                 )
@@ -2387,6 +2536,8 @@ class BlockSparseAttnForwardSm100Blk64:
         sO: cute.Tensor,
         oStats: cute.Tensor,
         oExchange: cute.Tensor,
+        sVScale: cute.Tensor,
+        v_scale_warp_base: Int32,
         reduce_mbar_addr: Int32,
         mLSE_cur: Optional[cute.Tensor] = None,
     ):
@@ -2471,14 +2622,28 @@ class BlockSparseAttnForwardSm100Blk64:
                         Int32((sO.iterator + sO.layout((out_row, col7))).toint()),
                     )
                 else:
-                    bsa_fwd_helpers.smem_exchange_reduce_store_bf16x32(
-                        Int32((oExchange.iterator + own_warp_base + off).toint()),
-                        Int32((oExchange.iterator + partner_warp_base + off).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col0))).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col1))).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col2))).toint()),
-                        Int32((sO.iterator + sO.layout((out_row, col3))).toint()),
-                    )
+                    if const_expr(self.is_sage_fp8):
+                        bsa_fwd_helpers.smem_exchange_reduce_scale_store_bf16x32(
+                            Int32((oExchange.iterator + own_warp_base + off).toint()),
+                            Int32((oExchange.iterator + partner_warp_base + off).toint()),
+                            Int32((sO.iterator + sO.layout((out_row, col0))).toint()),
+                            Int32((sO.iterator + sO.layout((out_row, col1))).toint()),
+                            Int32((sO.iterator + sO.layout((out_row, col2))).toint()),
+                            Int32((sO.iterator + sO.layout((out_row, col3))).toint()),
+                            Int32((sVScale.iterator + v_scale_warp_base + sVScale.layout(c * 32 + 0)).toint()),
+                            Int32((sVScale.iterator + v_scale_warp_base + sVScale.layout(c * 32 + 8)).toint()),
+                            Int32((sVScale.iterator + v_scale_warp_base + sVScale.layout(c * 32 + 16)).toint()),
+                            Int32((sVScale.iterator + v_scale_warp_base + sVScale.layout(c * 32 + 24)).toint()),
+                        )
+                    else:
+                        bsa_fwd_helpers.smem_exchange_reduce_store_bf16x32(
+                            Int32((oExchange.iterator + own_warp_base + off).toint()),
+                            Int32((oExchange.iterator + partner_warp_base + off).toint()),
+                            Int32((sO.iterator + sO.layout((out_row, col0))).toint()),
+                            Int32((sO.iterator + sO.layout((out_row, col1))).toint()),
+                            Int32((sO.iterator + sO.layout((out_row, col2))).toint()),
+                            Int32((sO.iterator + sO.layout((out_row, col3))).toint()),
+                        )
 
         cute.arch.fence_view_async_shared()
 
@@ -2536,9 +2701,9 @@ class BlockSparseAttnForwardSm100Blk64:
                         tOsO[None, rest_m, None], self.o_dtype
                     )
                     cute.autovec_copy(tOsO[None, rest_m, None], tOrO_row)
-                    if const_expr(self.is_sage_fp8):
+                    if const_expr(self.is_sage_fp8 and self.is_split_kv):
                         # P and the softmax denominator carry the same factor
-                        # of 448, so only V_scale remains after normalization.
+                        # of 256, so only V_scale remains after normalization.
                         assert cute.size(tOrO_row.shape[0]) % 2 == 0
                         for rest_n in cutlass.range_constexpr(
                             cute.size(tOrO_row.shape[1])
@@ -2597,7 +2762,7 @@ class BlockSparseAttnForwardSm100Blk64:
             tidx = cute.arch.thread_idx()[0] % (
                 cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
             )
-            if const_expr(self.is_sage_fp8):
+            if const_expr(self.is_sage_fp8 and self.is_split_kv):
                 # One epilogue warp cooperatively stages all per-channel V
                 # scales.  This happens before waiting for O, so the loads can
                 # overlap the producer's final correction work.

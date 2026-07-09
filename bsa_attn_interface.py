@@ -413,7 +413,11 @@ def _sm100_blk64_auto_fp8_kv_splits(
     heads = int(heads)
     q_tiles = heads * ((int(seqlen_q) + 63) // 64)
     if q_tiles >= 512:
-        return _sm100_blk64_kv_splits_from_count(topk_num)
+        # SLA-scale Q already exposes thousands of independent CTAs.  Splitting
+        # medium top-k rows only adds FP32 partial workspace and a combine pass;
+        # a small split remains useful once each CTA traverses at least 900 KV
+        # blocks.  These buckets are tuned on the full SLA 0709 shapes.
+        return 4 if topk_num >= 900 else 1
     if topk_num < 128:
         return 1
     if heads == 8:
@@ -1978,7 +1982,7 @@ def bsa_fp8_blk64_fwd(
 
     Q/K/V use BHSD E4M3 storage.  Q scales are per token, K scales are
     per 16-token block, and V scales are per output channel. P uses a fixed
-    448 E4M3 scale for one native FP8 PV MMA. The result is BHSD BF16. This
+    256 E4M3 scale for one native FP8 PV MMA. The result is BHSD BF16. This
     implementation intentionally supports the fixed v1 contract only: B=1,
     H in {4, 8}, D=128, uniform top-k, and sequence lengths aligned to the
     logical 64-token sparse block.

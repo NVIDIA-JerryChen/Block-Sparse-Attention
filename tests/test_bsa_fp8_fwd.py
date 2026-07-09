@@ -5,9 +5,13 @@ import torch
 
 
 def test_bsa_fp8_probability_scale_contract():
-    from csrc.fwd.sm100_blk64.cutedsl.bsa_fwd_sm100 import SAGE_P_QUANT_SCALE
+    from csrc.fwd.sm100_blk64.cutedsl.bsa_fwd_sm100 import (
+        SAGE_P_QUANT_SCALE,
+        SAGE_P_RESCALE_THRESHOLD,
+    )
 
-    assert SAGE_P_QUANT_SCALE == 448.0
+    assert SAGE_P_QUANT_SCALE == 256.0
+    assert SAGE_P_RESCALE_THRESHOLD == math.log2(448.0 / 256.0)
 
 
 @pytest.mark.parametrize(
@@ -24,20 +28,30 @@ def test_bsa_fp8_probability_scale_contract():
         (8, 64, 188, 4),
         (8, 64, 548, 16),
         (8, 64, 1089, 16),
-        # Long-Q PDF rows already expose enough independent Q tiles and use
-        # the same 1/2/4/8 split progression as the BF16 auto policy.
+        # Long-Q rows already expose enough independent Q tiles.  Avoid the
+        # partial-workspace/combine tax until a CTA traverses at least 900
+        # sparse KV blocks, then use four splits.
         (4, 119040, 188, 1),
         (8, 119040, 188, 1),
-        (4, 234240, 368, 2),
-        (8, 234240, 368, 2),
-        (4, 349440, 548, 4),
-        (8, 349440, 548, 4),
-        (4, 464640, 729, 4),
-        (8, 464640, 729, 4),
-        (4, 579840, 909, 8),
-        (8, 579840, 909, 8),
-        (4, 695040, 1089, 8),
-        (8, 695040, 1089, 8),
+        (4, 234240, 368, 1),
+        (8, 234240, 368, 1),
+        (4, 349440, 548, 1),
+        (8, 349440, 548, 1),
+        (4, 464640, 729, 1),
+        (8, 464640, 729, 1),
+        (4, 579840, 909, 4),
+        (8, 579840, 909, 4),
+        (4, 695040, 1089, 4),
+        (8, 695040, 1089, 4),
+        # SLA 0709 customer benchmark rows.
+        (4, 116160, 186, 1),
+        (8, 116160, 186, 1),
+        (4, 109312, 174, 1),
+        (8, 109312, 174, 1),
+        (4, 216832, 342, 1),
+        (8, 216832, 342, 1),
+        (4, 695040, 1090, 4),
+        (8, 695040, 1090, 4),
     ],
 )
 def test_bsa_fp8_split_policy(heads, seqlen_q, topk, expected_splits):
