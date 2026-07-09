@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "block-sparse-attention"
+version = "0.1.0"
+description = "Block-sparse attention kernels implemented with NVIDIA CuTe DSL"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "apache-tvm-ffi",
+    "cuda-python>=12.8",
+    "einops",
+    "nvidia-cutlass-dsl>=4.5.2",
+    "torch>=2.5",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools]
+py-modules = ["bsa_attn_interface"]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["csrc*", "utils*"]
+exclude = [
+    "csrc.fwd.sm100_blk64.cpp*",
+    "csrc.fwd.sm100_blk64.instantiations*",
+]
+namespaces = true

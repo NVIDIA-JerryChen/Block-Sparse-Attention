@@ -4,20 +4,20 @@
 
 **Forward backends:**
 
-| | SM120 blk64 (CuTe DSL / AOT + JIT) | SM100 blk128 (CuTe DSL / JIT) | SM90 blk64 (CuTe DSL / JIT) | SM100 blk64 (C++ AOT / CUTLASS) | SM100 blk64 (CuTe DSL / JIT) |
-|---|---|---|---|---|---|
-| Dtype | bf16, fp16 | bf16, fp16 | bf16, fp16 | bf16 only | bf16 only |
-| Head dim | 128 only | 64, 96, 128 | 64, 96, 128 | 128 only | 128 only |
-| Attention | MHA, GQA, MQA | MHA, GQA, MQA | MHA, GQA, MQA | MHA only | MHA only |
-| pack_gqa | No | Yes | No | No | No |
-| Persistent scheduling | Static | Static + CLC dynamic | Static | CLC dynamic (built-in) | Static + CLC dynamic |
-| Variable block counts (`q2k_block_nums`) | Yes (>= 1) | Yes (>= 0) | Yes (>= 0) | Yes (>= 1) | Yes (>= 0) |
-| KV split (`kv_splits`) | No | No | Explicit / auto | Explicit / auto | Explicit / auto |
-| LSE output | Yes | Yes | Yes | Yes | Yes |
+| | SM120 blk64 (CuTe DSL / AOT + JIT) | SM100 blk128 (CuTe DSL / JIT) | SM90 blk64 (CuTe DSL / JIT) | SM100/SM110 blk64 (CuTe DSL / JIT) |
+|---|---|---|---|---|
+| Dtype | bf16, fp16 | bf16, fp16 | bf16, fp16 | bf16 only |
+| Head dim | 128 only | 64, 96, 128 | 64, 96, 128 | 128 only |
+| Attention | MHA, GQA, MQA | MHA, GQA, MQA | MHA, GQA, MQA | MHA only |
+| pack_gqa | No | Yes | No | No |
+| Persistent scheduling | Static | Static + CLC dynamic | Static | Static + CLC dynamic |
+| Variable block counts (`q2k_block_nums`) | Yes (>= 1) | Yes (>= 0) | Yes (>= 0) | Yes (>= 0) |
+| KV split (`kv_splits`) | No | No | Explicit / auto | Explicit / auto |
+| LSE output | Yes | Yes | Yes | Yes |
 
 **Backward backends:**
 
-| | SM90 blk64 (CuTe DSL / JIT) | SM100 blk64 (CuTe DSL / JIT) |
+| | SM90 blk64 (CuTe DSL / JIT) | SM100/SM110 blk64 (CuTe DSL / JIT) |
 |---|---|---|
 | Dtype | bf16 | bf16 |
 | Head dim | 128 | 128 |
@@ -26,7 +26,7 @@
 
 **Not supported (current sparse kernels):** causal, local, mask_mod, score_mod, paged_kv, softcap, varlen
 
-Split-KV is supported by the SM90/SM100 blk64 forward paths. SM120 deliberately
+Split-KV is supported by the SM90/SM100/SM110 blk64 forward paths. SM120 deliberately
 keeps `kv_splits=1`; explicit split counts are rejected so no FP32 partial
 workspace is allocated. The blk128 and backward paths do not support split-KV.
 
@@ -35,6 +35,7 @@ workspace is allocated. The blk128 and backward paths do not support split-KV.
 ```
 BSA/
 ├── bsa_attn_interface.py         # Public API (fwd, bwd)
+├── pyproject.toml                # Unified wheel metadata and package discovery
 ├── tests/
 │   ├── test_flash_fwd.py         # Forward tests & benchmarks (blk64 + blk128)
 │   └── test_flash_bwd.py         # Backward tests & benchmarks (blk64)
@@ -52,19 +53,12 @@ BSA/
 │   │   ├── aot_runtime.py            # Manifest validation and runtime loader
 │   │   └── aot_utils.py              # Variant and artifact metadata
 │   │
-│   └── sm100_blk64/                  # blk64 — implementation family
-│       ├── cpp/                          # C++ AOT / CUTLASS backend
-│       │   ├── bsa_api.cpp               # PyTorch C++ bindings (returns [out, lse])
-│       │   ├── bsa_fwd_kernel_sm100.h    # Kernel definition
-│       │   ├── bsa_fwd_launch_template.h # Host launch wrapper
-│       │   ├── mainloop_fwd_sm100.hpp    # Mainloop (load, mma, softmax)
-│       │   ├── epilogue_fwd_sm100.hpp    # Output epilogue
-│       │   ├── instantiations/           # AOT template instantiations
-│       │   └── setup.py                  # CUDAExtension build script
-│       └── cutedsl/                      # CuTe DSL / JIT backend
-│           ├── bsa_fwd_sm100.py          # Forward kernel
-│           ├── bsa_fwd_helpers.py        # SM100 device helpers
-│           └── bsa_fwd_combine.py        # Split-KV combine kernel shared by both paths
+│   └── sm100_blk64/                  # blk64 — SM100/SM110 implementation
+│       ├── cutedsl/                      # Packaged CuTe DSL / JIT backend
+│       │   ├── bsa_fwd_sm100.py          # Forward kernel
+│       │   ├── bsa_fwd_helpers.py        # SM100 device helpers
+│       │   └── bsa_fwd_combine.py        # Split-KV combine kernel
+│       └── cpp/                          # Legacy development sources; excluded from wheel
 │
 ├── csrc/bwd/
 │   ├── bsa_bwd_preprocess.py             # Shared backward preprocess kernel
@@ -94,7 +88,7 @@ BSA/
 │   └── fa_logging.py             # Debug logging
 │
 └── third_party/
-    └── cutlass/                  # CUTLASS headers (git submodule)
+    └── cutlass/                  # Development-only submodule; excluded from wheel
 ```
 
 ## Quick Start
@@ -102,24 +96,33 @@ BSA/
 ### Prerequisites
 
 - Python 3.10+
-- PyTorch 2.5+ with CUDA support
+- PyTorch 2.5+ built for the installed CUDA runtime
 - CUDA 13.0+
 - CuTe DSL (`nvidia-cutlass-dsl>=4.5.2` for the SM120 dynamic AOT ABI)
-- CUTLASS headers (for blk64 C++ AOT build)
 
 ### Setup
 
 ```bash
-# Clone with submodules (CUTLASS headers required for blk64)
-git clone --recurse-submodules <repo-url>
-# Or if already cloned:
-git submodule update --init --recursive
+# Install directly from a source checkout.
+pip install .
 
-pip install -r requirements.txt
+# Or build one reusable wheel and install it elsewhere.
+make wheel
+pip install dist/block_sparse_attention-*.whl
 
-# Build blk64 C++ extension (builds wheel + pip installs it)
+# Development shortcut when the runtime dependencies are already installed.
 make setup
 ```
+
+The unified wheel and source distribution contain the public API, all supported
+forward and backward CuTe DSL kernels, and shared Python utilities. They do not
+contain the SM100 blk64 C++ implementation, a prebuilt CUDA extension, or the
+`third_party/cutlass` submodule. SM100/SM110 blk64 forward dispatches to the
+packaged CuTe DSL implementation and JIT-compiles it on first use. `make setup`
+uses `--no-deps` for fast development reinstalls; use `pip install .` or install
+the wheel directly in a fresh environment to resolve runtime dependencies.
+
+For an editable development install with tests, use `pip install -e '.[test]'`.
 
 ### SM120 CuTe DSL AOT
 
@@ -283,7 +286,7 @@ v = torch.randn(1, 8, 1024, 128, device="cuda", dtype=torch.bfloat16)
 
 out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes)
 
-# Split long KV lists on SM90/SM100. SM120 must keep kv_splits=1.
+# Split long KV lists on SM90/SM100/SM110. SM120 must keep kv_splits=1.
 out, lse = bsa_attn_fwd_blk64(
     q, k, v, q2k_block_index, block_sizes, q2k_block_nums,
     kv_splits="auto", block_sparse_num=block_sparse_num,
@@ -387,13 +390,16 @@ block_sizes = [tile_n] * N            # last block adjusted for seqlen remainder
 
 ### `bsa_attn_fwd_blk64(..., kv_splits=1, ...)`
 
-The SM90 and SM100 blk64 forward paths can split each Q block's active KV list:
+The SM90 and SM100/SM110 blk64 forward paths can split each Q block's active KV
+list. On SM100/SM110, `bsa_attn_fwd_blk64` dispatches to the packaged CuTe DSL
+backend. `bsa_attn_fwd_blk64_cutedsl` remains available as an explicit,
+backward-compatible entry point to the same implementation.
 
-On SM100, `bsa_attn_fwd_blk64` uses the C++ AOT backend, while
-`bsa_attn_fwd_blk64_cutedsl` selects the independently maintained CuTe DSL
-backend. Both reuse the CuTe DSL split-KV combine kernel.
+BHSD is the zero-copy layout. On SM100/SM110, `layout="bshd"` is a compatibility
+path that materializes contiguous BHSD inputs before launching the CuTe DSL
+kernel, then materializes the BSHD output.
 
-- `kv_splits=1` uses the legacy single forward kernel without partial-output
+- `kv_splits=1` uses one forward kernel without partial-output
   workspace or a combine kernel.
 - `kv_splits=2..256` produces FP32 O/LSE partials for each split and combines
   them into the requested output dtype. Partial workspace grows linearly with
@@ -405,7 +411,7 @@ backend. Both reuse the CuTe DSL split-KV combine kernel.
   counts report an error instead.
 
 SM90 split-KV supports the same MHA/GQA/MQA and QK/V dimensions (64, 96, or
-128) as its single-kernel path. SM100 blk64 retains its existing shape
+128) as its single-kernel path. SM100/SM110 blk64 retains its existing shape
 constraints, and its split path does not use the CLC scheduler; auto split
 selection disables CLC for that path. SM120 does not build or dispatch a
 split-KV variant: `kv_splits=1` is the only accepted value, avoiding the
@@ -413,7 +419,7 @@ split-dependent FP32 O/LSE workspace on memory-constrained devices.
 
 ### `bsa_attn_bwd(dout, q, k, v, out, lse, q2k_block_index, block_sparse_num, block_sizes, ...)`
 
-SM90/SM100 block-sparse backward attention (blk64 backend).
+SM90/SM100/SM110 block-sparse backward attention (blk64 backend).
 
 This recomputes the attention probabilities from `q/k/v`, `out`, and `lse`, then returns gradients `(dq, dk, dv)`.
 
@@ -481,7 +487,8 @@ Default bucket sizing is backend-owned: SM90 uses the SM90 blk64 backward defaul
 ## Tests & Benchmarks
 
 ```bash
-make setup                      # Build blk64 C++ extension
+make wheel                      # Build the unified CuTe DSL wheel
+make setup                      # Reinstall wheel after dependencies are provisioned
 make aot-sm120                  # Build the default SM120 native-ABI AOT matrix
 make tt                         # Quick correctness test (default: blk128)
 make tt BLK=64                  # Quick test blk64 only
@@ -493,7 +500,7 @@ make profile                    # Single fwd run for ncu profiling
 make bm                         # ncu full profile (NVTX-filtered)
 make bm-cli                     # ncu register/spill/smem analysis
 make compare                    # Compare BSA vs FA4 performance
-make clean                      # Clear compile caches + blk64 build
+make clean                      # Clear compile caches and build artifacts
 make help                       # Show all targets
 
 python test_flash_bwd.py                    # Backward quick correctness tests
