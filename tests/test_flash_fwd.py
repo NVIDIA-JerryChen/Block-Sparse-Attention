@@ -16,6 +16,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 import torch
 
+import bsa_attn_interface as bsa_interface
+
 # BSA_BLK env var: "64", "128", or "64,128" (default). Controls which blk sizes to test.
 _BSA_BLK = os.environ.get("BSA_BLK", "64,128")
 _BLK_SIZES = [int(x) for x in _BSA_BLK.split(",")]
@@ -32,13 +34,6 @@ from bsa_attn_interface import (
 from csrc.fwd.sm100_blk128.bsa_fwd_sm100 import (
     BlockSparseAttnForwardSm100Blk128,
 )
-
-# Optional: blk64 C++ AOT kernel (install via `make setup BLK=64`)
-try:
-    import bsa_fwd_blk64_ext
-    HAS_BLK64 = True
-except ImportError:
-    HAS_BLK64 = False
 
 
 # ============== Block-sparse helpers ==============
@@ -227,7 +222,7 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
                   blk_m=128, blk_n=128, use_clc=False):
     """Run a single correctness test with random block-sparse pattern.
 
-    blk_m/blk_n: block sizes. blk_n=64 routes to blk64 C++ AOT kernel.
+    blk_m/blk_n: block sizes. blk_n=64 routes to the blk64 CuTe DSL kernel.
     use_block_sizes=False exercises the HasBlockSizes=false kernel path
     (block_sizes passed as None / empty tensor; all KV tokens treated as valid).
     Requires seqlen_k % blk_n == 0 so every KV block is fully populated.
@@ -256,8 +251,6 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
             if dtype not in (torch.bfloat16, torch.float16):
                 pytest.skip("SM120 blk64 supports bf16/fp16")
         else:
-            if not HAS_BLK64:
-                pytest.skip("bsa_fwd_blk64_ext not built")
             if nheads_kv != nheads:
                 pytest.skip("SM100 blk64 does not support GQA/MQA")
             if d != 128:
@@ -346,6 +339,17 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
         q_bhsd = q.transpose(1, 2).contiguous()
         k_bhsd = k.transpose(1, 2).contiguous()
         v_bhsd = v.transpose(1, 2).contiguous()
+        out_bhsd, lse_bhsd = bsa_attn_fwd_blk64(
+            q_bhsd,
+            k_bhsd,
+            v_bhsd,
+            q2k_block_index,
+            bs_arg,
+            bn_arg,
+            softmax_scale,
+            use_clc=use_clc,
+        )
+        out_from_blk64 = out_bhsd.transpose(1, 2).contiguous()
         if is_sm90_blk64 or is_sm120_blk64:
             out, lse = bsa_attn_fwd(
                 q,
@@ -358,32 +362,10 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
                 return_lse=True,
                 layout="bshd",
             )
-            out_bhsd, lse_bhsd = bsa_attn_fwd_blk64(
-                q_bhsd,
-                k_bhsd,
-                v_bhsd,
-                q2k_block_index,
-                bs_arg,
-                bn_arg,
-                softmax_scale,
-                use_clc=use_clc,
-            )
-            out_from_blk64 = out_bhsd.transpose(1, 2).contiguous()
             assert torch.equal(out_from_blk64, out)
             assert torch.equal(lse_bhsd, lse)
         else:
-            out_bhsd, lse = torch.ops.bsa_blk64.fwd(
-                q_bhsd,
-                k_bhsd,
-                v_bhsd,
-                q2k_block_index,
-                block_sparse_num,
-                bs_arg,
-                softmax_scale,
-                bn_arg,
-                use_clc,
-            )
-            out = out_bhsd.transpose(1, 2).contiguous()
+            out, lse = out_from_blk64, lse_bhsd
     else:
         out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes_kernel,
                                  q2k_block_nums=q2k_block_nums, return_lse=True, layout="bshd")
@@ -685,7 +667,7 @@ def run_quick_tests():
         for bs, sq, sk, hq, hk, d in configs_128:
             _test_single(bs, sq, sk, hq, hk, d)
 
-    if HAS_BLK64 and 64 in _BLK_SIZES:
+    if 64 in _BLK_SIZES:
         print("-" * 70)
         print("Quick correctness tests (blk64)")
         configs_64 = [
@@ -717,7 +699,7 @@ def run_quick_tests():
         for bs, sq, sk, hq, hk, d in var_configs_128:
             _test_single(bs, sq, sk, hq, hk, d, use_variable_block_nums=True)
 
-    if HAS_BLK64 and 64 in _BLK_SIZES:
+    if 64 in _BLK_SIZES:
         print("-" * 70)
         print("Variable block_sparse_num tests (blk64)")
         var_configs_64 = [
@@ -747,7 +729,7 @@ def run_quick_tests():
             _test_single(bs, sq, sk, hq, hk, d, use_variable_block_nums=use_var,
                           use_block_sizes=False)
 
-    if HAS_BLK64 and 64 in _BLK_SIZES:
+    if 64 in _BLK_SIZES:
         print("-" * 70)
         print("No-block_sizes tests (blk64)")
         no_bs_configs_64 = [
@@ -1054,13 +1036,12 @@ def test_sm90_blk64_split_kv_auto_api():
     torch.testing.assert_close(auto_lse, explicit_lse, rtol=2e-3, atol=2e-3)
 
 
-def test_sm100_blk64_kv_bucketed_matches_legacy():
+def test_sm100_blk64_split_kv_matches_single_kernel():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
     arch_major = torch.cuda.get_device_capability()[0]
-    if arch_major != 10:
-        pytest.skip("KV-bucketed blk64 fwd is SM100-only")
-    if not HAS_BLK64:
-        pytest.skip("bsa_fwd_blk64_ext is not built")
-
+    if arch_major not in (10, 11):
+        pytest.skip("split-KV CuTe DSL blk64 fwd is SM100/SM110-only")
     bs, h, sq, sk, d = 1, 4, 128, 512, 128
     blk = 64
     nq = sq // blk
@@ -1097,9 +1078,9 @@ def test_sm100_blk64_kv_bucketed_matches_legacy():
 @pytest.mark.skipif(
     not (
         torch.cuda.is_available()
-        and torch.cuda.get_device_capability()[0] >= 10
+        and torch.cuda.get_device_capability()[0] in (10, 11)
     ),
-    reason="SM100+ required",
+    reason="SM100/SM110 required",
 )
 def test_sm100_blk64_cutedsl_large_kv_batch_stride():
     batch, heads, seqlen_q, seqlen_k, head_dim = 2, 1, 64, 512, 128
@@ -1205,9 +1186,13 @@ def test_sm100_blk64_int64_kv_stride_selection():
     assert _sm100_blk64_requires_int64_kv_strides(block_at_limit, block_at_limit)
 
 
-@pytest.mark.skipif(not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10),
-                    reason="SM100+ required")
-@pytest.mark.skipif(not HAS_BLK64, reason="bsa_fwd_blk64_ext not built")
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] in (10, 11)
+    ),
+    reason="SM100/SM110 required",
+)
 def test_sm100_blk64_kv_bucketed_respects_fixed_block_sparse_num():
     bs, h, sq, sk, d = 1, 4, 128, 512, 128
     blk = 64
@@ -1234,7 +1219,7 @@ def test_sm100_blk64_kv_bucketed_respects_fixed_block_sparse_num():
 
     ref_out, ref_lse = bsa_attn_fwd_blk64(
         q_bhsd, k_bhsd, v_bhsd, q2k_compact, block_sizes, empty_nums)
-    for kv_splits in (1, 2, 4):
+    for kv_splits in (1, 2, 4, 8):
         out, lse = bsa_attn_fwd_blk64(
             q_bhsd,
             k_bhsd,
@@ -1249,10 +1234,14 @@ def test_sm100_blk64_kv_bucketed_respects_fixed_block_sparse_num():
         torch.testing.assert_close(lse, ref_lse, rtol=5e-3, atol=3e-2)
 
 
-@pytest.mark.skipif(not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10),
-                    reason="SM100+ required")
-@pytest.mark.skipif(not HAS_BLK64, reason="bsa_fwd_blk64_ext not built")
-def test_sm100_blk64_auto_kv_splits_api():
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] in (10, 11)
+    ),
+    reason="SM100/SM110 required",
+)
+def test_sm100_blk64_auto_kv_splits_api(monkeypatch):
     bs, h, sq, sk, d = 1, 4, 128, 512, 128
     blk = 64
     nq = sq // blk
@@ -1270,8 +1259,20 @@ def test_sm100_blk64_auto_kv_splits_api():
     empty_nums = torch.empty(0, device=device, dtype=torch.int32)
     block_sizes = torch.full((nkv,), blk, device=device, dtype=torch.int32)
 
+    monkeypatch.setattr(
+        bsa_interface,
+        "_sm100_blk64_auto_kv_splits",
+        lambda *args, **kwargs: 2,
+    )
     ref_out, ref_lse = bsa_attn_fwd_blk64(
-        q_bhsd, k_bhsd, v_bhsd, q2k_block_index, block_sizes, empty_nums)
+        q_bhsd,
+        k_bhsd,
+        v_bhsd,
+        q2k_block_index,
+        block_sizes,
+        empty_nums,
+        kv_splits=2,
+    )
     out, lse = bsa_attn_fwd_blk64(
         q_bhsd,
         k_bhsd,
@@ -1355,10 +1356,6 @@ def run_benchmark_suite():
 
     for blk_n in _BLK_SIZES:
         blk_m = 64 if blk_n == 64 else 128
-        if blk_n == 64 and not HAS_BLK64:
-            print(f"[blk{blk_n}] skipped (not built)")
-            continue
-
         use_clc_settings = [False, True] if blk_n == 64 else [False]
         if blk_n == 64:
             header = f"{'clc off TFLOPS':>14} {'clc on TFLOPS':>14}"
@@ -1471,10 +1468,6 @@ def run_profile():
 
     for blk_n in _BLK_SIZES:
         blk_m = 64 if blk_n == 64 else 128
-        if blk_n == 64 and not HAS_BLK64:
-            print(f"[blk{blk_n}] skipped (not built)")
-            continue
-
         q = torch.randn(bs, nheads, seqlen, hdim, device="cuda", dtype=dtype)
         k = torch.randn(bs, nheads, seqlen, hdim, device="cuda", dtype=dtype)
         v = torch.randn(bs, nheads, seqlen, hdim, device="cuda", dtype=dtype)

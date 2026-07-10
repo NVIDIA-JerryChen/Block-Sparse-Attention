@@ -284,3 +284,41 @@ out = bsa_fp8_blk64_fwd(
     q8, k8, v8, q_scale, k_scale, v_scale, q2k_block_index, topk
 )
 ```
+
+## 2026-07-09：合并 master 后的 CUTLASS DSL 4.5.2 复验
+
+将 `origin/master` 的统一 CuTe DSL wheel 打包路径合入 `bsa_fp8` 后，在最终
+工作树和 `nvidia-cutlass-dsl==4.5.2` 下重新验证。wheel 元数据限制为
+`nvidia-cutlass-dsl>=4.5.2,<4.6`，从隔离安装目录导入
+`bsa_fp8_blk64_fwd` 和 `quantize_sage_bhsd` 通过；FP8/量化测试再次为
+`40/40` 通过。CuTe DSL compile-key/SM120 AOT 定向测试为 20 passed、
+9 skipped，SM100 blk64 split/unified-dispatch 的 3 个定向测试全部通过。
+
+性能仍使用未修改的客户十组脚本，只将 `quantize_sage` 替换为公开的直接
+BHSD API。每组保持 5 次 warmup、20 次 CUDA-event 计时，连续运行两轮。
+下表是两轮 median 的算术平均；`SpeedK` 和 `Speed+Q` 由平均延迟重新计算：
+
+| 配置 | BF16 ms | FP8 kernel ms | Quant ms | SpeedK | Speed+Q |
+|---|---:|---:|---:|---:|---:|
+| 368P-30s-H4 | 2.405 | 2.077 | 0.206 | 1.158x | 1.054x |
+| 368P-30s-H8 | 5.508 | 3.772 | 0.346 | 1.460x | 1.338x |
+| 480P-15s-H4 | 2.081 | 1.776 | 0.216 | 1.171x | 1.044x |
+| 480P-15s-H8 | 4.614 | 3.425 | 0.356 | 1.347x | 1.220x |
+| 480P-30s-H4 | 9.793 | 6.053 | 0.377 | 1.618x | 1.523x |
+| 480P-30s-H8 | 20.198 | 11.881 | 0.706 | 1.700x | 1.605x |
+| 720P-15s-H4 | 26.325 | 16.176 | 0.600 | 1.627x | 1.569x |
+| 720P-15s-H8 | 52.627 | 32.831 | 1.127 | 1.603x | 1.550x |
+| 720P-30s-H4 | 103.151 | 66.047 | 1.059 | 1.562x | 1.537x |
+| 720P-30s-H8 | 206.135 | 132.117 | 1.984 | 1.560x | 1.537x |
+
+- Run 1：`SpeedK=1.46716x`，`Speed+Q=1.38111x`。
+- Run 2：`SpeedK=1.47012x`，`Speed+Q=1.38082x`。
+- 两轮综合：`SpeedK=1.46864x`，`Speed+Q=1.38097x`，量化耗时几何平均
+  `0.53915 ms`。
+- 两轮都是 10/10 行 `Speed+Q > 1`；最小值分别为 `1.042x` 和 `1.041x`。
+- 相对上一轮记录的 `1.487x/1.398x`，两项几何平均分别变化 `-1.23%` 和
+  `-1.22%`，在预设的 3% 复验波动门槛内。
+
+环境为 NVIDIA B300 SXM6 AC（SM103）、driver 595.58.03、PyTorch
+`2.12.0a0+5aff3928d8.nv26.05`、CUDA 13.2、CUTLASS DSL 4.5.2。两轮开始前
+GPU 均为 0 MiB、0% utilization，第二轮结束后也恢复为 0 MiB、0%。
