@@ -43,6 +43,7 @@ SM120_AOT_ARGS ?=
 wheel:
 	mkdir -p $(WHEEL_DIR)
 	rm -f $(WHEEL_DIR)/block_sparse_attention-*.whl
+	rm -rf build/lib/ block_sparse_attention.egg-info/
 	$(PYTHON) -m pip wheel . --no-deps --wheel-dir $(WHEEL_DIR)
 
 setup: wheel

@@ -8,7 +8,7 @@ import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.hopper_helpers as hopper_helpers
 from cutlass._mlir.dialects import math as _math
-from csrc.utils.batched_static_scheduler import (
+from block_sparse_attention.csrc.utils.batched_static_scheduler import (
     BatchedStaticSchedulerMixin,
     BatchedStaticWorkDesc,
 )

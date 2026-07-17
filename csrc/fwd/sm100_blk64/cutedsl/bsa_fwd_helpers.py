@@ -8,8 +8,8 @@ from cutlass import Float32, Int32, Uint32, Boolean, const_expr
 from cutlass.cutlass_dsl import T
 from cutlass._mlir.dialects import llvm
 
-from csrc.utils import mma_sm100_desc as sm100_desc
-from csrc.utils.tcgen05_mma_helpers import i64_to_i32x2
+from block_sparse_attention.csrc.utils import mma_sm100_desc as sm100_desc
+from block_sparse_attention.csrc.utils.tcgen05_mma_helpers import i64_to_i32x2
 
 
 @cute.jit

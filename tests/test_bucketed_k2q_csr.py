@@ -1,12 +1,12 @@
 import pytest
 import torch
 
-from bsa_attn_interface import _build_bucketed_k2q_csr
-from csrc.bwd.bucketed_k2q_csr import (
+from block_sparse_attention.bsa_attn_interface import _build_bucketed_k2q_csr
+from block_sparse_attention.csrc.bwd.bucketed_k2q_csr import (
     _bucketed_k2q_csr_compile_key,
     build_bucketed_k2q_csr_cutedsl,
 )
-from utils.cache_utils import JITCache
+from block_sparse_attention.utils.cache_utils import JITCache
 
 
 def _reference_bucketed_k2q(

@@ -15,33 +15,33 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.pipeline import PipelineAsync
 
-from csrc.utils import layout_utils
-from csrc.utils import kernel_utils as utils
-from csrc.utils.cute_dsl_utils import (
+from block_sparse_attention.csrc.utils import layout_utils
+from block_sparse_attention.csrc.utils import kernel_utils as utils
+from block_sparse_attention.csrc.utils.cute_dsl_utils import (
     assume_tensor_aligned,
     get_broadcast_dims,
     to_cute_tensor,
     torch2cute_dtype_map,
 )
-from csrc.utils import copy_utils
-from csrc.utils import pipeline
-from csrc.utils.tcgen05_mma_helpers import gemm_w_idx, gemm_ptx_w_idx
-from csrc.utils.seqlen_info import SeqlenInfoQK
-from csrc.utils.block_info import BlockInfo
-from csrc.bwd.bsa_bwd_prepost import (
+from block_sparse_attention.csrc.utils import copy_utils
+from block_sparse_attention.csrc.utils import pipeline
+from block_sparse_attention.csrc.utils.tcgen05_mma_helpers import gemm_w_idx, gemm_ptx_w_idx
+from block_sparse_attention.csrc.utils.seqlen_info import SeqlenInfoQK
+from block_sparse_attention.csrc.utils.block_info import BlockInfo
+from block_sparse_attention.csrc.bwd.bsa_bwd_prepost import (
     _bwd_postprocess_convert,
     _bwd_preprocess,
     _get_device_arch,
 )
-from csrc.utils.cute_dsl_utils import ParamsBase, sub_packed_f32x2
-from csrc.utils.tile_scheduler import (
+from block_sparse_attention.csrc.utils.cute_dsl_utils import ParamsBase, sub_packed_f32x2
+from block_sparse_attention.csrc.utils.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
 )
 
-from csrc.utils.named_barrier import NamedBarrierBwdSm100
-from utils.cache_utils import get_jit_cache
-from utils.testing import is_fake_mode
+from block_sparse_attention.csrc.utils.named_barrier import NamedBarrierBwdSm100
+from block_sparse_attention.utils.cache_utils import get_jit_cache
+from block_sparse_attention.utils.testing import is_fake_mode
 
 
 class BsaK2qCsrTensors(NamedTuple):

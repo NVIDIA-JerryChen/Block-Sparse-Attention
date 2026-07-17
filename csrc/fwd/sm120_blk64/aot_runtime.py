@@ -7,8 +7,8 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
-import utils.cache_utils  # noqa: F401  # Preload runtime symbols for AOT modules.
-from csrc.fwd.sm120_blk64.aot_utils import (
+import block_sparse_attention.utils.cache_utils  # noqa: F401  # Preload runtime symbols for AOT modules.
+from block_sparse_attention.csrc.fwd.sm120_blk64.aot_utils import (
     SM120_AOT_MANIFEST,
     Sm120AotVariant,
     compute_sm120_aot_source_fingerprint,

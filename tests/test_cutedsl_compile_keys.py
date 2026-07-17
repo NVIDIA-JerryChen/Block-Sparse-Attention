@@ -3,17 +3,17 @@ import math
 import pytest
 import torch
 
-from bsa_attn_interface import (
+from block_sparse_attention import bsa_attn_fwd
+from block_sparse_attention.bsa_attn_interface import (
     _bsa_fwd_blk64_kv_bucketed_combine_compile_key,
     _bsa_attn_fwd_sm90_blk64,
     _bsa_attn_fwd_sm120_blk64,
     _dynamic_tensors_compile_key,
     _sm90_bwd_compile_key,
     _sm120_fwd_compile_key,
-    bsa_attn_fwd,
 )
-from csrc.bwd.bsa_bwd_prepost import _bwd_preprocess_compile_key
-from utils.cache_utils import JITCache
+from block_sparse_attention.csrc.bwd.bsa_bwd_prepost import _bwd_preprocess_compile_key
+from block_sparse_attention.utils.cache_utils import JITCache
 
 
 def _make_sm90_bwd_tensors(batch: int, heads: int, seqlen_q: int, seqlen_k: int):

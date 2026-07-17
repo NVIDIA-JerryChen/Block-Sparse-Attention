@@ -24,26 +24,26 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
-from csrc.utils import quack_compat  # noqa: F401
-from csrc.utils import copy_utils, layout_utils
+from block_sparse_attention.csrc.utils import quack_compat  # noqa: F401
+from block_sparse_attention.csrc.utils import copy_utils, layout_utils
 
-from csrc.utils.cute_dsl_utils import assume_tensor_aligned
-from csrc.utils import kernel_utils as utils
-from csrc.utils import pipeline as pipeline_custom
-from csrc.utils.softmax import SoftmaxSm100
-from csrc.utils.seqlen_info import SeqlenInfoQK
-from csrc.utils.pack_gqa import PackGQA, pack_gqa_layout
-from csrc.fwd.sm100_blk64.cutedsl import bsa_fwd_helpers
-from csrc.utils.named_barrier import NamedBarrierFwdSm100
-from csrc.utils.cute_dsl_utils import ParamsBase
+from block_sparse_attention.csrc.utils.cute_dsl_utils import assume_tensor_aligned
+from block_sparse_attention.csrc.utils import kernel_utils as utils
+from block_sparse_attention.csrc.utils import pipeline as pipeline_custom
+from block_sparse_attention.csrc.utils.softmax import SoftmaxSm100
+from block_sparse_attention.csrc.utils.seqlen_info import SeqlenInfoQK
+from block_sparse_attention.csrc.utils.pack_gqa import PackGQA, pack_gqa_layout
+from block_sparse_attention.csrc.fwd.sm100_blk64.cutedsl import bsa_fwd_helpers
+from block_sparse_attention.csrc.utils.named_barrier import NamedBarrierFwdSm100
+from block_sparse_attention.csrc.utils.cute_dsl_utils import ParamsBase
 import cutlass.pipeline as cutlass_pipeline
-from csrc.utils.block_sparse_tile_scheduler import (
+from block_sparse_attention.csrc.utils.block_sparse_tile_scheduler import (
     TileSchedulerArguments,
     TileSchedulerProtocol,
     SchedulingMode,
     BlockSparsePersistentTileScheduler,
 )
-from csrc.utils.tile_scheduler import SingleTileScheduler
+from block_sparse_attention.csrc.utils.tile_scheduler import SingleTileScheduler
 
 
 class BlockSparseAttnForwardSm100Blk64:

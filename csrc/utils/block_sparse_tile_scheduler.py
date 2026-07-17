@@ -13,7 +13,7 @@ from .tile_scheduler import (
     TileSchedulerArguments,
     WorkTileInfo,
 )
-from csrc.utils.cute_dsl_utils import ParamsBase
+from block_sparse_attention.csrc.utils.cute_dsl_utils import ParamsBase
 
 
 @runtime_checkable

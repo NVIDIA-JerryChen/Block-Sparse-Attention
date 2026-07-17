@@ -26,27 +26,27 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 
-from csrc.utils import quack_compat  # noqa: F401
-from csrc.utils import (
+from block_sparse_attention.csrc.utils import quack_compat  # noqa: F401
+from block_sparse_attention.csrc.utils import (
     copy_utils,
     kernel_utils as utils,
     layout_utils,
     mma_sm100_desc as sm100_desc,
     pipeline as pipeline_custom,
 )
-from csrc.utils.tcgen05_mma_helpers import i64_to_i32x2
-from csrc.utils.block_sparse_tile_scheduler import (
+from block_sparse_attention.csrc.utils.tcgen05_mma_helpers import i64_to_i32x2
+from block_sparse_attention.csrc.utils.block_sparse_tile_scheduler import (
     BlockSparsePersistentTileScheduler as StaticPersistentTileScheduler,
     TileSchedulerProtocol,
 )
-from csrc.utils.cute_dsl_utils import (
+from block_sparse_attention.csrc.utils.cute_dsl_utils import (
     ParamsBase,
     assume_tensor_aligned,
 )
-from csrc.utils.named_barrier import NamedBarrierFwdSm100
-from csrc.utils.pack_gqa import PackGQA, pack_gqa_layout
-from csrc.utils.softmax import SoftmaxSm100
-from csrc.utils.tile_scheduler import (
+from block_sparse_attention.csrc.utils.named_barrier import NamedBarrierFwdSm100
+from block_sparse_attention.csrc.utils.pack_gqa import PackGQA, pack_gqa_layout
+from block_sparse_attention.csrc.utils.softmax import SoftmaxSm100
+from block_sparse_attention.csrc.utils.tile_scheduler import (
     SchedulingMode,
     SingleTileScheduler,
     TileSchedulerArguments,

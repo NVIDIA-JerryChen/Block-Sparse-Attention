@@ -7,11 +7,10 @@ import cutlass
 import pytest
 import torch
 
-import bsa_attn_interface
-from bsa_attn_interface import bsa_attn_fwd_blk64
-from csrc.fwd.sm120_blk64.aot_build import build_sm120_aot_artifacts
-from csrc.fwd.sm120_blk64 import aot_runtime
-from csrc.fwd.sm120_blk64.aot_runtime import (
+from block_sparse_attention import bsa_attn_fwd, bsa_attn_interface
+from block_sparse_attention.csrc.fwd.sm120_blk64.aot_build import build_sm120_aot_artifacts
+from block_sparse_attention.csrc.fwd.sm120_blk64 import aot_runtime
+from block_sparse_attention.csrc.fwd.sm120_blk64.aot_runtime import (
     SM120_AOT_DIR_ENV,
     SM120_AOT_ONLY_ENV,
     Sm120AotArtifactError,
@@ -19,7 +18,7 @@ from csrc.fwd.sm120_blk64.aot_runtime import (
     get_sm120_aot_kernel,
 )
 
-from csrc.fwd.sm120_blk64.aot_utils import (
+from block_sparse_attention.csrc.fwd.sm120_blk64.aot_utils import (
     SM120_AOT_LAYOUT_MODE,
     SM120_AOT_MIN_CUTLASS_DSL_VERSION,
     SM120_AOT_SCHEMA_VERSION,
@@ -558,15 +557,17 @@ def _run_sm120_aot_runtime_case(
         device,
     )
 
-    out, lse = bsa_attn_fwd_blk64(
+    out, lse = bsa_attn_fwd(
         q,
         k,
         v,
         indices,
+        capacity,
         block_sizes,
-        block_nums,
+        q2k_block_nums=block_nums,
         kv_splits=1,
-        block_sparse_num=capacity,
+        return_lse=True,
+        sparse_block_size=64,
     )
     ref_out, ref_lse = _reference_sparse_attention(
         q,
@@ -651,13 +652,14 @@ def test_sm120_split_kv_is_disabled(monkeypatch):
     empty = torch.empty(0, dtype=torch.int32, device="cuda")
 
     with pytest.raises(AssertionError, match="does not support split-KV"):
-        bsa_attn_fwd_blk64(
+        bsa_attn_fwd(
             q,
             k,
             v,
             indices,
+            1,
             empty,
-            empty,
+            q2k_block_nums=empty,
             kv_splits=2,
-            block_sparse_num=1,
+            sparse_block_size=64,
         )

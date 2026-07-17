@@ -13,14 +13,14 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass import Float32, const_expr
 from cutlass.utils import LayoutEnum
 
-from csrc.utils import copy_utils, layout_utils
+from block_sparse_attention.csrc.utils import copy_utils, layout_utils
 
-from csrc.utils import kernel_utils as utils
-from csrc.utils.cute_dsl_utils import assume_tensor_aligned
-from csrc.utils.seqlen_info import SeqlenInfoQK
+from block_sparse_attention.csrc.utils import kernel_utils as utils
+from block_sparse_attention.csrc.utils.cute_dsl_utils import assume_tensor_aligned
+from block_sparse_attention.csrc.utils.seqlen_info import SeqlenInfoQK
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
-from csrc.utils.cute_dsl_utils import ParamsBase
-from csrc.utils.tile_scheduler import (
+from block_sparse_attention.csrc.utils.cute_dsl_utils import ParamsBase
+from block_sparse_attention.csrc.utils.tile_scheduler import (
     SingleTileScheduler,
     SingleTileVarlenScheduler,
     TileSchedulerArguments,

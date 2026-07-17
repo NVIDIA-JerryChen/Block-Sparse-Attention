@@ -20,14 +20,4 @@ dependencies = [
 test = ["pytest"]
 
 [tool.setuptools]
-py-modules = ["bsa_attn_interface"]
 include-package-data = false
-
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["csrc*", "utils*"]
-exclude = [
-    "csrc.fwd.sm100_blk64.cpp*",
-    "csrc.fwd.sm100_blk64.instantiations*",
-]
-namespaces = true

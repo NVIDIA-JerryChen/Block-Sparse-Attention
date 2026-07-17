@@ -19,10 +19,10 @@ from cutlass.utils import (
     LayoutEnum,
 )
 
-from csrc.utils import copy_utils, kernel_utils as utils, layout_utils, pipeline, sm90_utils
-from csrc.utils.cute_dsl_utils import ParamsBase, assume_tensor_aligned
-from csrc.utils.sm90_utils import gemm_w_idx, gemm_zero_init
-from csrc.utils.tile_scheduler import SingleTileScheduler, TileSchedulerArguments, WorkTileInfo
+from block_sparse_attention.csrc.utils import copy_utils, kernel_utils as utils, layout_utils, pipeline, sm90_utils
+from block_sparse_attention.csrc.utils.cute_dsl_utils import ParamsBase, assume_tensor_aligned
+from block_sparse_attention.csrc.utils.sm90_utils import gemm_w_idx, gemm_zero_init
+from block_sparse_attention.csrc.utils.tile_scheduler import SingleTileScheduler, TileSchedulerArguments, WorkTileInfo
 
 SM90_BWD_SPARSE_BLOCK_SIZE = 64
 SM90_BWD_HEAD_DIM = 128

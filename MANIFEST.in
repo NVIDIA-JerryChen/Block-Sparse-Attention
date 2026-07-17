@@ -1,1 +1,2 @@
+include bsa_attn_interface.py
 prune csrc/fwd/sm100_blk64/cpp

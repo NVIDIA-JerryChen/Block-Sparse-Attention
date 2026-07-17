@@ -34,11 +34,9 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from bsa_attn_interface import (  # noqa: E402
+from block_sparse_attention import (  # noqa: E402
     bsa_attn_bwd,
     bsa_attn_fwd,
-    bsa_attn_fwd_blk64,
-    bsa_attn_fwd_blk64_cutedsl,
 )
 
 
@@ -186,6 +184,8 @@ def _make_fwd_kernel_call(
     block_sizes: torch.Tensor,
     topk: int,
 ) -> tuple[str, Callable[[], tuple[torch.Tensor, torch.Tensor]]]:
+    # The same callable prepares out/LSE for backward, so every path requests
+    # LSE explicitly instead of depending on input grad state.
     arch = _device_arch()
     arch_major = _device_arch_major()
     if arch_major == 9:
@@ -205,16 +205,18 @@ def _make_fwd_kernel_call(
         )
 
         def run_kernel() -> tuple[torch.Tensor, torch.Tensor]:
-            return bsa_attn_fwd_blk64(
+            return bsa_attn_fwd(
                 q,
                 k,
                 v,
                 q2k_block_index,
+                topk,
                 block_sizes_bh,
-                q2k_block_nums,
+                q2k_block_nums=q2k_block_nums,
+                return_lse=True,
                 layout="bhsd",
                 kv_splits="auto",
-                block_sparse_num=topk,
+                sparse_block_size=64,
             )
 
         return path_name, run_kernel
@@ -223,17 +225,19 @@ def _make_fwd_kernel_call(
         path_name = f"sm{arch}_blk64_cutedsl_fwd"
 
         def run_kernel() -> tuple[torch.Tensor, torch.Tensor]:
-            return bsa_attn_fwd_blk64_cutedsl(
+            return bsa_attn_fwd(
                 q,
                 k,
                 v,
                 q2k_block_index,
+                topk,
                 block_sizes,
                 q2k_block_nums=None,
-                block_sparse_num=topk,
+                return_lse=True,
                 layout="bhsd",
                 use_clc=None,
                 kv_splits="auto",
+                sparse_block_size=64,
             )
 
         return path_name, run_kernel
@@ -252,6 +256,7 @@ def _make_fwd_kernel_call(
             q2k_block_nums=None,
             return_lse=True,
             layout="bhsd",
+            sparse_block_size=128,
         )
 
     return path_name, run_kernel
@@ -291,6 +296,7 @@ def _make_bwd_kernel_call(
             dk=dk,
             dv=dv,
             layout="bhsd",
+            sparse_block_size=block_size,
         )
 
     return path_name, run_kernel
