@@ -4,7 +4,7 @@
 
 **Forward backends:**
 
-| | SM120 blk64 (CuTe DSL / AOT + JIT) | SM100 blk128 (CuTe DSL / JIT) | SM90 blk64 (CuTe DSL / JIT) | SM100/SM110 blk64 (CuTe DSL / JIT) |
+| | SM120 blk64 (CuTe DSL / AOT + JIT) | SM100 blk128 (CuTe DSL / JIT) | SM90 blk64 (CuTe DSL / AOT + JIT) | SM100/SM110 blk64 (CuTe DSL / JIT) |
 |---|---|---|---|---|
 | Dtype | bf16, fp16 | bf16, fp16 | bf16, fp16 | bf16 only |
 | Head dim | 128 only | 64, 96, 128 | 64, 96, 128 | 128 only |
@@ -41,15 +41,20 @@ BSA/
 ├── pyproject.toml                 # Unified wheel metadata
 ├── tests/
 │   ├── test_flash_fwd.py          # Forward tests & benchmarks (blk64 + blk128)
-│   └── test_flash_bwd.py          # Backward tests & benchmarks (blk64 + blk128)
+│   ├── test_flash_bwd.py          # Backward tests & benchmarks (blk64 + blk128)
+│   ├── test_sm90_aot.py           # SM90 producer/combine AOT validation
+│   └── test_sm120_aot.py          # SM120 forward AOT validation
 ├── requirements.txt               # Python dependencies
 ├── Makefile                       # Build & test automation
 │
 ├── csrc/fwd/
 │   ├── sm100_blk128/                 # blk128 — CuTe DSL / JIT compiled
 │   │   └── bsa_fwd_sm100.py          # Single-file Blackwell forward kernel
-│   ├── sm90_blk64/                   # blk64 — SM90 CuTe DSL / JIT compiled
-│   │   └── bsa_fwd_sm90.py           # Single-file Hopper forward kernel
+│   ├── sm90_blk64/                   # blk64 — SM90 CuTe DSL / AOT + JIT
+│   │   ├── bsa_fwd_sm90.py           # Hopper forward producer
+│   │   ├── aot_build.py              # Producer/combine offline builder
+│   │   ├── aot_runtime.py            # Manifest validation and runtime loader
+│   │   └── aot_utils.py              # Main/combine variant metadata
 │   ├── sm120_blk64/                  # blk64 — SM120 CuTe DSL / AOT + JIT
 │   │   ├── bsa_fwd_sm120.py          # SM120 forward kernel
 │   │   ├── aot_build.py              # Offline native-ABI artifact builder
@@ -101,7 +106,7 @@ BSA/
 - Python 3.10+
 - PyTorch 2.5+ built for the installed CUDA runtime
 - CUDA 13.0+
-- CuTe DSL (`nvidia-cutlass-dsl>=4.5.2` for the SM120 dynamic AOT ABI)
+- CuTe DSL (`nvidia-cutlass-dsl>=4.5.2` for the SM90/SM120 dynamic AOT ABI)
 
 ### Setup
 
@@ -130,12 +135,133 @@ wheel does not install top-level `csrc`, `utils`, or `bsa_attn_interface`
 modules. The source tree remains in its existing layout; the build configuration
 maps those files to their package-qualified installation paths.
 
+The wheel includes the SM90 and SM120 AOT builders and runtime loaders, but not
+generated `.o`, `.h`, or `.so` artifacts. On those architectures, a compatible
+artifact bundle is used when present; otherwise dispatch falls back to JIT unless
+the corresponding AOT-only mode is enabled.
+
 API migration note: the former `bsa_attn_fwd_blk64` and
 `bsa_attn_fwd_blk64_cutedsl` names are removed. Both unified entry points
 default to `sparse_block_size=64`; existing blk128 callers must pass
 `sparse_block_size=128` explicitly so their metadata is not reinterpreted.
 
 For an editable development install with tests, use `pip install -e '.[test]'`.
+
+### SM90 CuTe DSL AOT
+
+SM90 blk64 forward can be compiled offline for `sm_90a` and loaded through the
+CuTe native ABI. Split-KV bundles contain both the forward producer and the
+deduplicated combine kernel, so AOT-only execution does not invoke
+`cute.compile()` at either stage. The public attention API is unchanged.
+
+#### Supported configurations
+
+- Target: `sm_90a`
+- Dtype: BF16 and FP16
+- QK and value head dimensions: 64, 96, or 128 independently
+- Attention: MHA, GQA, and MQA
+- Block counts: fixed `block_sparse_num` or runtime `q2k_block_nums`
+- `block_sizes`: absent or present; input ranks 1/2/3 share one normalized ABI
+- Split-KV: exact `kv_splits` values from 1 through 256; the default bundle
+  contains 1, 2, 4, and 8
+- Minimum DSL version: `nvidia-cutlass-dsl>=4.5.2`
+
+Batch size, absolute head counts, sequence lengths, sparse-index capacity,
+active topK, and non-leading tensor strides are runtime dynamic. Dtype, QK/value
+dimensions, GQA ratio, `block_sizes` presence, exact split count, and the
+single-kernel empty-row specialization select the static forward variant. The
+combine variant is selected by dtype, value dimension, and
+`ceil(log2(kv_splits))`; one combine artifact can therefore serve multiple main
+variants.
+
+#### Build artifacts
+
+Build with the same CPU architecture, CUDA runtime, CUTLASS DSL version, and BSA
+source revision as the deployment environment.
+
+```bash
+# Default: Dq=Dv=128, bf16/fp16, common GQA ratios, split 1/2/4/8.
+make aot-sm90 SM90_AOT_DIR=/shared/bsa-sm90-aot
+
+# Build a deployment-specific subset, including non-default head dimensions.
+make aot-sm90 \
+  SM90_AOT_DIR=/shared/bsa-sm90-aot \
+  SM90_AOT_ARGS='--dtypes bf16 --qk-dims 64,128 --value-dims 128 --gqa-ratios 1,2,4 --kv-splits 1,2,4 --block-sizes both --allow-empty-block-nums both'
+
+# List main and deduplicated combine variants without compiling them.
+python -m csrc.fwd.sm90_blk64.aot_build --dry-run
+```
+
+The default matrix contains 140 main forward variants and 6 combine variants:
+
+- Main: 2 dtypes × 7 GQA ratios × 2 block-size modes ×
+  (`split1` empty-disabled/enabled + `split2/4/8` empty-disabled)
+- Combine: 2 dtypes × `logsplit` 1/2/3
+
+This covers every split count selected by `kv_splits="auto"`. Use
+`--qk-dims`, `--value-dims`, and `--kv-splits` to add deployment-specific
+variants rather than building the full Cartesian product.
+
+The output bundle is self-describing and contains both artifact classes:
+
+```text
+/shared/bsa-sm90-aot/
+└── x86_64/
+    └── sm_90a/
+        ├── manifest.json
+        ├── bsa_sm90_blk64_bf16_qk128_v128_gqa1_bs0_split1_empty0_dyn.o
+        ├── bsa_sm90_blk64_bf16_qk128_v128_gqa1_bs0_split1_empty0_dyn.h
+        ├── bsa_sm90_blk64_bf16_qk128_v128_gqa1_bs0_split1_empty0_dyn.so
+        ├── bsa_sm90_blk64_bf16_qk128_v128_gqa1_bs0_split4_empty0_dyn.so
+        ├── bsa_sm90_blk64_combine_bf16_v128_logsplit2_dyn.so
+        └── ...
+```
+
+The manifest stores main artifacts under `variants` and combine artifacts under
+`combine_variants`. It also records the CPU/GPU target, CUTLASS DSL and CUDA
+runtime versions, BSA source fingerprint, filenames, and `.so` SHA256 values.
+
+#### Deploy and load
+
+Set the artifact root before importing or calling BSA:
+
+```bash
+export BSA_SM90_AOT_DIR=/shared/bsa-sm90-aot
+
+# Require the complete producer/combine path to be precompiled.
+export BSA_SM90_AOT_ONLY=1
+```
+
+`BSA_SM90_AOT_DIR` may point to the bundle root shown above or directly to the
+directory containing `manifest.json`. If unset, BSA searches
+`csrc/fwd/sm90_blk64/aot_artifacts/<cpu-arch>/sm_90a/`.
+
+With `BSA_SM90_AOT_ONLY=1`, a missing main variant or required combine variant
+fails before JIT, and `cute.compile()` is never called. Without this flag, the
+main and combine stages independently fall back to their existing JIT caches.
+Manifest schema, version, source-fingerprint, and checksum failures always
+report an error rather than silently falling back.
+
+Current artifacts use the `dynamic_strided_nonbroadcast` layout class. Every
+ABI tensor's leading mode must have stride 1, and stride-0 broadcast tensors are
+not supported. Materialize tensors produced by `expand()` with `.contiguous()`
+before an AOT-only call. Other strides, BHSD/BSHD boundary layouts, and runtime
+sizes remain dynamic.
+
+#### Validate a deployment
+
+Build the variants required by the runtime matrix, then run:
+
+```bash
+BSA_SM90_AOT_DIR=/shared/bsa-sm90-aot \
+BSA_SM90_AOT_ONLY=1 \
+BSA_TEST_SM90_AOT_RUNTIME=1 \
+python -m pytest tests/test_sm90_aot.py -q
+```
+
+The runtime validation monkeypatches `cute.compile()` to fail and includes
+single-kernel, split producer/combine, mixed QK/value dimensions, GQA/MQA,
+block-size layouts, and empty-row cases.
 
 ### SM120 CuTe DSL AOT
 
@@ -454,6 +580,9 @@ constraints, and its split path does not use the CLC scheduler; auto split
 selection disables CLC for that path. SM120 does not build or dispatch a
 split-KV variant: `kv_splits=1` is the only accepted value, avoiding the
 split-dependent FP32 O/LSE workspace on memory-constrained devices.
+On SM90, a compatible AOT bundle supplies both the split producer and the
+deduplicated combine kernel; without matching artifacts, the two stages can
+fall back independently to JIT.
 
 ### `bsa_attn_bwd(dout, q, k, v, out, lse, q2k_block_index, block_sparse_num, block_sizes, ..., sparse_block_size=64)`
 
@@ -529,6 +658,7 @@ SM100/SM110 selects the blk64 or blk128 default from `sparse_block_size`. Pass
 ```bash
 make wheel                      # Build the unified CuTe DSL wheel
 make setup                      # Reinstall wheel after dependencies are provisioned
+make aot-sm90                   # Build the default 140 main + 6 combine SM90 matrix
 make aot-sm120                  # Build the default SM120 native-ABI AOT matrix
 make tt                         # Quick correctness test (default: blk128)
 make tt BLK=64                  # Quick test blk64 only
@@ -545,6 +675,12 @@ make help                       # Show all targets
 
 python test_flash_bwd.py                    # Backward quick correctness tests
 python test_flash_bwd.py benchmark          # Backward benchmark
+
+# On an SM90 deployment host after building the required AOT variants:
+BSA_SM90_AOT_DIR=/shared/bsa-sm90-aot \
+BSA_SM90_AOT_ONLY=1 \
+BSA_TEST_SM90_AOT_RUNTIME=1 \
+python -m pytest tests/test_sm90_aot.py -q
 
 # On an SM120 deployment host after building the required AOT variants:
 BSA_SM120_AOT_DIR=/shared/bsa-sm120-aot \

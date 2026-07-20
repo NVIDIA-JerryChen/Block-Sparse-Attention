@@ -137,6 +137,9 @@ def test_wheel_contains_single_import_package(built_wheel: Path) -> None:
     assert {
         "block_sparse_attention/__init__.py",
         "block_sparse_attention/bsa_attn_interface.py",
+        "block_sparse_attention/csrc/fwd/sm90_blk64/aot_build.py",
+        "block_sparse_attention/csrc/fwd/sm90_blk64/aot_runtime.py",
+        "block_sparse_attention/csrc/fwd/sm90_blk64/aot_utils.py",
         "block_sparse_attention/csrc/fwd/sm100_blk64/cutedsl/bsa_fwd_sm100.py",
         "block_sparse_attention/utils/cache_utils.py",
     } <= names
@@ -159,6 +162,9 @@ def test_sdist_contains_mapped_sources_without_legacy_cpp(built_sdist: Path) -> 
     assert {
         "block_sparse_attention/__init__.py",
         "bsa_attn_interface.py",
+        "csrc/fwd/sm90_blk64/aot_build.py",
+        "csrc/fwd/sm90_blk64/aot_runtime.py",
+        "csrc/fwd/sm90_blk64/aot_utils.py",
         "csrc/fwd/sm100_blk64/cutedsl/bsa_fwd_sm100.py",
         "setup.py",
         "utils/cache_utils.py",
@@ -197,6 +203,9 @@ from block_sparse_attention import (
     bsa_attn_bwd,
     bsa_attn_fwd,
 )
+from block_sparse_attention.csrc.fwd.sm90_blk64.aot_utils import (
+    compute_sm90_aot_source_fingerprint,
+)
 from block_sparse_attention.csrc.fwd.sm120_blk64.aot_utils import (
     compute_sm120_aot_source_fingerprint,
 )
@@ -218,6 +227,7 @@ for old_name in ("bsa_attn_fwd_blk64", "bsa_attn_fwd_blk64_cutedsl"):
 
 for module_name in (
     "block_sparse_attention.csrc.bwd.sm90_blk64.bsa_bwd_sm90",
+    "block_sparse_attention.csrc.fwd.sm90_blk64.aot_runtime",
     "block_sparse_attention.csrc.fwd.sm100_blk128.bsa_fwd_sm100",
     "block_sparse_attention.csrc.fwd.sm120_blk64.aot_runtime",
     "block_sparse_attention.utils.cache_utils",
@@ -231,6 +241,12 @@ aot_fingerprint = compute_sm120_aot_source_fingerprint()
 assert len(aot_fingerprint) == 64
 assert compute_sm120_aot_source_fingerprint(package_file.parent) == aot_fingerprint
 assert install_dir in package_file.parents
+sm90_aot_fingerprint = compute_sm90_aot_source_fingerprint()
+assert len(sm90_aot_fingerprint) == 64
+assert (
+    compute_sm90_aot_source_fingerprint(package_file.parent)
+    == sm90_aot_fingerprint
+)
 """
     env = os.environ.copy()
     env["PYTHONPATH"] = str(install_dir)
@@ -284,7 +300,8 @@ from block_sparse_attention import (
     bsa_attn_bwd,
     bsa_attn_fwd,
 )
-from block_sparse_attention.csrc.fwd.sm120_blk64 import aot_utils
+from block_sparse_attention.csrc.fwd.sm90_blk64 import aot_utils as sm90_aot_utils
+from block_sparse_attention.csrc.fwd.sm120_blk64 import aot_utils as sm120_aot_utils
 from block_sparse_attention.utils import cache_utils
 
 for api in (
@@ -302,7 +319,8 @@ assert Path(block_sparse_attention.__file__).resolve() == (
     source_dir / "block_sparse_attention" / "__init__.py"
 )
 assert Path(interface.__file__).resolve() == source_dir / "bsa_attn_interface.py"
-assert source_dir / "csrc" in Path(aot_utils.__file__).resolve().parents
+assert source_dir / "csrc" in Path(sm90_aot_utils.__file__).resolve().parents
+assert source_dir / "csrc" in Path(sm120_aot_utils.__file__).resolve().parents
 assert source_dir / "utils" in Path(cache_utils.__file__).resolve().parents
 """
     env = os.environ.copy()

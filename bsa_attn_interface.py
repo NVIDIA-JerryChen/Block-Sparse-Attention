@@ -24,6 +24,18 @@ from block_sparse_attention.csrc.fwd.sm90_blk64.bsa_fwd_sm90 import (
     BlockSparseAttnForwardSm90Blk64,
     SM90_FWD_BLOCK_SIZE,
 )
+from block_sparse_attention.csrc.fwd.sm90_blk64.aot_runtime import (
+    get_sm90_aot_combine_kernel,
+    get_sm90_aot_kernel,
+)
+from block_sparse_attention.csrc.fwd.sm90_blk64.aot_utils import (
+    SM90_AOT_COMBINE_K_BLOCK_SIZE,
+    SM90_AOT_COMBINE_NUM_THREADS,
+    SM90_AOT_COMBINE_STAGES,
+    SM90_AOT_COMBINE_TILE_M,
+    Sm90AotCombineVariant,
+    Sm90AotVariant,
+)
 from block_sparse_attention.csrc.fwd.sm120_blk64.bsa_fwd_sm120 import (
     BlockSparseAttnForwardSm120Blk64,
     SM120_FWD_BLOCK_SIZE,
@@ -117,8 +129,14 @@ def _to_cute_tensor_dynamic_compact_shape(
     leading_dim: int = -1,
     divisibility: int = 1,
     stride_order: tuple[int, ...] | None = None,
+    enable_tvm_ffi: bool = True,
 ) -> cute.Tensor:
-    tensor = _to_cute_tensor(t, assumed_align=assumed_align, leading_dim=leading_dim)
+    tensor = _to_cute_tensor(
+        t,
+        assumed_align=assumed_align,
+        leading_dim=leading_dim,
+        enable_tvm_ffi=enable_tvm_ffi,
+    )
     if isinstance(mode, int):
         mode = (mode,)
     stride_order = t.dim_order() if stride_order is None else stride_order
@@ -327,6 +345,37 @@ def _sm120_fwd_compile_key(
     )
 
 
+def _sm90_fwd_compile_key(
+    arch: int,
+    dtype: torch.dtype,
+    head_dim: int,
+    value_dim: int,
+    gqa_ratio: int,
+    has_block_sizes: bool,
+    kv_splits: int,
+    allow_empty_block_nums: bool,
+    tensors: tuple[torch.Tensor, ...],
+):
+    """Build the SM90 key from static features and dynamic tensor ABI parts."""
+    assert len(tensors) == 9
+    return _dynamic_tensors_compile_key(
+        "sm90_blk64_fwd",
+        (
+            int(arch),
+            dtype,
+            int(head_dim),
+            int(value_dim),
+            int(gqa_ratio),
+            SM90_FWD_BLOCK_SIZE,
+            bool(has_block_sizes),
+            int(kv_splits),
+            bool(allow_empty_block_nums),
+        ),
+        tensors,
+        leading_dims=(1, 1, 0, 1, 0, 0, 0, 0, 0),
+    )
+
+
 def _resolve_sm120_fwd_callable(
     variant: Sm120AotVariant,
     device_arch: int,
@@ -337,6 +386,27 @@ def _resolve_sm120_fwd_callable(
     compile_cache,
 ):
     aot_kernel = get_sm120_aot_kernel(
+        variant,
+        device_arch,
+        runtime_tensors,
+    )
+    if aot_kernel is not None:
+        return aot_kernel
+    if compile_key not in compile_cache:
+        compile_cache[compile_key] = cute.compile(fwd_kernel, *args)
+    return compile_cache[compile_key]
+
+
+def _resolve_sm90_fwd_callable(
+    variant: Sm90AotVariant,
+    device_arch: int,
+    runtime_tensors: tuple[torch.Tensor, ...],
+    compile_key: tuple,
+    fwd_kernel,
+    args: tuple,
+    compile_cache,
+):
+    aot_kernel = get_sm90_aot_kernel(
         variant,
         device_arch,
         runtime_tensors,
@@ -764,31 +834,27 @@ def _bsa_attn_fwd_sm90_blk64(
         allow_empty_block_nums=allow_empty_block_nums,
     )
 
-    compile_key = _dynamic_tensors_compile_key(
-        "sm90_blk64_fwd",
-        (
-            _get_device_arch(),
-            q.dtype,
-            head_dim,
-            v.shape[-1],
-            gqa_ratio,
-            SM90_FWD_BLOCK_SIZE,
-            has_block_sizes,
-            kv_splits,
-            allow_empty_block_nums,
-        ),
-        (
-            q_t,
-            k_t,
-            v_t,
-            out_t,
-            lse_t,
-            q2k_t,
-            q2k_nums_t,
-            block_sizes_t if has_block_sizes else q2k_nums_t,
-            split_offsets_t if split_offsets_t is not None else q2k_nums_t,
-        ),
-        leading_dims=(1, 1, 0, 1, 0, 0, 0, 0, 0),
+    runtime_tensors = (
+        q_t,
+        k_t,
+        v_t,
+        out_t,
+        lse_t,
+        q2k_t,
+        q2k_nums_t,
+        block_sizes_t if has_block_sizes else q2k_nums_t,
+        split_offsets_t if split_offsets_t is not None else q2k_nums_t,
+    )
+    compile_key = _sm90_fwd_compile_key(
+        _get_device_arch(),
+        q.dtype,
+        head_dim,
+        v.shape[-1],
+        gqa_ratio,
+        has_block_sizes,
+        kv_splits,
+        allow_empty_block_nums,
+        runtime_tensors,
     )
     args = (
         q_cute,
@@ -803,12 +869,28 @@ def _bsa_attn_fwd_sm90_blk64(
         softmax_scale,
         current_stream,
     )
-    if compile_key not in bsa_attn_fwd.compile_cache:
-        bsa_attn_fwd.compile_cache[compile_key] = cute.compile(fwd_kernel, *args)
+    variant = Sm90AotVariant(
+        dtype="bf16" if q.dtype == torch.bfloat16 else "fp16",
+        qk_dim=head_dim,
+        value_dim=v.shape[-1],
+        gqa_ratio=gqa_ratio,
+        has_block_sizes=has_block_sizes,
+        kv_splits=kv_splits,
+        allow_empty_block_nums=allow_empty_block_nums,
+    )
+    launch_kernel = _resolve_sm90_fwd_callable(
+        variant,
+        _get_device_arch(),
+        runtime_tensors,
+        compile_key,
+        fwd_kernel,
+        args,
+        bsa_attn_fwd.compile_cache,
+    )
 
     if not is_fake_mode():
         with torch.cuda.nvtx.range("bsa_attn_fwd_sm90_blk64_kernel"):
-            bsa_attn_fwd.compile_cache[compile_key](*args)
+            launch_kernel(*args)
 
     if is_split_kv:
         return _combine_blk64_kv_bucketed_partials(q, out, lse, kv_splits)
@@ -1005,6 +1087,52 @@ def _bsa_attn_fwd_sm120_blk64(
     return out, lse
 
 
+def _make_blk64_combine_cute_args(
+    o_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out_bshd: torch.Tensor,
+    lse_bsh: torch.Tensor,
+    current_stream,
+    *,
+    enable_tvm_ffi: bool,
+) -> tuple:
+    return (
+        _to_cute_tensor_dynamic_compact_shape(
+            o_partial,
+            mode=(0, 1, 2, 3),
+            stride_order=(1, 0, 3, 2, 4),
+            enable_tvm_ffi=enable_tvm_ffi,
+        ),
+        _to_cute_tensor_dynamic_compact_shape(
+            lse_partial,
+            mode=(0, 1, 2, 3),
+            assumed_align=4,
+            leading_dim=2,
+            stride_order=(1, 0, 3, 2),
+            enable_tvm_ffi=enable_tvm_ffi,
+        ),
+        _to_cute_tensor_dynamic_compact_shape(
+            out_bshd,
+            mode=(0, 1, 2),
+            stride_order=(0, 1, 2, 3),
+            enable_tvm_ffi=enable_tvm_ffi,
+        ),
+        _to_cute_tensor_dynamic_compact_shape(
+            lse_bsh,
+            mode=(0, 1, 2),
+            assumed_align=4,
+            stride_order=(0, 1, 2),
+            enable_tvm_ffi=enable_tvm_ffi,
+        ),
+        None,
+        None,
+        None,
+        None,
+        None,
+        current_stream,
+    )
+
+
 def _combine_blk64_kv_bucketed_partials(
     q: torch.Tensor,
     o_partial_phys: torch.Tensor,
@@ -1012,12 +1140,6 @@ def _combine_blk64_kv_bucketed_partials(
     kv_splits: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Combine KV-bucketed partial outputs using the shared CuTeDSL combine kernel."""
-    if BlockSparseAttnForwardCombine is None:
-        raise ImportError(
-            "BlockSparseAttnForwardCombine is unavailable. Ensure local CuTe "
-            "helpers are importable."
-        )
-
     kv_splits = int(kv_splits)
     assert 1 <= kv_splits <= 256, "kv_splits must be in [1, 256]"
 
@@ -1059,86 +1181,90 @@ def _combine_blk64_kv_bucketed_partials(
     dtype = torch2cute_dtype_map[q.dtype]
     log_max_splits = _ceil_log2_int(kv_splits)
     # Baseline combine geometry; a single configuration is easier to maintain.
-    combine_tile_m = 16
-    combine_k_block_size = 64
-    combine_num_threads = 128
-    combine_stages = 4
+    combine_tile_m = SM90_AOT_COMBINE_TILE_M
+    combine_k_block_size = SM90_AOT_COMBINE_K_BLOCK_SIZE
+    combine_num_threads = SM90_AOT_COMBINE_NUM_THREADS
+    combine_stages = SM90_AOT_COMBINE_STAGES
 
     current_stream = (
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         if is_fake_mode()
         else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     )
-    compile_key = _bsa_fwd_blk64_kv_bucketed_combine_compile_key(
-        _get_device_arch(),
-        dtype,
-        head_dim,
-        combine_tile_m,
-        combine_k_block_size,
-        log_max_splits,
-        combine_num_threads,
-        combine_stages,
-    )
-    if compile_key not in _combine_blk64_kv_bucketed_partials.compile_cache:
-        combine_kernel = BlockSparseAttnForwardCombine(
-            dtype=dtype,
-            head_dim=head_dim,
-            tile_m=combine_tile_m,
-            k_block_size=combine_k_block_size,
+    device_arch = _get_device_arch()
+    aot_kernel = None
+    if device_arch == 90:
+        combine_variant = Sm90AotCombineVariant(
+            dtype="bf16" if q.dtype == torch.bfloat16 else "fp16",
+            value_dim=head_dim,
             log_max_splits=log_max_splits,
-            num_threads=combine_num_threads,
-            stages=combine_stages,
         )
-        args = (
-            _to_cute_tensor_dynamic_compact_shape(
-                o_partial,
-                mode=(0, 1, 2, 3),
-                stride_order=(1, 0, 3, 2, 4),
-            ),
-            _to_cute_tensor_dynamic_compact_shape(
-                lse_partial,
-                mode=(0, 1, 2, 3),
-                assumed_align=4,
-                leading_dim=2,
-                stride_order=(1, 0, 3, 2),
-            ),
-            _to_cute_tensor_dynamic_compact_shape(
-                out_bshd,
-                mode=(0, 1, 2),
-                stride_order=(0, 1, 2, 3),
-            ),
-            _to_cute_tensor_dynamic_compact_shape(
-                lse_bsh,
-                mode=(0, 1, 2),
-                assumed_align=4,
-                stride_order=(0, 1, 2),
-            ),
-            None,
-            None,
-            None,
-            None,
-            None,
-            current_stream,
-        )
-        _combine_blk64_kv_bucketed_partials.compile_cache[compile_key] = cute.compile(
-            combine_kernel,
-            *args,
-            options="--enable-tvm-ffi",
-        )
+        aot_kernel = get_sm90_aot_combine_kernel(combine_variant, device_arch)
 
-    if not is_fake_mode():
-        _combine_blk64_kv_bucketed_partials.compile_cache[compile_key](
-            o_partial,
-            lse_partial,
-            out_bshd,
-            lse_bsh,
-            None,
-            None,
-            None,
-            None,
-            None,
-            current_stream,
+    if aot_kernel is not None:
+        if not is_fake_mode():
+            native_args = _make_blk64_combine_cute_args(
+                o_partial,
+                lse_partial,
+                out_bshd,
+                lse_bsh,
+                current_stream,
+                enable_tvm_ffi=False,
+            )
+            aot_kernel(*native_args)
+    else:
+        if BlockSparseAttnForwardCombine is None:
+            raise ImportError(
+                "BlockSparseAttnForwardCombine is unavailable. Ensure local "
+                "CuTe helpers are importable."
+            )
+        compile_key = _bsa_fwd_blk64_kv_bucketed_combine_compile_key(
+            device_arch,
+            dtype,
+            head_dim,
+            combine_tile_m,
+            combine_k_block_size,
+            log_max_splits,
+            combine_num_threads,
+            combine_stages,
         )
+        if compile_key not in _combine_blk64_kv_bucketed_partials.compile_cache:
+            combine_kernel = BlockSparseAttnForwardCombine(
+                dtype=dtype,
+                head_dim=head_dim,
+                tile_m=combine_tile_m,
+                k_block_size=combine_k_block_size,
+                log_max_splits=log_max_splits,
+                num_threads=combine_num_threads,
+                stages=combine_stages,
+            )
+            jit_args = _make_blk64_combine_cute_args(
+                o_partial,
+                lse_partial,
+                out_bshd,
+                lse_bsh,
+                current_stream,
+                enable_tvm_ffi=True,
+            )
+            _combine_blk64_kv_bucketed_partials.compile_cache[compile_key] = cute.compile(
+                combine_kernel,
+                *jit_args,
+                options="--enable-tvm-ffi",
+            )
+
+        if not is_fake_mode():
+            _combine_blk64_kv_bucketed_partials.compile_cache[compile_key](
+                o_partial,
+                lse_partial,
+                out_bshd,
+                lse_bsh,
+                None,
+                None,
+                None,
+                None,
+                None,
+                current_stream,
+            )
 
     # Combine writes its native BSHD/BSH layout. Return BHSD/BHS views without D2D.
     out = out_bshd.transpose(1, 2)
