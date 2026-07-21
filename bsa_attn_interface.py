@@ -1360,10 +1360,10 @@ def _bsa_attn_fwd_blk64(
             kv_splits=1 keeps the single-kernel fwd path; kv_splits>1
             uses FP32 partial attention workspace and a combine kernel. Pass
             "auto" to select 1/2/4/8 splits at 256/450/900 KV blocks; SM90
-            keeps a single Q head unsplit in the 256--449 range. The SM100
-            split path does not use its CLC scheduler. Auto may lower the split
-            count to fit the available workspace; an explicit count reports
-            an error instead.
+            keeps a single Q head unsplit in the 256--449 range. SM100 supports
+            explicit CLC scheduling for split-KV, while use_clc=None keeps CLC
+            disabled for that path. Auto may lower the split count to fit the
+            available workspace; an explicit count reports an error instead.
         block_sparse_num: fixed number of valid KV blocks per Q block when
             q2k_block_nums is empty. Defaults to q2k_block_index.shape[-1].
     """
@@ -1674,8 +1674,6 @@ def _bsa_attn_fwd_sm100_blk64(
     allow_empty_block_nums = (
         allow_empty_block_nums and has_variable_block_nums
     ) or kv_splits_i > 1
-    if kv_splits_i > 1 and use_clc is True:
-        raise ValueError("SM100/SM110 blk64 split-KV does not support use_clc=True")
     if use_clc is None:
         if kv_splits_i > 1:
             use_clc_scheduler = False
@@ -1688,9 +1686,6 @@ def _bsa_attn_fwd_sm100_blk64(
             )
     else:
         use_clc_scheduler = bool(use_clc)
-    assert not (kv_splits_i > 1 and use_clc_scheduler), (
-        "blk64 CuTeDSL kv_splits>1 does not support use_clc=True"
-    )
     is_persistent = use_clc_scheduler
     pack_gqa = False
     input_layout = "bhsd_native"

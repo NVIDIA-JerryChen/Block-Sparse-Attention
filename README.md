@@ -576,10 +576,12 @@ kernel, then materializes the BSHD output.
 
 SM90 split-KV supports the same MHA/GQA/MQA and QK/V dimensions (64, 96, or
 128) as its single-kernel path. SM100/SM110 blk64 retains its existing shape
-constraints, and its split path does not use the CLC scheduler; auto split
-selection disables CLC for that path. SM120 does not build or dispatch a
-split-KV variant: `kv_splits=1` is the only accepted value, avoiding the
-split-dependent FP32 O/LSE workspace on memory-constrained devices.
+constraints. Its split path supports `use_clc=True` for persistent scheduling;
+`use_clc=False` selects one tile per CTA. The default `use_clc=None` keeps CLC
+disabled when `kv_splits>1` because the automatic scheduler policy has not been
+tuned for split-KV. SM120 does not build or dispatch a split-KV variant:
+`kv_splits=1` is the only accepted value, avoiding the split-dependent FP32
+O/LSE workspace on memory-constrained devices.
 On SM90, a compatible AOT bundle supplies both the split producer and the
 deduplicated combine kernel; without matching artifacts, the two stages can
 fall back independently to JIT.

@@ -115,7 +115,6 @@ class BlockSparseAttnForwardSm100Blk64:
         self.sched_stages = 1
         self.scheduling_mode = SchedulingMode.CLC if self.use_clc_scheduler else SchedulingMode.STATIC
         assert num_splits >= 1, "num_splits must be >= 1"
-        assert not (num_splits > 1 and self.use_clc_scheduler), "split-KV CuTeDSL fwd does not support CLC"
         self.num_splits = num_splits
         self.is_split_kv = num_splits > 1
         self.allow_empty_block_nums = allow_empty_block_nums

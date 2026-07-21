@@ -1120,13 +1120,14 @@ def test_sm90_blk64_split_kv_auto_api():
     torch.testing.assert_close(auto_lse, explicit_lse, rtol=2e-3, atol=2e-3)
 
 
-def test_sm100_blk64_split_kv_matches_single_kernel():
+@pytest.mark.parametrize("use_clc", [False, True], ids=["single_tile", "clc"])
+def test_sm100_blk64_split_kv_matches_single_kernel(use_clc):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     arch_major = torch.cuda.get_device_capability()[0]
     if arch_major not in (10, 11):
         pytest.skip("split-KV CuTe DSL blk64 fwd is SM100/SM110-only")
-    bs, h, sq, sk, d = 1, 4, 128, 512, 128
+    bs, h, sq, sk, d = 2, 2, 128, 512, 128
     blk = 64
     nq = sq // blk
     nkv = sk // blk
@@ -1141,6 +1142,7 @@ def test_sm100_blk64_split_kv_matches_single_kernel():
     q2k_block_index = torch.arange(nkv, device=device, dtype=torch.int32) \
         .view(1, 1, 1, nkv).expand(bs, h, nq, nkv).contiguous()
     q2k_block_nums = torch.full((bs, h, nq), nkv, device=device, dtype=torch.int32)
+    q2k_block_nums[..., 0] = 2
     block_sizes = torch.full((nkv,), blk, device=device, dtype=torch.int32)
 
     ref_out, ref_lse = bsa_attn_fwd(
@@ -1153,6 +1155,7 @@ def test_sm100_blk64_split_kv_matches_single_kernel():
         q2k_block_nums=q2k_block_nums,
         return_lse=True,
         sparse_block_size=64,
+        use_clc=False,
     )
     for kv_splits in (2, 4):
         out, lse = bsa_attn_fwd(
@@ -1165,10 +1168,88 @@ def test_sm100_blk64_split_kv_matches_single_kernel():
             q2k_block_nums=q2k_block_nums,
             return_lse=True,
             sparse_block_size=64,
+            use_clc=use_clc,
             kv_splits=kv_splits,
         )
         torch.testing.assert_close(out, ref_out, rtol=3e-2, atol=3e-2)
         torch.testing.assert_close(lse, ref_lse, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] in (10, 11)
+    ),
+    reason="SM100/SM110 required",
+)
+def test_sm100_blk64_split_kv_clc_persistent_tiles():
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    bs, h, nkv, d = 2, 3, 8, 128
+    kv_splits = 3
+    nq = max(32, 2 * sm_count // (bs * h * kv_splits) + 1)
+    blk = 64
+    sq, sk = nq * blk, nkv * blk
+    device = "cuda"
+    dtype = torch.bfloat16
+    assert bs * h * nq * kv_splits > 2 * sm_count
+
+    torch.manual_seed(2029)
+    q_bhsd = torch.randn(bs, h, sq, d, device=device, dtype=dtype)
+    k_bhsd = torch.randn(bs, h, sk, d, device=device, dtype=dtype)
+    v_bhsd = torch.randn(bs, h, sk, d, device=device, dtype=dtype)
+    q2k_block_index = torch.arange(nkv, device=device, dtype=torch.int32) \
+        .view(1, 1, 1, nkv).expand(bs, h, nq, nkv).contiguous()
+    empty_nums = torch.empty(0, device=device, dtype=torch.int32)
+    block_sizes = torch.full((nkv,), blk, device=device, dtype=torch.int32)
+
+    ref_out, ref_lse = bsa_attn_fwd(
+        q_bhsd,
+        k_bhsd,
+        v_bhsd,
+        q2k_block_index,
+        nkv,
+        block_sizes,
+        q2k_block_nums=empty_nums,
+        return_lse=True,
+        sparse_block_size=64,
+        use_clc=False,
+        kv_splits=kv_splits,
+    )
+    torch.cuda.synchronize()
+    out, lse = bsa_attn_fwd(
+        q_bhsd,
+        k_bhsd,
+        v_bhsd,
+        q2k_block_index,
+        nkv,
+        block_sizes,
+        q2k_block_nums=empty_nums,
+        return_lse=True,
+        sparse_block_size=64,
+        use_clc=True,
+        kv_splits=kv_splits,
+    )
+    torch.cuda.synchronize()
+
+    repeat_out, repeat_lse = bsa_attn_fwd(
+        q_bhsd,
+        k_bhsd,
+        v_bhsd,
+        q2k_block_index,
+        nkv,
+        block_sizes,
+        q2k_block_nums=empty_nums,
+        return_lse=True,
+        sparse_block_size=64,
+        use_clc=True,
+        kv_splits=kv_splits,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out, ref_out, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(lse, ref_lse, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(repeat_out, out, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(repeat_lse, lse, rtol=0.0, atol=0.0)
 
 
 @pytest.mark.skipif(
