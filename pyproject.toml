@@ -12,7 +12,7 @@ dependencies = [
     "apache-tvm-ffi",
     "cuda-python>=12.8",
     "einops",
-    "nvidia-cutlass-dsl>=4.5.2",
+    "nvidia-cutlass-dsl>=4.5.2,<4.6",
     "torch>=2.5",
 ]
 

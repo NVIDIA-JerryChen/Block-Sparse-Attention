@@ -42,6 +42,8 @@ def packaging_source(tmp_path_factory: pytest.TempPathFactory) -> Path:
         "MANIFEST.in",
         "README.md",
         "bsa_attn_interface.py",
+        "bsa_fp8_blk64.py",
+        "bsa_fp8_quant.py",
         "pyproject.toml",
         "setup.py",
     ):
@@ -73,7 +75,7 @@ def built_wheel(
         stale_output.parent.mkdir(parents=True, exist_ok=True)
         stale_output.write_text("stale build output")
     _run(
-        [sys.executable, "setup.py", "--dry-run", "build_py"],
+        [sys.executable, "setup.py", "build_py", "--dry-run"],
         cwd=packaging_source,
     )
     assert all(stale_output.is_file() for stale_output in stale_outputs)
@@ -118,6 +120,8 @@ def built_sdist(
 
 def test_source_tree_keeps_existing_layout() -> None:
     assert (REPO_ROOT / "bsa_attn_interface.py").is_file()
+    assert (REPO_ROOT / "bsa_fp8_blk64.py").is_file()
+    assert (REPO_ROOT / "bsa_fp8_quant.py").is_file()
     assert (REPO_ROOT / "csrc" / "__init__.py").is_file()
     assert (REPO_ROOT / "utils" / "__init__.py").is_file()
     assert not (REPO_ROOT / "block_sparse_attention" / "bsa_attn_interface.py").exists()
@@ -137,6 +141,8 @@ def test_wheel_contains_single_import_package(built_wheel: Path) -> None:
     assert {
         "block_sparse_attention/__init__.py",
         "block_sparse_attention/bsa_attn_interface.py",
+        "block_sparse_attention/bsa_fp8_blk64.py",
+        "block_sparse_attention/bsa_fp8_quant.py",
         "block_sparse_attention/csrc/fwd/sm90_blk64/aot_build.py",
         "block_sparse_attention/csrc/fwd/sm90_blk64/aot_runtime.py",
         "block_sparse_attention/csrc/fwd/sm90_blk64/aot_utils.py",
@@ -162,6 +168,8 @@ def test_sdist_contains_mapped_sources_without_legacy_cpp(built_sdist: Path) -> 
     assert {
         "block_sparse_attention/__init__.py",
         "bsa_attn_interface.py",
+        "bsa_fp8_blk64.py",
+        "bsa_fp8_quant.py",
         "csrc/fwd/sm90_blk64/aot_build.py",
         "csrc/fwd/sm90_blk64/aot_runtime.py",
         "csrc/fwd/sm90_blk64/aot_utils.py",
@@ -202,6 +210,11 @@ import block_sparse_attention.bsa_attn_interface as interface
 from block_sparse_attention import (
     bsa_attn_bwd,
     bsa_attn_fwd,
+    bsa_fp8_blk64_fwd,
+    quantize_sage_bhsd,
+)
+from block_sparse_attention.bsa_fp8_blk64 import (
+    bsa_fp8_blk64_fwd as module_bsa_fp8_blk64_fwd,
 )
 from block_sparse_attention.csrc.fwd.sm90_blk64.aot_utils import (
     compute_sm90_aot_source_fingerprint,
@@ -214,12 +227,17 @@ from block_sparse_attention.utils.cache_utils import _compute_source_fingerprint
 public_apis = {
     "bsa_attn_bwd": bsa_attn_bwd,
     "bsa_attn_fwd": bsa_attn_fwd,
+    "bsa_fp8_blk64_fwd": bsa_fp8_blk64_fwd,
+    "quantize_sage_bhsd": quantize_sage_bhsd,
 }
 assert set(block_sparse_attention.__all__) == set(public_apis)
 assert len(block_sparse_attention.__dir__()) == len(set(block_sparse_attention.__dir__()))
 for name, api in public_apis.items():
     assert callable(api)
+for name in ("bsa_attn_bwd", "bsa_attn_fwd", "bsa_fp8_blk64_fwd"):
+    api = public_apis[name]
     assert api is getattr(interface, name)
+assert module_bsa_fp8_blk64_fwd is bsa_fp8_blk64_fwd
 for old_name in ("bsa_attn_fwd_blk64", "bsa_attn_fwd_blk64_cutedsl"):
     assert old_name not in block_sparse_attention.__all__
     assert not hasattr(block_sparse_attention, old_name)
@@ -299,6 +317,11 @@ import block_sparse_attention.bsa_attn_interface as interface
 from block_sparse_attention import (
     bsa_attn_bwd,
     bsa_attn_fwd,
+    bsa_fp8_blk64_fwd,
+    quantize_sage_bhsd,
+)
+from block_sparse_attention.bsa_fp8_blk64 import (
+    bsa_fp8_blk64_fwd as module_bsa_fp8_blk64_fwd,
 )
 from block_sparse_attention.csrc.fwd.sm90_blk64 import aot_utils as sm90_aot_utils
 from block_sparse_attention.csrc.fwd.sm120_blk64 import aot_utils as sm120_aot_utils
@@ -307,9 +330,17 @@ from block_sparse_attention.utils import cache_utils
 for api in (
     bsa_attn_bwd,
     bsa_attn_fwd,
+    bsa_fp8_blk64_fwd,
+    quantize_sage_bhsd,
 ):
     assert callable(api)
-assert set(block_sparse_attention.__all__) == {"bsa_attn_bwd", "bsa_attn_fwd"}
+assert module_bsa_fp8_blk64_fwd is bsa_fp8_blk64_fwd
+assert set(block_sparse_attention.__all__) == {
+    "bsa_attn_bwd",
+    "bsa_attn_fwd",
+    "bsa_fp8_blk64_fwd",
+    "quantize_sage_bhsd",
+}
 for old_name in ("bsa_attn_fwd_blk64", "bsa_attn_fwd_blk64_cutedsl"):
     assert not hasattr(block_sparse_attention, old_name)
     assert not hasattr(interface, old_name)

@@ -20,6 +20,8 @@ if _is_source_layout:
 __all__ = [
     "bsa_attn_bwd",
     "bsa_attn_fwd",
+    "bsa_fp8_blk64_fwd",
+    "quantize_sage_bhsd",
 ]
 
 
@@ -30,8 +32,11 @@ def __getattr__(name: str):
     from importlib import import_module
 
     interface = import_module(".bsa_attn_interface", __name__)
-    for api_name in __all__:
+    quantization = import_module(".bsa_fp8_quant", __name__)
+    import_module(".bsa_fp8_blk64", __name__)
+    for api_name in ("bsa_attn_bwd", "bsa_attn_fwd", "bsa_fp8_blk64_fwd"):
         globals()[api_name] = getattr(interface, api_name)
+    globals()["quantize_sage_bhsd"] = quantization.quantize_sage_bhsd
 
     global _source_path
     if _source_path is not None:

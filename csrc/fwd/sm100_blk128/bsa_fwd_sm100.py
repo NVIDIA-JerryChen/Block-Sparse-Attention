@@ -94,7 +94,7 @@ class BlockSparseAttnForwardSm100Blk128:
         assert self.split_P_arrive % 32 == 0
         assert self.split_P_arrive < self.n_block_size
         self.arch = BaseDSL._get_dsl().get_arch_enum()
-        assert self.arch >= Arch.sm_100 and self.arch <= Arch.sm_110f, "Only SM 10.x and 11.x are supported"
+        assert self.arch.is_family_of(Arch.sm_100f) or self.arch.is_family_of(Arch.sm_110f), "Only SM 10.x and 11.x are supported"
 
         self.cta_tiler = (self.m_block_size, self.n_block_size, self.head_dim_padded)
         self.mma_tiler_qk = (

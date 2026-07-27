@@ -14,7 +14,13 @@ _CSRC_EXCLUDE = (
 
 
 class BuildPy(_BuildPy):
-    """Install the root interface module inside block_sparse_attention."""
+    """Install root API modules inside block_sparse_attention."""
+
+    user_options = [
+        *_BuildPy.user_options,
+        ("dry-run", None, "show build actions without changing files"),
+    ]
+    boolean_options = [*_BuildPy.boolean_options, "dry-run"]
 
     def run(self) -> None:
         if not self.dry_run:
@@ -35,7 +41,13 @@ class BuildPy(_BuildPy):
     def find_package_modules(self, package: str, package_dir: str) -> list[tuple]:
         modules = super().find_package_modules(package, package_dir)
         if package == "block_sparse_attention":
-            modules.append((package, "bsa_attn_interface", "bsa_attn_interface.py"))
+            modules.extend(
+                (
+                    (package, "bsa_attn_interface", "bsa_attn_interface.py"),
+                    (package, "bsa_fp8_blk64", "bsa_fp8_blk64.py"),
+                    (package, "bsa_fp8_quant", "bsa_fp8_quant.py"),
+                )
+            )
         return modules
 
 

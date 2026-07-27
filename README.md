@@ -106,7 +106,8 @@ BSA/
 - Python 3.10+
 - PyTorch 2.5+ built for the installed CUDA runtime
 - CUDA 13.0+
-- CuTe DSL (`nvidia-cutlass-dsl>=4.5.2` for the SM90/SM120 dynamic AOT ABI)
+- CuTe DSL (`nvidia-cutlass-dsl>=4.5.2,<4.6`; Sage FP8 and the SM90/SM120
+  dynamic AOT paths are validated with the 4.5.2 ABI)
 
 ### Setup
 
@@ -122,10 +123,11 @@ pip install dist/block_sparse_attention-*.whl
 make setup
 ```
 
-The unified wheel and source distribution expose only `bsa_attn_fwd` and
-`bsa_attn_bwd` as public APIs. They contain all supported
-forward and backward CuTe DSL kernels, and shared Python utilities. They do not
-contain the SM100 blk64 C++ implementation, a prebuilt CUDA extension, or the
+The unified wheel and source distribution expose `bsa_attn_fwd`,
+`bsa_attn_bwd`, `bsa_fp8_blk64_fwd`, and `quantize_sage_bhsd` as public APIs.
+They contain all supported forward and backward CuTe DSL kernels, the Sage FP8
+quantization path, and shared Python utilities. They do not contain the SM100
+blk64 C++ implementation, a prebuilt CUDA extension, or the
 `third_party/cutlass` submodule. SM100/SM110 blk64 forward dispatches to the
 packaged CuTe DSL implementation and JIT-compiles it on first use. `make setup`
 uses `--no-deps` for fast development reinstalls; use `pip install .` or install
@@ -278,7 +280,7 @@ first-call memory peak. The Python attention API remains unchanged.
 - Block counts: fixed `block_sparse_num` or runtime `q2k_block_nums`
 - `block_sizes`: absent, `[N]`, `[B, N]`, or `[B, Hq, N]`
 - Split-KV: disabled; SM120 only accepts `kv_splits=1`
-- Minimum DSL version: `nvidia-cutlass-dsl>=4.5.2`
+- Supported DSL range: `nvidia-cutlass-dsl>=4.5.2,<4.6`
 
 Batch size, absolute head counts, sequence lengths, sparse index capacity,
 active topK, and non-leading tensor strides are runtime dynamic. Dtype, D=128,
