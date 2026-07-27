@@ -6,9 +6,9 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
 import cuda.bindings.driver as cuda
-from csrc.utils import layout_utils
-from csrc.utils import kernel_utils
-from csrc.utils.batched_static_scheduler import BatchedStaticSchedulerMixin
+from block_sparse_attention.csrc.utils import layout_utils
+from block_sparse_attention.csrc.utils import kernel_utils
+from block_sparse_attention.csrc.utils.batched_static_scheduler import BatchedStaticSchedulerMixin
 
 SM120_FWD_BLOCK_SIZE = 64
 

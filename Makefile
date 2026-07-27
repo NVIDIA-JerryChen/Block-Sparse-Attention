@@ -3,6 +3,8 @@
 # Usage:
 #   make wheel                - Build the unified CuTe DSL wheel
 #   make setup                - Reinstall wheel in a provisioned environment
+#   make aot-sm90             - Build SM90 forward/combine AOT artifacts
+#   make aot-sm120            - Build SM120 forward AOT artifacts
 #   make tt                   - Quick correctness test (blk64+128)
 #   make tt BLK=64            - Quick test blk64 only
 #   make vt                   - Full pytest suite (blk64+128)
@@ -35,19 +37,26 @@ AGENT_SPACE := agent/agent_space
 AGENT_PROFILES := agent/agent_profiles
 WHEEL_DIR ?= dist
 NCU_DIR := $(AGENT_PROFILES)/ncu
+SM90_AOT_DIR ?= $(AGENT_SPACE)/sm90_aot
+SM90_AOT_ARGS ?=
 SM120_AOT_DIR ?= $(AGENT_SPACE)/sm120_aot
 SM120_AOT_ARGS ?=
 
-.PHONY: wheel setup aot-sm120 tt vt ttb vtb bb bbb profile bm bm-cli clean help
+.PHONY: wheel setup aot-sm90 aot-sm120 tt vt ttb vtb bb bbb profile bm bm-cli clean help
 
 wheel:
 	mkdir -p $(WHEEL_DIR)
 	rm -f $(WHEEL_DIR)/block_sparse_attention-*.whl
+	rm -rf build/lib/ block_sparse_attention.egg-info/
 	$(PYTHON) -m pip wheel . --no-deps --wheel-dir $(WHEEL_DIR)
 
 setup: wheel
 	$(PYTHON) -m pip install --force-reinstall --no-deps \
 		$(WHEEL_DIR)/block_sparse_attention-*.whl
+
+aot-sm90:
+	$(PYTHON) -m csrc.fwd.sm90_blk64.aot_build \
+		--output-dir $(SM90_AOT_DIR) $(SM90_AOT_ARGS)
 
 aot-sm120:
 	$(PYTHON) -m csrc.fwd.sm120_blk64.aot_build \
@@ -114,6 +123,7 @@ help:
 	@echo ""
 	@echo "  make wheel                      Build unified CuTe DSL wheel"
 	@echo "  make setup                      Reinstall wheel (dependencies preinstalled)"
+	@echo "  make aot-sm90                   Build SM90 forward/combine CuTe DSL AOT artifacts"
 	@echo "  make aot-sm120                  Build SM120 CuTe DSL AOT artifacts"
 	@echo "  make tt    [BLK=64|128|64,128]  Quick correctness test (default: both)"
 	@echo "  make vt    [BLK=64|128|64,128]  Full pytest suite (default: both)"
@@ -129,4 +139,5 @@ help:
 	@echo ""
 	@echo "  Profile toggles: VAR_BN=0|1  BLKSZ=0|1"
 	@echo "    e.g. make bm-cli BLK=64 VAR_BN=1 BLKSZ=1"
+	@echo "  SM90 AOT: SM90_AOT_DIR=<root> SM90_AOT_ARGS='<builder args>'"
 	@echo "  SM120 AOT: SM120_AOT_DIR=<root> SM120_AOT_ARGS='<builder args>'"

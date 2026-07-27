@@ -1,1 +1,4 @@
+include bsa_attn_interface.py
+include bsa_fp8_blk64.py
+include bsa_fp8_quant.py
 prune csrc/fwd/sm100_blk64/cpp

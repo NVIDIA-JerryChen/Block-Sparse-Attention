@@ -322,3 +322,33 @@ BHSD API。每组保持 5 次 warmup、20 次 CUDA-event 计时，连续运行�
 环境为 NVIDIA B300 SXM6 AC（SM103）、driver 595.58.03、PyTorch
 `2.12.0a0+5aff3928d8.nv26.05`、CUDA 13.2、CUTLASS DSL 4.5.2。两轮开始前
 GPU 均为 0 MiB、0% utilization，第二轮结束后也恢复为 0 MiB、0%。
+
+## 2026-07-26：合入最新 master 前的回归验证
+
+将 `origin/master@7e0f854` 合入 `bsa_fp8@83bfba3`，保留 FP8 kernel、直接
+BHSD 量化、统一 Python 包 API，同时接入 master 的 SM90 AOT、SM120 AOT 和
+SM100 blk64 CLC split-KV 调度。冲突解决后，在同一台 B300、同一
+`nvcr.io/nvidia/pytorch:26.05-py3` 容器和 CUTLASS DSL 4.5.2 下验证：
+
+- 客户 PDF 的 12 个精确形状全部通过；最差相对平均误差为 `2.71331%`
+  （门槛 `<2.9%`），最大绝对误差为 `0.000763`（门槛 `<0.15`）。
+- FP8 kernel 定向回归 `36/36` 通过；直接 BHSD 量化为 2 passed、2 skipped，
+  skipped 项依赖未安装的私有 `flashinfer_vx`。
+- 包安装/导入测试 `6/6` 通过，SM100 blk64 的 CLC、single-tile、
+  persistent、large-stride 和 auto-split 定向测试 `10/10` 通过。
+- 全仓正式测试目录结果为 `296 passed, 325 skipped, 0 failed`。
+
+性能使用 10 个 SLA 形状、5 次 warmup、20 个交错 CUDA-event 样本，对合并前
+`83bfba3` 和合并后工作树做同机 A/B。这里的稀疏索引是固定随机种子的滚动
+sparse map，用于判断合并回归，不替代前文客户 mean-pool map 的 headline：
+
+- 合并后相对 BF16：kernel-only 几何平均 `1.32954x`，含直接 BHSD 量化为
+  `1.27970x`。
+- 合并前相对 BF16：kernel-only 几何平均 `1.32527x`，含量化为
+  `1.27751x`。
+- 合并后/合并前的 FP8 绝对延迟比：kernel-only `1.00050`（`+0.05%`），
+  含量化 `1.00201`（`+0.20%`），属于计时噪声，没有可测的合并回退。
+
+全量测试还暴露并修正了 master 中 SM100 blk128 的架构判断：CUTLASS DSL
+把 B300 表示为 `sm_103a`，原数值上界 `<= sm_110f` 会错误拒绝它；改为与
+blk64 一致的 SM100/SM110 family 判断后，相关回归全部通过。

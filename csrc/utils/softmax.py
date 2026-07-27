@@ -7,9 +7,9 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32
 
-from csrc.utils import layout_utils
+from block_sparse_attention.csrc.utils import layout_utils
 from . import kernel_utils as utils
-from csrc.utils.cute_dsl_utils import ParamsBase
+from block_sparse_attention.csrc.utils.cute_dsl_utils import ParamsBase
 
 
 @dataclass

@@ -7,8 +7,8 @@ from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
 import torch
 
-from utils.cache_utils import get_jit_cache
-from utils.testing import is_fake_mode
+from block_sparse_attention.utils.cache_utils import get_jit_cache
+from block_sparse_attention.utils.testing import is_fake_mode
 
 
 class BucketedK2QCsrUniversal:

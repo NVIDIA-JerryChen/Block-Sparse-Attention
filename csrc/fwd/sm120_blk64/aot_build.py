@@ -8,8 +8,8 @@ from pathlib import Path
 import cutlass
 import cutlass.cute as cute
 
-import utils.cache_utils  # noqa: F401  # Preload runtime symbols for export_to_c.
-from csrc.fwd.sm120_blk64.aot_utils import (
+import block_sparse_attention.utils.cache_utils  # noqa: F401  # Preload runtime symbols for export_to_c.
+from block_sparse_attention.csrc.fwd.sm120_blk64.aot_utils import (
     SM120_AOT_SCHEMA_VERSION,
     Sm120AotVariant,
     compute_sm120_aot_source_fingerprint,
@@ -21,7 +21,7 @@ from csrc.fwd.sm120_blk64.aot_utils import (
     sha256_file,
     write_sm120_aot_manifest,
 )
-from csrc.fwd.sm120_blk64.bsa_fwd_sm120 import (
+from block_sparse_attention.csrc.fwd.sm120_blk64.bsa_fwd_sm120 import (
     BlockSparseAttnForwardSm120Blk64,
 )
 

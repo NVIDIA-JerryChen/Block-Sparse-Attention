@@ -17,9 +17,9 @@ from cutlass import Int32, const_expr
 from cutlass.cute import FastDivmodDivisor
 from cutlass.utils import ClcDynamicPersistentTileScheduler, ClcDynamicPersistentTileSchedulerParams
 
-from csrc.utils.cute_dsl_utils import ParamsBase
+from block_sparse_attention.csrc.utils.cute_dsl_utils import ParamsBase
 
-from csrc.utils import kernel_utils as utils
+from block_sparse_attention.csrc.utils import kernel_utils as utils
 
 
 class SchedulingMode(IntEnum):

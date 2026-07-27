@@ -33,7 +33,7 @@ Goal: Simplify blk64 kernel, align code structure with FA Hopper.
 ### Phase 3: Binding + Python interface
 - Replace PYBIND11_MODULE with TORCH_LIBRARY
 - Delete `bindings.cpp`
-- Add `bsa_attn_fwd_blk64()` Python wrapper (bshd/bhsd, validation)
+- Add blk64 dispatch to the Python interface (bshd/bhsd, validation)
 - **Test:** `make setup && make tt BLK=64`
 
 ### Phase 4: 5D TMA + remove host transforms
@@ -48,3 +48,16 @@ Goal: Simplify blk64 kernel, align code structure with FA Hopper.
 - Replace with CUTLASS PipelineAsync API (consumer_release, producer_commit)
 - Keep raw PTX for UMMA arrives, Q-ready barrier, p_lastsplit wait
 - **Test:** `make setup && make tt BLK=64`
+
+## Current public API
+
+The package exposes two attention entry points:
+
+- `bsa_attn_fwd(..., sparse_block_size=64)`
+- `bsa_attn_bwd(..., sparse_block_size=64)`
+
+Pass `sparse_block_size=64` or `128` to select the matching metadata and kernel
+path. Backend-specific CuTe DSL launchers remain internal implementation details.
+Forward always returns a two-tuple: inference calls default to `(out, None)`;
+callers that need LSE pass `return_lse=True`. Inputs requiring gradients and an
+explicit `lse` output buffer also retain and return LSE.

@@ -3,17 +3,18 @@ import math
 import pytest
 import torch
 
-from bsa_attn_interface import (
+from block_sparse_attention import bsa_attn_fwd
+from block_sparse_attention.bsa_attn_interface import (
     _bsa_fwd_blk64_kv_bucketed_combine_compile_key,
     _bsa_attn_fwd_sm90_blk64,
     _bsa_attn_fwd_sm120_blk64,
     _dynamic_tensors_compile_key,
     _sm90_bwd_compile_key,
+    _sm90_fwd_compile_key,
     _sm120_fwd_compile_key,
-    bsa_attn_fwd,
 )
-from csrc.bwd.bsa_bwd_prepost import _bwd_preprocess_compile_key
-from utils.cache_utils import JITCache
+from block_sparse_attention.csrc.bwd.bsa_bwd_prepost import _bwd_preprocess_compile_key
+from block_sparse_attention.utils.cache_utils import JITCache
 
 
 def _make_sm90_bwd_tensors(batch: int, heads: int, seqlen_q: int, seqlen_k: int):
@@ -94,6 +95,91 @@ def test_dynamic_tensor_compile_key_tracks_static_type_parts():
     assert contiguous_key != broadcast_key
     assert contiguous_key != float_key
     assert contiguous_key != non_unit_key
+
+
+def _make_sm90_fwd_tensors(
+    batch: int,
+    q_heads: int,
+    kv_heads: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    capacity: int,
+    qk_dim: int = 128,
+    value_dim: int = 128,
+    kv_splits: int = 1,
+):
+    q = torch.empty((batch, q_heads, seqlen_q, qk_dim), dtype=torch.bfloat16)
+    k = torch.empty((batch, kv_heads, seqlen_k, qk_dim), dtype=torch.bfloat16)
+    v = torch.empty(
+        (batch, kv_heads, seqlen_k, value_dim), dtype=torch.bfloat16
+    )
+    output_dtype = torch.float32 if kv_splits > 1 else torch.bfloat16
+    out = torch.empty(
+        (batch, kv_splits * q_heads, seqlen_q, value_dim), dtype=output_dtype
+    )
+    lse = torch.empty(
+        (batch, kv_splits * q_heads, seqlen_q), dtype=torch.float32
+    )
+    num_q_blocks = seqlen_q // 64
+    num_kv_blocks = math.ceil(seqlen_k / 64)
+    q2k = torch.empty(
+        (batch, q_heads, num_q_blocks, capacity), dtype=torch.int32
+    )
+    q2k_nums = torch.empty((batch, q_heads, num_q_blocks), dtype=torch.int32)
+    block_sizes = torch.empty(
+        (batch, q_heads, num_kv_blocks), dtype=torch.int32
+    )
+    split_offsets = (
+        torch.empty(
+            (batch, q_heads, num_q_blocks, kv_splits + 1), dtype=torch.int32
+        ).permute(3, 2, 1, 0)
+        if kv_splits > 1
+        else q2k_nums.permute(2, 1, 0)
+    )
+    return (
+        q.permute(2, 3, 1, 0),
+        k.permute(2, 3, 1, 0),
+        v.permute(3, 2, 1, 0),
+        out.permute(2, 3, 1, 0),
+        lse.permute(2, 1, 0),
+        q2k.permute(3, 2, 1, 0),
+        q2k_nums.permute(2, 1, 0),
+        block_sizes.permute(2, 1, 0),
+        split_offsets,
+    )
+
+
+def test_sm90_fwd_compile_key_ignores_runtime_shapes():
+    first = _make_sm90_fwd_tensors(1, 4, 2, 64, 128, 2, kv_splits=2)
+    second = _make_sm90_fwd_tensors(3, 8, 4, 256, 513, 11, kv_splits=2)
+
+    first_key = _sm90_fwd_compile_key(
+        90, torch.bfloat16, 128, 128, 2, True, 2, False, first
+    )
+    second_key = _sm90_fwd_compile_key(
+        90, torch.bfloat16, 128, 128, 2, True, 2, False, second
+    )
+    assert first_key == second_key
+
+
+def test_sm90_fwd_compile_key_tracks_static_features():
+    tensors = _make_sm90_fwd_tensors(1, 4, 2, 64, 128, 2)
+    base_args = (90, torch.bfloat16, 128, 128, 2, True, 1, False)
+    base = _sm90_fwd_compile_key(*base_args, tensors)
+    alternatives = (
+        (91, torch.bfloat16, 128, 128, 2, True, 1, False),
+        (90, torch.float16, 128, 128, 2, True, 1, False),
+        (90, torch.bfloat16, 64, 128, 2, True, 1, False),
+        (90, torch.bfloat16, 128, 96, 2, True, 1, False),
+        (90, torch.bfloat16, 128, 128, 4, True, 1, False),
+        (90, torch.bfloat16, 128, 128, 2, False, 1, False),
+        (90, torch.bfloat16, 128, 128, 2, True, 2, False),
+        (90, torch.bfloat16, 128, 128, 2, True, 1, True),
+    )
+    assert all(
+        base != _sm90_fwd_compile_key(*alternative, tensors)
+        for alternative in alternatives
+    )
 
 
 def _make_sm120_fwd_tensors(

@@ -12,9 +12,9 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
 from cutlass import Float32, Int32, Boolean, const_expr
 
-from csrc.utils import kernel_utils as utils
-from csrc.utils.cute_dsl_utils import assume_tensor_aligned
-from csrc.utils.seqlen_info import SeqlenInfo
+from block_sparse_attention.csrc.utils import kernel_utils as utils
+from block_sparse_attention.csrc.utils.cute_dsl_utils import assume_tensor_aligned
+from block_sparse_attention.csrc.utils.seqlen_info import SeqlenInfo
 from cutlass.cute import FastDivmodDivisor
 
 

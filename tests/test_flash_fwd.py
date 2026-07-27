@@ -16,22 +16,22 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 import torch
 
-import bsa_attn_interface as bsa_interface
+from block_sparse_attention import (
+    bsa_attn_fwd,
+    bsa_attn_interface as bsa_interface,
+)
 
 # BSA_BLK env var: "64", "128", or "64,128" (default). Controls which blk sizes to test.
 _BSA_BLK = os.environ.get("BSA_BLK", "64,128")
 _BLK_SIZES = [int(x) for x in _BSA_BLK.split(",")]
 
-from utils.testing import attention_ref
-from utils.bench_utils import flops
-from utils.benchmark import benchmark_forward
-from bsa_attn_interface import (
+from block_sparse_attention.utils.testing import attention_ref
+from block_sparse_attention.utils.bench_utils import flops
+from block_sparse_attention.utils.benchmark import benchmark_forward
+from block_sparse_attention.bsa_attn_interface import (
     _sm100_blk64_requires_int64_kv_strides,
-    bsa_attn_fwd,
-    bsa_attn_fwd_blk64,
-    bsa_attn_fwd_blk64_cutedsl,
 )
-from csrc.fwd.sm100_blk128.bsa_fwd_sm100 import (
+from block_sparse_attention.csrc.fwd.sm100_blk128.bsa_fwd_sm100 import (
     BlockSparseAttnForwardSm100Blk128,
 )
 
@@ -339,14 +339,17 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
         q_bhsd = q.transpose(1, 2).contiguous()
         k_bhsd = k.transpose(1, 2).contiguous()
         v_bhsd = v.transpose(1, 2).contiguous()
-        out_bhsd, lse_bhsd = bsa_attn_fwd_blk64(
+        out_bhsd, lse_bhsd = bsa_attn_fwd(
             q_bhsd,
             k_bhsd,
             v_bhsd,
             q2k_block_index,
+            block_sparse_num,
             bs_arg,
-            bn_arg,
-            softmax_scale,
+            q2k_block_nums=bn_arg,
+            softmax_scale=softmax_scale,
+            return_lse=True,
+            sparse_block_size=64,
             use_clc=use_clc,
         )
         out_from_blk64 = out_bhsd.transpose(1, 2).contiguous()
@@ -361,14 +364,25 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
                 q2k_block_nums=q2k_block_nums,
                 return_lse=True,
                 layout="bshd",
+                sparse_block_size=64,
             )
             assert torch.equal(out_from_blk64, out)
             assert torch.equal(lse_bhsd, lse)
         else:
             out, lse = out_from_blk64, lse_bhsd
     else:
-        out, lse = bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes_kernel,
-                                 q2k_block_nums=q2k_block_nums, return_lse=True, layout="bshd")
+        out, lse = bsa_attn_fwd(
+            q,
+            k,
+            v,
+            q2k_block_index,
+            block_sparse_num,
+            block_sizes_kernel,
+            q2k_block_nums=q2k_block_nums,
+            return_lse=True,
+            layout="bshd",
+            sparse_block_size=128,
+        )
     out = torch.nan_to_num(out, nan=0.0)
 
     kernel_diff = (out - out_ref).abs().max().item()
@@ -520,14 +534,16 @@ def test_sm120_blk64_odd_topk_q_tail_block_sizes():
     q2k_block_nums = torch.empty(0, device=device, dtype=torch.int32)
     block_sizes = torch.tensor([64, 64, 17, 64], device=device, dtype=torch.int32)
 
-    out, lse = bsa_attn_fwd_blk64(
+    out, lse = bsa_attn_fwd(
         q,
         k,
         v,
         q2k_block_index,
+        3,
         block_sizes,
-        q2k_block_nums,
-        block_sparse_num=3,
+        q2k_block_nums=q2k_block_nums,
+        return_lse=True,
+        sparse_block_size=64,
     )
 
     cols = list(range(0, 64)) + list(range(128, 145)) + list(range(192, 256))
@@ -581,17 +597,26 @@ def test_sm100_blk64_cutedsl_partial_tail_rows(seqlen_q):
     ref_lse = torch.logsumexp(scores, dim=-1)
 
     for kv_splits in (1, 2):
-        out, lse = bsa_attn_fwd_blk64_cutedsl(
+        out_buffer = torch.empty_like(q)
+        lse_buffer = torch.empty_like(ref_lse)
+        out, lse = bsa_attn_fwd(
             q,
             k,
             v,
             q2k_block_index,
+            0,
             block_sizes,
-            q2k_block_nums,
+            q2k_block_nums=q2k_block_nums,
             softmax_scale=scale,
+            return_lse=True,
+            out=out_buffer,
+            lse=lse_buffer,
+            sparse_block_size=64,
             use_clc=False,
             kv_splits=kv_splits,
         )
+        assert out is out_buffer
+        assert lse is lse_buffer
         torch.testing.assert_close(out.float(), ref_out, rtol=3e-2, atol=3e-2)
         torch.testing.assert_close(lse, ref_lse, rtol=2e-3, atol=2e-3)
 
@@ -631,6 +656,7 @@ def test_sm90_blk64_empty_variable_row():
         q2k_block_nums=q2k_block_nums,
         allow_empty_block_nums=True,
         return_lse=True,
+        sparse_block_size=64,
     )
 
     assert torch.count_nonzero(out[:, :, :blk]) == 0
@@ -778,11 +804,29 @@ def _test_blk64_interface_layouts():
     q2k_block_nums = torch.full((bs, h, nq), nkv, device=device, dtype=torch.int32)
     block_sizes = torch.full((nkv,), blk, device=device, dtype=torch.int32)
 
-    out_bhsd, lse_bhsd = bsa_attn_fwd_blk64(
-        q_bhsd, k_bhsd, v_bhsd, q2k_block_index, block_sizes, q2k_block_nums)
-    out_bshd, lse_bshd = bsa_attn_fwd_blk64(
-        q_bshd, k_bshd, v_bshd, q2k_block_index, block_sizes, q2k_block_nums,
-        layout="bshd")
+    out_bhsd, lse_bhsd = bsa_attn_fwd(
+        q_bhsd,
+        k_bhsd,
+        v_bhsd,
+        q2k_block_index,
+        0,
+        block_sizes,
+        q2k_block_nums=q2k_block_nums,
+        return_lse=True,
+        sparse_block_size=64,
+    )
+    out_bshd, lse_bshd = bsa_attn_fwd(
+        q_bshd,
+        k_bshd,
+        v_bshd,
+        q2k_block_index,
+        0,
+        block_sizes,
+        q2k_block_nums=q2k_block_nums,
+        layout="bshd",
+        return_lse=True,
+        sparse_block_size=64,
+    )
 
     assert torch.equal(out_bhsd.transpose(1, 2).contiguous(), out_bshd), \
         f"BSHD output mismatch: max diff = {(out_bhsd.transpose(1, 2).contiguous() - out_bshd).abs().max().item()}"
@@ -842,22 +886,28 @@ def test_sm90_blk64_split_kv_variable_odd_topk(kv_splits):
     inputs = _make_sm90_split_kv_variable_case()
     q_bhsd, k_bhsd, v_bhsd, q2k_block_index, q2k_block_nums, block_sizes = inputs
 
-    ref_out, ref_lse = bsa_attn_fwd_blk64(
+    ref_out, ref_lse = bsa_attn_fwd(
         q_bhsd,
         k_bhsd,
         v_bhsd,
         q2k_block_index,
+        0,
         block_sizes,
-        q2k_block_nums,
+        q2k_block_nums=q2k_block_nums,
+        return_lse=True,
+        sparse_block_size=64,
         kv_splits=1,
     )
-    out, lse = bsa_attn_fwd_blk64(
+    out, lse = bsa_attn_fwd(
         q_bhsd,
         k_bhsd,
         v_bhsd,
         q2k_block_index,
+        0,
         block_sizes,
-        q2k_block_nums,
+        q2k_block_nums=q2k_block_nums,
+        return_lse=True,
+        sparse_block_size=64,
         kv_splits=kv_splits,
     )
 
@@ -865,14 +915,17 @@ def test_sm90_blk64_split_kv_variable_odd_topk(kv_splits):
     torch.testing.assert_close(lse, ref_lse, rtol=2e-3, atol=2e-3)
 
     if kv_splits == 2:
-        out_bshd, lse_bshd = bsa_attn_fwd_blk64(
+        out_bshd, lse_bshd = bsa_attn_fwd(
             q_bhsd.transpose(1, 2).contiguous(),
             k_bhsd.transpose(1, 2).contiguous(),
             v_bhsd.transpose(1, 2).contiguous(),
             q2k_block_index,
+            0,
             block_sizes,
-            q2k_block_nums,
+            q2k_block_nums=q2k_block_nums,
             layout="bshd",
+            return_lse=True,
+            sparse_block_size=64,
             kv_splits=kv_splits,
         )
         assert out_bshd.is_contiguous()
@@ -882,22 +935,28 @@ def test_sm90_blk64_split_kv_variable_odd_topk(kv_splits):
         torch.testing.assert_close(lse_bshd, lse, rtol=0.0, atol=0.0)
 
         empty_block_sizes = torch.empty(0, device="cuda", dtype=torch.int32)
-        ref_no_bs, ref_lse_no_bs = bsa_attn_fwd_blk64(
+        ref_no_bs, ref_lse_no_bs = bsa_attn_fwd(
             q_bhsd,
             k_bhsd,
             v_bhsd,
             q2k_block_index,
+            0,
             empty_block_sizes,
-            q2k_block_nums,
+            q2k_block_nums=q2k_block_nums,
+            return_lse=True,
+            sparse_block_size=64,
             kv_splits=1,
         )
-        out_no_bs, lse_no_bs = bsa_attn_fwd_blk64(
+        out_no_bs, lse_no_bs = bsa_attn_fwd(
             q_bhsd,
             k_bhsd,
             v_bhsd,
             q2k_block_index,
+            0,
             empty_block_sizes,
-            q2k_block_nums,
+            q2k_block_nums=q2k_block_nums,
+            return_lse=True,
+            sparse_block_size=64,
             kv_splits=kv_splits,
         )
         torch.testing.assert_close(out_no_bs, ref_no_bs, rtol=3e-2, atol=3e-2)
@@ -956,24 +1015,45 @@ def test_sm90_blk64_split_kv_gqa(dtype):
         (num_kv_blocks,), 64, device=device, dtype=torch.int32
     )
 
-    ref_out, ref_lse = bsa_attn_fwd_blk64(
-        q, k, v, q2k_block_index, block_sizes, q2k_block_nums, kv_splits=1
+    ref_out, ref_lse = bsa_attn_fwd(
+        q,
+        k,
+        v,
+        q2k_block_index,
+        0,
+        block_sizes,
+        q2k_block_nums=q2k_block_nums,
+        return_lse=True,
+        sparse_block_size=64,
+        kv_splits=1,
     )
-    out, lse = bsa_attn_fwd_blk64(
-        q, k, v, q2k_block_index, block_sizes, q2k_block_nums, kv_splits=2
+    out, lse = bsa_attn_fwd(
+        q,
+        k,
+        v,
+        q2k_block_index,
+        0,
+        block_sizes,
+        q2k_block_nums=q2k_block_nums,
+        return_lse=True,
+        sparse_block_size=64,
+        kv_splits=2,
     )
 
     torch.testing.assert_close(out, ref_out, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(lse, ref_lse, rtol=2e-3, atol=2e-3)
 
-    out_bshd, lse_bshd = bsa_attn_fwd_blk64(
+    out_bshd, lse_bshd = bsa_attn_fwd(
         q.transpose(1, 2).contiguous(),
         k.transpose(1, 2).contiguous(),
         v.transpose(1, 2).contiguous(),
         q2k_block_index,
+        0,
         block_sizes,
-        q2k_block_nums,
+        q2k_block_nums=q2k_block_nums,
         layout="bshd",
+        return_lse=True,
+        sparse_block_size=64,
         kv_splits=2,
     )
     assert out_bshd.is_contiguous()
@@ -1011,38 +1091,43 @@ def test_sm90_blk64_split_kv_auto_api():
     )
     q2k_block_nums = torch.empty(0, device=device, dtype=torch.int32)
 
-    explicit_out, explicit_lse = bsa_attn_fwd_blk64(
+    explicit_out, explicit_lse = bsa_attn_fwd(
         q_bhsd,
         k_bhsd,
         v_bhsd,
         q2k_block_index,
+        block_sparse_num,
         block_sizes,
-        q2k_block_nums,
+        q2k_block_nums=q2k_block_nums,
+        return_lse=True,
+        sparse_block_size=64,
         kv_splits=2,
-        block_sparse_num=block_sparse_num,
     )
-    auto_out, auto_lse = bsa_attn_fwd_blk64(
+    auto_out, auto_lse = bsa_attn_fwd(
         q_bhsd,
         k_bhsd,
         v_bhsd,
         q2k_block_index,
+        block_sparse_num,
         block_sizes,
-        q2k_block_nums,
+        q2k_block_nums=q2k_block_nums,
+        return_lse=True,
+        sparse_block_size=64,
         kv_splits="auto",
-        block_sparse_num=block_sparse_num,
     )
 
     torch.testing.assert_close(auto_out, explicit_out, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(auto_lse, explicit_lse, rtol=2e-3, atol=2e-3)
 
 
-def test_sm100_blk64_split_kv_matches_single_kernel():
+@pytest.mark.parametrize("use_clc", [False, True], ids=["single_tile", "clc"])
+def test_sm100_blk64_split_kv_matches_single_kernel(use_clc):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     arch_major = torch.cuda.get_device_capability()[0]
     if arch_major not in (10, 11):
         pytest.skip("split-KV CuTe DSL blk64 fwd is SM100/SM110-only")
-    bs, h, sq, sk, d = 1, 4, 128, 512, 128
+    bs, h, sq, sk, d = 2, 2, 128, 512, 128
     blk = 64
     nq = sq // blk
     nkv = sk // blk
@@ -1057,22 +1142,114 @@ def test_sm100_blk64_split_kv_matches_single_kernel():
     q2k_block_index = torch.arange(nkv, device=device, dtype=torch.int32) \
         .view(1, 1, 1, nkv).expand(bs, h, nq, nkv).contiguous()
     q2k_block_nums = torch.full((bs, h, nq), nkv, device=device, dtype=torch.int32)
+    q2k_block_nums[..., 0] = 2
     block_sizes = torch.full((nkv,), blk, device=device, dtype=torch.int32)
 
-    ref_out, ref_lse = bsa_attn_fwd_blk64(
-        q_bhsd, k_bhsd, v_bhsd, q2k_block_index, block_sizes, q2k_block_nums)
+    ref_out, ref_lse = bsa_attn_fwd(
+        q_bhsd,
+        k_bhsd,
+        v_bhsd,
+        q2k_block_index,
+        0,
+        block_sizes,
+        q2k_block_nums=q2k_block_nums,
+        return_lse=True,
+        sparse_block_size=64,
+        use_clc=False,
+    )
     for kv_splits in (2, 4):
-        out, lse = bsa_attn_fwd_blk64(
+        out, lse = bsa_attn_fwd(
             q_bhsd,
             k_bhsd,
             v_bhsd,
             q2k_block_index,
+            0,
             block_sizes,
-            q2k_block_nums,
+            q2k_block_nums=q2k_block_nums,
+            return_lse=True,
+            sparse_block_size=64,
+            use_clc=use_clc,
             kv_splits=kv_splits,
         )
         torch.testing.assert_close(out, ref_out, rtol=3e-2, atol=3e-2)
         torch.testing.assert_close(lse, ref_lse, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] in (10, 11)
+    ),
+    reason="SM100/SM110 required",
+)
+def test_sm100_blk64_split_kv_clc_persistent_tiles():
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    bs, h, nkv, d = 2, 3, 8, 128
+    kv_splits = 3
+    nq = max(32, 2 * sm_count // (bs * h * kv_splits) + 1)
+    blk = 64
+    sq, sk = nq * blk, nkv * blk
+    device = "cuda"
+    dtype = torch.bfloat16
+    assert bs * h * nq * kv_splits > 2 * sm_count
+
+    torch.manual_seed(2029)
+    q_bhsd = torch.randn(bs, h, sq, d, device=device, dtype=dtype)
+    k_bhsd = torch.randn(bs, h, sk, d, device=device, dtype=dtype)
+    v_bhsd = torch.randn(bs, h, sk, d, device=device, dtype=dtype)
+    q2k_block_index = torch.arange(nkv, device=device, dtype=torch.int32) \
+        .view(1, 1, 1, nkv).expand(bs, h, nq, nkv).contiguous()
+    empty_nums = torch.empty(0, device=device, dtype=torch.int32)
+    block_sizes = torch.full((nkv,), blk, device=device, dtype=torch.int32)
+
+    ref_out, ref_lse = bsa_attn_fwd(
+        q_bhsd,
+        k_bhsd,
+        v_bhsd,
+        q2k_block_index,
+        nkv,
+        block_sizes,
+        q2k_block_nums=empty_nums,
+        return_lse=True,
+        sparse_block_size=64,
+        use_clc=False,
+        kv_splits=kv_splits,
+    )
+    torch.cuda.synchronize()
+    out, lse = bsa_attn_fwd(
+        q_bhsd,
+        k_bhsd,
+        v_bhsd,
+        q2k_block_index,
+        nkv,
+        block_sizes,
+        q2k_block_nums=empty_nums,
+        return_lse=True,
+        sparse_block_size=64,
+        use_clc=True,
+        kv_splits=kv_splits,
+    )
+    torch.cuda.synchronize()
+
+    repeat_out, repeat_lse = bsa_attn_fwd(
+        q_bhsd,
+        k_bhsd,
+        v_bhsd,
+        q2k_block_index,
+        nkv,
+        block_sizes,
+        q2k_block_nums=empty_nums,
+        return_lse=True,
+        sparse_block_size=64,
+        use_clc=True,
+        kv_splits=kv_splits,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out, ref_out, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(lse, ref_lse, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(repeat_out, out, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(repeat_lse, lse, rtol=0.0, atol=0.0)
 
 
 @pytest.mark.skipif(
@@ -1109,14 +1286,16 @@ def test_sm100_blk64_cutedsl_large_kv_batch_stride():
     )
 
     def run(k, v):
-        return bsa_attn_fwd_blk64_cutedsl(
+        return bsa_attn_fwd(
             q,
             k,
             v,
             q2k_block_index,
+            num_kv_blocks,
             block_sizes,
-            block_sparse_num=num_kv_blocks,
             softmax_scale=1.0,
+            return_lse=True,
+            sparse_block_size=64,
             use_clc=False,
             kv_splits=2,
         )
@@ -1186,6 +1365,88 @@ def test_sm100_blk64_int64_kv_stride_selection():
     assert _sm100_blk64_requires_int64_kv_strides(block_at_limit, block_at_limit)
 
 
+def test_unified_blk64_lse_and_preallocated_buffer_contract(monkeypatch):
+    q = torch.empty((1, 1, 64, 128), dtype=torch.bfloat16)
+    k = torch.empty_like(q)
+    v = torch.empty_like(q)
+    q2k_block_index = torch.zeros((1, 1, 1, 1), dtype=torch.int32)
+    generated_out = torch.empty_like(q)
+    generated_lse = torch.empty((1, 1, 64), dtype=torch.float32)
+    calls = []
+
+    def fake_blk64(*args, out=None, lse=None, **kwargs):
+        calls.append((out, lse))
+        return (
+            generated_out if out is None else out,
+            generated_lse if lse is None else lse,
+        )
+
+    monkeypatch.setattr(bsa_interface, "_bsa_attn_fwd_blk64", fake_blk64)
+
+    result_out, result_lse = bsa_attn_fwd(
+        q,
+        k,
+        v,
+        q2k_block_index,
+        1,
+        sparse_block_size=64,
+    )
+    assert result_out is generated_out
+    assert result_lse is None
+
+    result_out, result_lse = bsa_attn_fwd(
+        q,
+        k,
+        v,
+        q2k_block_index,
+        1,
+        return_lse=True,
+        sparse_block_size=64,
+    )
+    assert result_out is generated_out
+    assert result_lse is generated_lse
+
+    result_out, result_lse = bsa_attn_fwd(
+        q.requires_grad_(),
+        k,
+        v,
+        q2k_block_index,
+        1,
+        sparse_block_size=64,
+    )
+    assert result_out is generated_out
+    assert result_lse is generated_lse
+    q.requires_grad_(False)
+
+    out_buffer = torch.empty_like(q)
+    lse_buffer = torch.empty_like(generated_lse)
+    result_out, result_lse = bsa_attn_fwd(
+        q,
+        k,
+        v,
+        q2k_block_index,
+        1,
+        out=out_buffer,
+        lse=lse_buffer,
+        sparse_block_size=64,
+    )
+    assert calls[-1][0] is out_buffer
+    assert calls[-1][1] is lse_buffer
+    assert result_out is out_buffer
+    assert result_lse is lse_buffer
+
+    with pytest.raises(AssertionError, match="pack_gqa"):
+        bsa_attn_fwd(
+            q,
+            k,
+            v,
+            q2k_block_index,
+            1,
+            pack_gqa=False,
+            sparse_block_size=64,
+        )
+
+
 @pytest.mark.skipif(
     not (
         torch.cuda.is_available()
@@ -1217,18 +1478,29 @@ def test_sm100_blk64_kv_bucketed_respects_fixed_block_sparse_num():
     empty_nums = torch.empty(0, device=device, dtype=torch.int32)
     block_sizes = torch.full((nkv,), blk, device=device, dtype=torch.int32)
 
-    ref_out, ref_lse = bsa_attn_fwd_blk64(
-        q_bhsd, k_bhsd, v_bhsd, q2k_compact, block_sizes, empty_nums)
+    ref_out, ref_lse = bsa_attn_fwd(
+        q_bhsd,
+        k_bhsd,
+        v_bhsd,
+        q2k_compact,
+        topk,
+        block_sizes,
+        q2k_block_nums=empty_nums,
+        return_lse=True,
+        sparse_block_size=64,
+    )
     for kv_splits in (1, 2, 4, 8):
-        out, lse = bsa_attn_fwd_blk64(
+        out, lse = bsa_attn_fwd(
             q_bhsd,
             k_bhsd,
             v_bhsd,
             q2k_padded,
+            topk,
             block_sizes,
-            empty_nums,
+            q2k_block_nums=empty_nums,
+            return_lse=True,
+            sparse_block_size=64,
             kv_splits=kv_splits,
-            block_sparse_num=topk,
         )
         torch.testing.assert_close(out, ref_out, rtol=3e-2, atol=3e-2)
         torch.testing.assert_close(lse, ref_lse, rtol=5e-3, atol=3e-2)
@@ -1264,24 +1536,29 @@ def test_sm100_blk64_auto_kv_splits_api(monkeypatch):
         "_sm100_blk64_auto_kv_splits",
         lambda *args, **kwargs: 2,
     )
-    ref_out, ref_lse = bsa_attn_fwd_blk64(
+    ref_out, ref_lse = bsa_attn_fwd(
         q_bhsd,
         k_bhsd,
         v_bhsd,
         q2k_block_index,
+        nkv,
         block_sizes,
-        empty_nums,
+        q2k_block_nums=empty_nums,
+        return_lse=True,
+        sparse_block_size=64,
         kv_splits=2,
     )
-    out, lse = bsa_attn_fwd_blk64(
+    out, lse = bsa_attn_fwd(
         q_bhsd,
         k_bhsd,
         v_bhsd,
         q2k_block_index,
+        nkv,
         block_sizes,
-        empty_nums,
+        q2k_block_nums=empty_nums,
+        return_lse=True,
+        sparse_block_size=64,
         kv_splits="auto",
-        block_sparse_num=nkv,
     )
     torch.testing.assert_close(out, ref_out, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(lse, ref_lse, rtol=5e-3, atol=3e-2)
@@ -1302,20 +1579,30 @@ def _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n,
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
         bn_arg = q2k_block_nums if q2k_block_nums is not None else torch.Tensor()
         bs_arg = block_sizes if block_sizes is not None else torch.Tensor()
-        out_bhsd, _ = bsa_attn_fwd_blk64(
+        out_bhsd, _ = bsa_attn_fwd(
             q,
             k,
             v,
             q2k_block_index,
+            block_sparse_num,
             bs_arg,
-            bn_arg,
-            softmax_scale,
+            q2k_block_nums=bn_arg,
+            softmax_scale=softmax_scale,
+            sparse_block_size=64,
             use_clc=use_clc,
         )
         return out_bhsd
     else:
-        return bsa_attn_fwd(q, k, v, q2k_block_index, block_sparse_num, block_sizes,
-                             q2k_block_nums=q2k_block_nums)[0]
+        return bsa_attn_fwd(
+            q,
+            k,
+            v,
+            q2k_block_index,
+            block_sparse_num,
+            block_sizes,
+            q2k_block_nums=q2k_block_nums,
+            sparse_block_size=128,
+        )[0]
 
 
 # ============== Benchmark (make bb) ==============

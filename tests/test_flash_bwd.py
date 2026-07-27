@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 import torch
 
-from bsa_attn_interface import bsa_attn_bwd
+from block_sparse_attention import bsa_attn_bwd
 from test_flash_fwd import (
     make_dense_block_sparse_args,
     make_random_block_sparse_args,
@@ -23,7 +23,7 @@ from test_flash_fwd import (
     make_topk_block_sparse_args,
     block_sparse_to_attn_bias,
 )
-from utils.bench_utils import bwd_flops
+from block_sparse_attention.utils.bench_utils import bwd_flops
 
 
 # Native bwd coverage: blk64 for SM90/SM100 and blk128 for SM100/SM110.
@@ -171,6 +171,7 @@ def _test_bwd_single(
         q2k_block_nums=q2k_block_nums,
         softmax_scale=softmax_scale,
         bucket_size_blocks=bucket_size_blocks,
+        sparse_block_size=blk,
     )
 
     def _max_abs(a, b):
@@ -252,6 +253,7 @@ def _test_bwd_dense_single(bs, seqlen_q, seqlen_k, nheads):
         dout, q, k, v, out_ref, lse_ref,
         q2k_block_index, block_sparse_num, block_sizes,
         softmax_scale=softmax_scale,
+        sparse_block_size=BLK,
     )
 
     def _max_abs(a, b):
@@ -378,6 +380,7 @@ def _test_bwd_topk_blk128(
         block_sizes,
         softmax_scale=softmax_scale,
         bucket_size_blocks=bucket_size_blocks,
+        sparse_block_size=BLK128,
     )
     _assert_bwd_close(f"blk128 topk={topk}", (dq, dk, dv), refs, tols)
 
@@ -409,6 +412,7 @@ def _test_bwd_layout_equivalence():
         dout, q, k, v, out_ref, lse_ref,
         q2k_block_index, block_sparse_num, block_sizes,
         softmax_scale=softmax_scale,
+        sparse_block_size=BLK,
     )
 
     q_bshd = q.transpose(1, 2).contiguous()
@@ -429,6 +433,7 @@ def _test_bwd_layout_equivalence():
         block_sizes,
         softmax_scale=softmax_scale,
         layout="bshd",
+        sparse_block_size=BLK,
     )
     # Bucketed CSR scatter and dQ accumulation use atomics, so equivalent
     # layouts can differ by a BF16 rounding step.
@@ -463,6 +468,7 @@ def _test_bwd_layout_equivalence():
         dk=dk_buf,
         dv=dv_buf,
         layout="bshd",
+        sparse_block_size=BLK,
     )
 
     assert dq_bshd.data_ptr() == dq_buf.data_ptr()
@@ -605,6 +611,7 @@ def test_flash_bwd_blk64_sparse_path_compare_no_block_sizes():
         None,
         q2k_block_nums=q2k_block_nums,
         softmax_scale=softmax_scale,
+        sparse_block_size=BLK,
     )
     direct_bucketed = bsa_attn_bwd(
         dout,
@@ -619,6 +626,7 @@ def test_flash_bwd_blk64_sparse_path_compare_no_block_sizes():
         q2k_block_nums=q2k_block_nums,
         softmax_scale=softmax_scale,
         bucket_size_blocks=2,
+        sparse_block_size=BLK,
     )
 
     _assert_bwd_close("default sparse block_sizes=None", default_path, refs, tols)
@@ -679,6 +687,7 @@ def test_flash_bwd_blk64_dense_equivalent_compare_no_block_sizes():
         block_sparse_num,
         None,
         softmax_scale=softmax_scale,
+        sparse_block_size=BLK,
     )
     bucketed_path = bsa_attn_bwd(
         dout,
@@ -692,6 +701,7 @@ def test_flash_bwd_blk64_dense_equivalent_compare_no_block_sizes():
         None,
         softmax_scale=softmax_scale,
         bucket_size_blocks=2,
+        sparse_block_size=BLK,
     )
 
     _assert_bwd_close("default dense-equivalent block_sizes=None", default_path, refs, tols)
@@ -715,20 +725,23 @@ def test_flash_bwd_blk64_layout_equivalence():
 
 
 @pytest.mark.parametrize(
-    "seqlen_k,topk,use_block_sizes",
+    "seqlen_q,seqlen_k,topk,use_block_sizes",
     [
-        (512, 2, True),
-        (512, 4, True),
-        (448, 4, True),
-        (448, 4, False),
+        (256, 512, 2, True),
+        (256, 512, 4, True),
+        (256, 448, 4, True),
+        # q2k shape is valid for both block sizes; the explicit API must pick blk128.
+        (64, 448, 4, False),
     ],
 )
-def test_flash_bwd_sm100_blk128_topk_correctness(seqlen_k, topk, use_block_sizes):
+def test_flash_bwd_sm100_blk128_topk_correctness(
+    seqlen_q, seqlen_k, topk, use_block_sizes
+):
     if _cuda_major() not in [10, 11]:
         pytest.skip("SM100/SM110 blk128 bwd test")
     _test_bwd_topk_blk128(
         bs=1,
-        seqlen_q=256,
+        seqlen_q=seqlen_q,
         seqlen_k=seqlen_k,
         nheads=2,
         topk=topk,
@@ -879,6 +892,7 @@ def _bench_bwd_one(
             bsn,
             bsize,
             q2k_block_nums=q2k_block_nums,
+            sparse_block_size=BLK,
         )
 
     for _ in range(5):

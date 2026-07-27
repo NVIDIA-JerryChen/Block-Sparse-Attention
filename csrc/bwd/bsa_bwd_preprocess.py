@@ -23,12 +23,12 @@ import cutlass.cute as cute
 from cutlass import Float32, const_expr
 from cutlass.cutlass_dsl import Arch, BaseDSL
 
-from csrc.utils import copy_utils, layout_utils
+from block_sparse_attention.csrc.utils import copy_utils, layout_utils
 
-from csrc.utils import kernel_utils as utils
-from csrc.utils.seqlen_info import SeqlenInfo
-from csrc.utils.cute_dsl_utils import ParamsBase
-from csrc.utils.tile_scheduler import (
+from block_sparse_attention.csrc.utils import kernel_utils as utils
+from block_sparse_attention.csrc.utils.seqlen_info import SeqlenInfo
+from block_sparse_attention.csrc.utils.cute_dsl_utils import ParamsBase
+from block_sparse_attention.csrc.utils.tile_scheduler import (
     SingleTileScheduler,
     SingleTileVarlenScheduler,
     TileSchedulerArguments,

@@ -13,7 +13,7 @@ from cutlass._mlir.dialects import nvvm, llvm
 
 
 from .copy_utils import predicate_k
-from csrc.utils.cute_dsl_utils import sub_packed_f32x2
+from block_sparse_attention.csrc.utils.cute_dsl_utils import sub_packed_f32x2
 
 _NVVM_FMAX_REQUIRES_RESULT_TYPE = sum(1 for p in inspect.signature(nvvm.fmax).parameters.values() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)) > 2
 

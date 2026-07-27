@@ -5,12 +5,12 @@ import torch
 import cutlass.cute as cute
 from cutlass import Float32, Int32
 
-from csrc.utils.cute_dsl_utils import make_fake_tensor as fake_tensor
+from block_sparse_attention.csrc.utils.cute_dsl_utils import make_fake_tensor as fake_tensor
 
-from csrc.bwd.bsa_bwd_postprocess import BlockSparseAttnBackwardPostprocess
-from csrc.bwd.bsa_bwd_preprocess import BlockSparseAttnBackwardPreprocess
-from utils.cache_utils import get_jit_cache
-from utils.testing import is_fake_mode
+from block_sparse_attention.csrc.bwd.bsa_bwd_postprocess import BlockSparseAttnBackwardPostprocess
+from block_sparse_attention.csrc.bwd.bsa_bwd_preprocess import BlockSparseAttnBackwardPreprocess
+from block_sparse_attention.utils.cache_utils import get_jit_cache
+from block_sparse_attention.utils.testing import is_fake_mode
 
 
 @lru_cache(maxsize=None)
