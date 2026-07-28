@@ -196,12 +196,12 @@ def test_sm90_aot_variant_round_trip_and_validation():
 
 
 def test_sm90_aot_requires_dynamic_layout_capable_dsl():
-    assert SM90_AOT_MIN_CUTLASS_DSL_VERSION == "4.5.2"
-    require_sm90_aot_cutlass_dsl_version("4.5.2")
-    require_sm90_aot_cutlass_dsl_version("4.6.0.dev0")
+    assert SM90_AOT_MIN_CUTLASS_DSL_VERSION == "4.6.1"
+    require_sm90_aot_cutlass_dsl_version("4.6.1")
+    require_sm90_aot_cutlass_dsl_version("4.7.0.dev0")
 
-    with pytest.raises(RuntimeError, match="nvidia-cutlass-dsl>=4.5.2"):
-        require_sm90_aot_cutlass_dsl_version("4.4.2")
+    with pytest.raises(RuntimeError, match="nvidia-cutlass-dsl>=4.6.1"):
+        require_sm90_aot_cutlass_dsl_version("4.6.0")
     with pytest.raises(RuntimeError, match="Cannot parse"):
         require_sm90_aot_cutlass_dsl_version("unknown")
 

@@ -4,6 +4,7 @@
 # Selected helpers are adapted from quack-kernels 0.4.1 (Apache-2.0) and
 # maintained locally so BSA does not require Quack at runtime.
 
+import contextlib
 from typing import Callable, Optional, Tuple, Type
 
 import cutlass
@@ -15,6 +16,33 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import llvm
 import cutlass.pipeline
+
+
+def _cute_dsl_bulk_copy_self_elects() -> bool:
+    """Return whether cute.copy elects a lane for bulk-async copies."""
+    try:
+        major, minor = (int(part) for part in cutlass.__version__.split(".")[:2])
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Cannot parse CUTLASS DSL version {getattr(cutlass, '__version__', None)!r}"
+        ) from exc
+    return (major, minor) >= (4, 6)
+
+
+_BULK_COPY_SELF_ELECTS = _cute_dsl_bulk_copy_self_elects()
+
+
+def bulk_copy_elect_one():
+    """Select a lane only when the installed DSL does not do so internally.
+
+    CUTLASS DSL 4.6 added an internal warp-collective election to
+    ``cute.copy`` for bulk-async atoms. Nesting that copy inside
+    ``cute.arch.elect_one()`` leaves one lane at the inner collective and
+    deadlocks the warp. CUTLASS DSL 4.5 still requires the outer guard.
+    """
+    if _BULK_COPY_SELF_ELECTS:
+        return contextlib.nullcontext()
+    return cute.arch.elect_one()
 
 
 @dsl_user_op
@@ -321,7 +349,7 @@ def cpasync_bulk_get_copy_fn(
 
     def copy_bulk(src_idx, dst_idx, tma_bar_ptr: cute.Pointer, **new_kwargs):
         atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), src.element_type)
-        with cute.arch.elect_one():
+        with bulk_copy_elect_one():
             cute.copy(
                 atom,
                 src[None, src_idx],
@@ -333,7 +361,7 @@ def cpasync_bulk_get_copy_fn(
 
     def copy_bulk_single_stage(tma_bar_ptr: cute.Pointer, **new_kwargs):
         atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), src.element_type)
-        with cute.arch.elect_one():
+        with bulk_copy_elect_one():
             cute.copy(atom, src, dst, mbar_ptr=tma_bar_ptr, **new_kwargs, **kwargs)
 
     return copy_bulk if const_expr(not single_stage) else copy_bulk_single_stage

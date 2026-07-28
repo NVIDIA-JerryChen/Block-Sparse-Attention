@@ -167,7 +167,7 @@ deduplicated combine kernel, so AOT-only execution does not invoke
 - `block_sizes`: absent or present; input ranks 1/2/3 share one normalized ABI
 - Split-KV: exact `kv_splits` values from 1 through 256; the default bundle
   contains 1, 2, 4, and 8
-- Minimum DSL version: `nvidia-cutlass-dsl>=4.5.2`
+- Supported DSL range: `nvidia-cutlass-dsl>=4.6.1`
 
 Batch size, absolute head counts, sequence lengths, sparse-index capacity,
 active topK, and non-leading tensor strides are runtime dynamic. Dtype, QK/value
@@ -402,8 +402,8 @@ python -m pytest tests/test_sm120_aot.py -q
 ```
 
 The validation monkeypatches `cute.compile()` to fail, so every passing launch
-must come from a precompiled `.so`. The validated CUDA 13 configuration was
-PyTorch CUDA 13.2, CUDA runtime 13.3, CUTLASS DSL 4.5.2, and a 16 GB SM120 GPU.
+must come from a precompiled `.so`. AOT artifacts are DSL-version-specific:
+bundles built with CUTLASS DSL 4.5.2 must be rebuilt with 4.6.1 before use.
 
 Common deployment errors:
 
