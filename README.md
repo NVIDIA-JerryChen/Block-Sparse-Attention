@@ -6,9 +6,9 @@
 
 | | SM120 blk64 (CuTe DSL / AOT + JIT) | SM100 blk128 (CuTe DSL / JIT) | SM90 blk64 (CuTe DSL / AOT + JIT) | SM100/SM110 blk64 (CuTe DSL / JIT) |
 |---|---|---|---|---|
-| Dtype | bf16, fp16 | bf16, fp16 | bf16, fp16 | bf16 only |
+| Dtype | bf16, fp16, Sage FP8 | bf16, fp16 | bf16, fp16 | bf16, Sage FP8 |
 | Head dim | 128 only | 64, 96, 128 | 64, 96, 128 | 128 only |
-| Attention | MHA, GQA, MQA | MHA, GQA, MQA | MHA, GQA, MQA | MHA only |
+| Attention | MHA, GQA, MQA (FP8: MHA) | MHA, GQA, MQA | MHA, GQA, MQA | MHA only |
 | pack_gqa | No | Yes | No | No |
 | Persistent scheduling | Static | Static + CLC dynamic | Static | Static + CLC dynamic |
 | Variable block counts (`q2k_block_nums`) | Yes (>= 1) | Yes (>= 0) | Yes (>= 0) | Yes (>= 0) |
@@ -57,6 +57,7 @@ BSA/
 │   │   └── aot_utils.py              # Main/combine variant metadata
 │   ├── sm120_blk64/                  # blk64 — SM120 CuTe DSL / AOT + JIT
 │   │   ├── bsa_fwd_sm120.py          # SM120 forward kernel
+│   │   ├── bsa_fwd_sm120_fp8.py      # SM120 Sage FP8 forward kernel
 │   │   ├── aot_build.py              # Offline native-ABI artifact builder
 │   │   ├── aot_runtime.py            # Manifest validation and runtime loader
 │   │   └── aot_utils.py              # Variant and artifact metadata
@@ -106,8 +107,8 @@ BSA/
 - Python 3.10+
 - PyTorch 2.5+ built for the installed CUDA runtime
 - CUDA 13.0+
-- CuTe DSL (`nvidia-cutlass-dsl>=4.5.2,<4.6`; Sage FP8 and the SM90/SM120
-  dynamic AOT paths are validated with the 4.5.2 ABI)
+- CuTe DSL (`nvidia-cutlass-dsl>=4.6.1`; AOT artifacts must be built and loaded
+  with the same DSL version)
 
 ### Setup
 
@@ -274,19 +275,19 @@ first-call memory peak. The Python attention API remains unchanged.
 #### Supported configurations
 
 - Target: `sm_120f`
-- Dtype: BF16 and FP16
+- Dtype: BF16, FP16, and Sage FP8 E4M3
 - QK/value head dimension: 128
-- Attention: MHA, GQA, and MQA
+- Attention: MHA, GQA, and MQA for BF16/FP16; MHA for Sage FP8
 - Block counts: fixed `block_sparse_num` or runtime `q2k_block_nums`
 - `block_sizes`: absent, `[N]`, `[B, N]`, or `[B, Hq, N]`
 - Split-KV: disabled; SM120 only accepts `kv_splits=1`
-- Supported DSL range: `nvidia-cutlass-dsl>=4.5.2,<4.6`
+- Supported DSL range: `nvidia-cutlass-dsl>=4.6.1`
 
 Batch size, absolute head counts, sequence lengths, sparse index capacity,
 active topK, and non-leading tensor strides are runtime dynamic. Dtype, D=128,
 GQA ratio, fixed/variable block-count mode, and `block_sizes` rank select the
 static AOT variant. For example, one `gqa2` artifact can run both `Hq/Hkv=4/2`
-and `8/4`, but ratio 6 requires a `gqa6` artifact.
+and `8/4`, but ratio 6 requires a `gqa6` artifact. Sage FP8 remains MHA-only.
 
 #### Build artifacts
 
@@ -301,13 +302,13 @@ make aot-sm120 SM120_AOT_DIR=/shared/bsa-sm120-aot
 # A smaller deployment-specific matrix is usually preferable.
 make aot-sm120 \
   SM120_AOT_DIR=/shared/bsa-sm120-aot \
-  SM120_AOT_ARGS='--dtypes bf16,fp16 --gqa-ratios 1,2,6 --block-nums both --block-sizes-modes 0,1,2,3'
+  SM120_AOT_ARGS='--dtypes bf16,fp16,fp8 --gqa-ratios 1,2,6 --block-nums both --block-sizes-modes 0,1,2,3'
 
 # List the default variants without compiling them.
 python -m csrc.fwd.sm120_blk64.aot_build --dry-run
 ```
 
-The default matrix contains 112 variants. A deployment-specific subset is
+The default matrix contains 120 variants. A deployment-specific subset is
 recommended to reduce build time and package size.
 
 The output bundle is self-describing:
@@ -320,6 +321,7 @@ The output bundle is self-describing:
         ├── bsa_sm120_blk64_bf16_gqa1_bn0_bs0_dyn.o
         ├── bsa_sm120_blk64_bf16_gqa1_bn0_bs0_dyn.h
         ├── bsa_sm120_blk64_bf16_gqa1_bn0_bs0_dyn.so
+        ├── bsa_sm120_blk64_fp8_gqa1_bn0_bs0_dyn.so
         └── ...
 ```
 
@@ -350,6 +352,13 @@ source-fingerprint, and checksum failures always report an error.
 
 Call `bsa_attn_fwd` with `sparse_block_size=64`. For fixed block counts, omit
 `q2k_block_nums`; for variable counts, pass a `[B, Hq, Q_blocks]` int32 tensor.
+For FP8, call `quantize_sage_bhsd` followed by `bsa_fp8_blk64_fwd`; the API and
+scale contract are identical for AOT and JIT. On SM120, pass optional
+`q2k_block_nums=[B, H, Q_blocks]` and `block_sizes=[N]`, `[B, N]`, or
+`[B, H, N]` keyword arguments to select the corresponding sparse metadata
+variant. When `q2k_block_nums` is present, the scalar `topk_num` is ignored.
+SM120 Sage FP8 accepts any positive batch/head counts and non-aligned Q/KV
+tails. SM100/SM110 retain the B=1, H in {4, 8}, and 64-aligned v1 contract.
 
 ```python
 import torch

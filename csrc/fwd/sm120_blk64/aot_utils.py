@@ -13,7 +13,7 @@ from cuda.bindings import runtime as cuda_runtime
 SM120_AOT_SCHEMA_VERSION = 1
 SM120_AOT_MANIFEST = "manifest.json"
 SM120_AOT_LAYOUT_MODE = "dynamic_strided_nonbroadcast"
-SM120_AOT_MIN_CUTLASS_DSL_VERSION = "4.5.2"
+SM120_AOT_MIN_CUTLASS_DSL_VERSION = "4.6.1"
 
 
 @dataclass(frozen=True)
@@ -25,7 +25,7 @@ class Sm120AotVariant:
     layout_mode: str = SM120_AOT_LAYOUT_MODE
 
     def __post_init__(self) -> None:
-        if self.dtype not in ("bf16", "fp16"):
+        if self.dtype not in ("bf16", "fp16", "fp8"):
             raise ValueError(f"Unsupported SM120 AOT dtype: {self.dtype}")
         if self.gqa_ratio < 1:
             raise ValueError("gqa_ratio must be >= 1")
@@ -33,10 +33,17 @@ class Sm120AotVariant:
             raise ValueError("block_sizes_mode must be one of 0, 1, 2, or 3")
         if self.layout_mode != SM120_AOT_LAYOUT_MODE:
             raise ValueError(f"Unsupported SM120 AOT layout mode: {self.layout_mode}")
+        if self.dtype == "fp8":
+            if self.gqa_ratio != 1:
+                raise ValueError("SM120 Sage FP8 AOT currently requires gqa_ratio=1")
 
     @property
     def has_block_sizes(self) -> bool:
         return self.block_sizes_mode != 0
+
+    @property
+    def is_fp8(self) -> bool:
+        return self.dtype == "fp8"
 
     @property
     def name(self) -> str:
@@ -66,13 +73,21 @@ def iter_sm120_aot_variants(
     has_block_nums_values: Iterable[bool],
     block_sizes_modes: Iterable[int],
 ) -> tuple[Sm120AotVariant, ...]:
-    variants = {
-        Sm120AotVariant(dtype, gqa_ratio, has_block_nums, block_sizes_mode)
-        for dtype in dtypes
-        for gqa_ratio in gqa_ratios
-        for has_block_nums in has_block_nums_values
-        for block_sizes_mode in block_sizes_modes
-    }
+    variants = set()
+    for dtype in dtypes:
+        for gqa_ratio in gqa_ratios:
+            for has_block_nums in has_block_nums_values:
+                for block_sizes_mode in block_sizes_modes:
+                    if dtype == "fp8" and gqa_ratio != 1:
+                        continue
+                    variants.add(
+                        Sm120AotVariant(
+                            dtype,
+                            gqa_ratio,
+                            has_block_nums,
+                            block_sizes_mode,
+                        )
+                    )
     return tuple(sorted(variants, key=lambda variant: variant.name))
 
 

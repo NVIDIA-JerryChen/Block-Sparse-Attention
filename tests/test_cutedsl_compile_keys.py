@@ -9,8 +9,10 @@ from block_sparse_attention.bsa_attn_interface import (
     _bsa_attn_fwd_sm90_blk64,
     _bsa_attn_fwd_sm120_blk64,
     _dynamic_tensors_compile_key,
+    _prepare_sm120_sparse_metadata,
     _sm90_bwd_compile_key,
     _sm90_fwd_compile_key,
+    _sm120_fp8_fwd_compile_key,
     _sm120_fwd_compile_key,
 )
 from block_sparse_attention.csrc.bwd.bsa_bwd_prepost import _bwd_preprocess_compile_key
@@ -243,6 +245,183 @@ def test_sm120_fwd_compile_key_tracks_static_features():
     assert base != _sm120_fwd_compile_key(
         120, torch.bfloat16, 128, 128, 2, True, True, 2, tensors
     )
+
+
+def _make_sm120_fp8_fwd_tensors(
+    heads: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    capacity: int,
+):
+    q = torch.empty((1, heads, seqlen_q, 128), dtype=torch.float8_e4m3fn)
+    k = torch.empty((1, heads, seqlen_k, 128), dtype=torch.float8_e4m3fn)
+    v = torch.empty_like(k)
+    out = torch.empty((1, heads, seqlen_q, 128), dtype=torch.bfloat16)
+    lse = torch.empty((1, heads, seqlen_q), dtype=torch.float32)
+    q_scale = torch.empty((1, heads, seqlen_q), dtype=torch.float32)
+    k_scale = torch.empty((1, heads, seqlen_k // 16), dtype=torch.float32)
+    v_scale = torch.empty((heads, 128), dtype=torch.float32)
+    q2k = torch.empty(
+        (1, heads, seqlen_q // 64, capacity),
+        dtype=torch.int32,
+    )
+    q2k_nums = torch.empty(
+        (1, heads, seqlen_q // 64),
+        dtype=torch.int32,
+    )
+    block_sizes = torch.empty(
+        (1, heads, seqlen_k // 64),
+        dtype=torch.int32,
+    )
+    return (
+        q.permute(2, 3, 1, 0),
+        k.permute(2, 3, 1, 0),
+        v.permute(3, 2, 1, 0),
+        out.permute(2, 3, 1, 0),
+        lse.permute(2, 1, 0),
+        q_scale.permute(2, 1, 0),
+        k_scale.permute(2, 1, 0),
+        v_scale.permute(1, 0),
+        q2k.permute(3, 2, 1, 0),
+        q2k_nums.permute(2, 1, 0),
+        block_sizes.permute(2, 1, 0),
+    )
+
+
+def test_sm120_fp8_fwd_compile_key_ignores_runtime_shapes():
+    first = _make_sm120_fp8_fwd_tensors(4, 64, 128, 2)
+    second = _make_sm120_fp8_fwd_tensors(8, 256, 512, 7)
+
+    assert _sm120_fp8_fwd_compile_key(
+        120,
+        128,
+        True,
+        True,
+        3,
+        first,
+    ) == _sm120_fp8_fwd_compile_key(
+        120,
+        128,
+        True,
+        True,
+        3,
+        second,
+    )
+
+
+def test_sm120_fp8_fwd_compile_key_tracks_sparse_metadata_modes():
+    tensors = _make_sm120_fp8_fwd_tensors(4, 64, 128, 2)
+    base = _sm120_fp8_fwd_compile_key(
+        120,
+        128,
+        False,
+        False,
+        0,
+        tensors,
+    )
+    alternatives = (
+        (121, 128, False, False, 0),
+        (120, 64, False, False, 0),
+        (120, 128, True, False, 0),
+        (120, 128, False, True, 1),
+        (120, 128, False, True, 2),
+        (120, 128, False, True, 3),
+    )
+
+    assert all(
+        base != _sm120_fp8_fwd_compile_key(*alternative, tensors)
+        for alternative in alternatives
+    )
+
+
+@pytest.mark.parametrize(
+    ("block_sizes_shape", "expected_mode", "expected_shape"),
+    (
+        (None, 0, (2, 3, 2)),
+        ((5,), 1, (5,)),
+        ((2, 5), 2, (5, 2)),
+        ((2, 3, 5), 3, (5, 3, 2)),
+    ),
+)
+def test_prepare_sm120_sparse_metadata_layouts(
+    block_sizes_shape,
+    expected_mode,
+    expected_shape,
+):
+    batch, heads, num_q_blocks, num_kv_blocks, capacity = 2, 3, 2, 5, 4
+    q2k = torch.empty(
+        (batch, heads, num_q_blocks, capacity * 2),
+        dtype=torch.int32,
+    )[..., ::2]
+    block_nums = torch.empty(
+        (batch, heads, num_q_blocks, 2),
+        dtype=torch.int32,
+    )[..., 0]
+    block_sizes = (
+        None
+        if block_sizes_shape is None
+        else torch.empty(block_sizes_shape, dtype=torch.int32)
+    )
+
+    (
+        has_block_nums,
+        has_block_sizes,
+        block_sizes_mode,
+        q2k_t,
+        q2k_nums_t,
+        block_sizes_t,
+    ) = _prepare_sm120_sparse_metadata(
+        q2k,
+        block_nums,
+        block_sizes,
+        0,
+        batch_size=batch,
+        num_heads=heads,
+        num_q_blocks=num_q_blocks,
+        num_kv_blocks=num_kv_blocks,
+        device=q2k.device,
+    )
+
+    assert has_block_nums
+    assert has_block_sizes == (block_sizes_shape is not None)
+    assert block_sizes_mode == expected_mode
+    assert q2k_t.shape == (capacity, num_q_blocks, heads, batch)
+    assert q2k_nums_t.shape == (num_q_blocks, heads, batch)
+    assert block_sizes_t.shape == expected_shape
+    assert q2k_t.stride(0) == 1
+    assert q2k_nums_t.stride(0) == 1
+    assert block_sizes_t.stride(0) == 1
+    if block_sizes_shape is None:
+        assert block_sizes_t is q2k_nums_t
+
+
+def test_prepare_sm120_sparse_metadata_uses_uniform_sentinels():
+    q2k = torch.empty((1, 4, 2, 3), dtype=torch.int32)
+
+    (
+        has_block_nums,
+        has_block_sizes,
+        block_sizes_mode,
+        q2k_t,
+        q2k_nums_t,
+        block_sizes_t,
+    ) = _prepare_sm120_sparse_metadata(
+        q2k,
+        None,
+        None,
+        2,
+        batch_size=1,
+        num_heads=4,
+        num_q_blocks=2,
+        num_kv_blocks=5,
+        device=q2k.device,
+    )
+
+    assert not has_block_nums
+    assert not has_block_sizes
+    assert block_sizes_mode == 0
+    assert q2k_nums_t is q2k_t
+    assert block_sizes_t is q2k_t
 
 
 def test_arch_specific_helper_keys_do_not_cross_devices():
