@@ -68,6 +68,11 @@ def _require_sm100_or_sm110() -> None:
         pytest.skip("FP8 blk64 BSA requires SM100/SM110")
 
 
+def _require_sm120() -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("SM120 FP8 blk64 BSA requires SM120")
+
+
 def _sage_quantize_bhsd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
     """Self-contained equivalent of the fixed flashinfer-vx Sage recipe."""
     fp8 = torch.float8_e4m3fn
@@ -100,6 +105,8 @@ def _dequantized_sparse_reference(
     v_sfs: torch.Tensor,
     block_index: torch.Tensor,
     softmax_scale: float,
+    block_nums: torch.Tensor | None = None,
+    block_sizes: torch.Tensor | None = None,
 ) -> torch.Tensor:
     b, h, sq, d = q_fp8.shape
     sk = k_fp8.shape[2]
@@ -111,12 +118,39 @@ def _dequantized_sparse_reference(
     v = (v_fp8.float() * v_sfs.view(1, h, 1, d)).bfloat16()
 
     out = torch.empty((b, h, sq, d), device=q.device, dtype=torch.float32)
-    token_in_block = torch.arange(64, device=q.device)
     for batch_idx in range(b):
         for head_idx in range(h):
-            for q_block in range(sq // 64):
-                kv_blocks = block_index[batch_idx, head_idx, q_block].long()
-                kv_tokens = (kv_blocks[:, None] * 64 + token_in_block).reshape(-1)
+            for q_block in range(math.ceil(sq / 64)):
+                count = (
+                    int(block_nums[batch_idx, head_idx, q_block])
+                    if block_nums is not None
+                    else block_index.shape[-1]
+                )
+                token_ids = []
+                for physical_idx in block_index[
+                    batch_idx, head_idx, q_block, :count
+                ].tolist():
+                    if block_sizes is None:
+                        block_size = min(64, sk - physical_idx * 64)
+                    elif block_sizes.ndim == 1:
+                        block_size = int(block_sizes[physical_idx])
+                    elif block_sizes.ndim == 2:
+                        block_size = int(block_sizes[batch_idx, physical_idx])
+                    else:
+                        block_size = int(
+                            block_sizes[batch_idx, head_idx, physical_idx]
+                        )
+                    token_ids.extend(
+                        range(
+                            physical_idx * 64,
+                            physical_idx * 64 + block_size,
+                        )
+                    )
+                kv_tokens = torch.tensor(
+                    token_ids,
+                    dtype=torch.long,
+                    device=q.device,
+                )
                 q_tile = q[batch_idx, head_idx, q_block * 64 : (q_block + 1) * 64].float()
                 k_tile = k[batch_idx, head_idx].index_select(0, kv_tokens).float()
                 v_tile = v[batch_idx, head_idx].index_select(0, kv_tokens).float()
@@ -125,16 +159,27 @@ def _dequantized_sparse_reference(
     return out
 
 
-def _make_block_index(heads: int, sq: int, sk: int, topk: int) -> torch.Tensor:
-    num_q_blocks = sq // 64
-    num_k_blocks = sk // 64
-    result = torch.empty((1, heads, num_q_blocks, topk), device="cuda", dtype=torch.int32)
+def _make_block_index(
+    heads: int,
+    sq: int,
+    sk: int,
+    topk: int,
+    batch: int = 1,
+) -> torch.Tensor:
+    num_q_blocks = math.ceil(sq / 64)
+    num_k_blocks = math.ceil(sk / 64)
+    result = torch.empty(
+        (batch, heads, num_q_blocks, topk),
+        device="cuda",
+        dtype=torch.int32,
+    )
     base = torch.arange(num_k_blocks, device="cuda")
-    for head_idx in range(heads):
-        for q_block in range(num_q_blocks):
-            shift = (3 * head_idx + q_block) % num_k_blocks
-            selected = torch.roll(base, shifts=shift)[:topk].sort().values
-            result[0, head_idx, q_block] = selected.to(torch.int32)
+    for batch_idx in range(batch):
+        for head_idx in range(heads):
+            for q_block in range(num_q_blocks):
+                shift = (batch_idx + 3 * head_idx + q_block) % num_k_blocks
+                selected = torch.roll(base, shifts=shift)[:topk].sort().values
+                result[batch_idx, head_idx, q_block] = selected.to(torch.int32)
     return result
 
 
@@ -181,4 +226,163 @@ def test_bsa_fp8_blk64_forward(heads, sq, sk, topk, flatten_v_scale):
     assert diff.max().item() < 0.15
     # The accepted Sage FP8 contract allows up to 2.9% relative mean error;
     # the broader 28-case validation currently tops out at about 2.82%.
+    assert (diff.mean() / ref.abs().mean()).item() < 0.029
+
+
+@pytest.mark.parametrize(
+    "batch,heads,sq,sk,topk,flatten_v_scale",
+    [
+        (1, 2, 96, 209, 3, True),
+        (2, 3, 65, 127, 2, False),
+        (1, 4, 128, 640, 1, True),
+        (1, 4, 128, 640, 5, False),
+        (1, 8, 64, 640, 9, True),
+        (1, 4, 64, 75200, 188, True),
+        (1, 4, 64, 75200, 1089, True),
+    ],
+)
+def test_bsa_fp8_blk64_forward_sm120(
+    batch,
+    heads,
+    sq,
+    sk,
+    topk,
+    flatten_v_scale,
+):
+    _require_sm120()
+    from bsa_fp8_blk64 import bsa_fp8_blk64_fwd, quantize_sage_bhsd
+
+    torch.manual_seed(1200 + batch + heads + topk)
+    q = torch.randn(
+        (batch, heads, sq, 128),
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.5
+    k = torch.randn(
+        (batch, heads, sk, 128),
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.5
+    v = torch.randn(
+        (batch, heads, sk, 128),
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.5
+    q_fp8, k_fp8, v_fp8, q_sfs, k_sfs, v_sfs = quantize_sage_bhsd(q, k, v)
+    block_index = _make_block_index(heads, sq, sk, topk, batch)
+    scale = 1.0 / math.sqrt(128)
+
+    ref = _dequantized_sparse_reference(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_sfs,
+        k_sfs,
+        v_sfs,
+        block_index,
+        scale,
+    )
+    out = bsa_fp8_blk64_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_sfs,
+        k_sfs,
+        v_sfs.flatten() if flatten_v_scale else v_sfs,
+        block_index,
+        topk,
+        scale,
+    )
+
+    assert out.dtype == torch.bfloat16
+    assert out.shape == q.shape
+    diff = (out.float() - ref).abs()
+    assert diff.max().item() < 0.15
+    assert (diff.mean() / ref.abs().mean()).item() < 0.029
+
+
+@pytest.mark.parametrize(
+    "heads,sq,sk,capacity,block_sizes_mode",
+    [
+        (4, 128, 256, 3, 0),
+        (4, 128, 256, 3, 1),
+        (4, 128, 320, 4, 2),
+        (8, 64, 320, 4, 3),
+    ],
+)
+def test_bsa_fp8_blk64_variable_metadata_sm120(
+    heads,
+    sq,
+    sk,
+    capacity,
+    block_sizes_mode,
+):
+    _require_sm120()
+    from bsa_fp8_blk64 import bsa_fp8_blk64_fwd, quantize_sage_bhsd
+
+    torch.manual_seed(1210 + heads + capacity + block_sizes_mode)
+    q = torch.randn((1, heads, sq, 128), device="cuda", dtype=torch.bfloat16) * 0.5
+    k = torch.randn((1, heads, sk, 128), device="cuda", dtype=torch.bfloat16) * 0.5
+    v = torch.randn_like(k)
+    q_fp8, k_fp8, v_fp8, q_sfs, k_sfs, v_sfs = quantize_sage_bhsd(q, k, v)
+    block_index = _make_block_index(heads, sq, sk, capacity)
+    num_q_blocks = sq // 64
+    num_kv_blocks = sk // 64
+    head_ids = torch.arange(
+        heads,
+        dtype=torch.int32,
+        device="cuda",
+    ).unsqueeze(1)
+    q_block_ids = torch.arange(
+        num_q_blocks,
+        dtype=torch.int32,
+        device="cuda",
+    ).unsqueeze(0)
+    block_nums = (1 + (head_ids + q_block_ids) % capacity).unsqueeze(0)
+
+    block_ids = torch.arange(
+        num_kv_blocks,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    if block_sizes_mode == 0:
+        block_sizes = None
+    elif block_sizes_mode == 1:
+        block_sizes = 64 - block_ids % 9
+    elif block_sizes_mode == 2:
+        block_sizes = (64 - block_ids % 9).unsqueeze(0)
+    else:
+        block_sizes = (64 - (head_ids + block_ids.unsqueeze(0)) % 9).unsqueeze(0)
+    scale = 1.0 / math.sqrt(128)
+
+    ref = _dequantized_sparse_reference(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_sfs,
+        k_sfs,
+        v_sfs,
+        block_index,
+        scale,
+        block_nums,
+        block_sizes,
+    )
+    out = bsa_fp8_blk64_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_sfs,
+        k_sfs,
+        v_sfs,
+        block_index,
+        0,
+        scale,
+        block_sizes=block_sizes,
+        q2k_block_nums=block_nums,
+    )
+
+    assert out.dtype == torch.bfloat16
+    assert out.shape == q.shape
+    diff = (out.float() - ref).abs()
+    assert diff.max().item() < 0.15
     assert (diff.mean() / ref.abs().mean()).item() < 0.029

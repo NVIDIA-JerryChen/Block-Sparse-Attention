@@ -7,8 +7,16 @@ import cutlass
 import pytest
 import torch
 
-from block_sparse_attention import bsa_attn_fwd, bsa_attn_interface
-from block_sparse_attention.csrc.fwd.sm120_blk64.aot_build import build_sm120_aot_artifacts
+from block_sparse_attention import (
+    bsa_attn_fwd,
+    bsa_attn_interface,
+    bsa_fp8_blk64_fwd,
+    quantize_sage_bhsd,
+)
+from block_sparse_attention.csrc.fwd.sm120_blk64.aot_build import (
+    build_sm120_aot_artifacts,
+    make_sm120_aot_fake_args,
+)
 from block_sparse_attention.csrc.fwd.sm120_blk64 import aot_runtime
 from block_sparse_attention.csrc.fwd.sm120_blk64.aot_runtime import (
     SM120_AOT_DIR_ENV,
@@ -73,17 +81,27 @@ def _write_compatible_sm120_artifact(root: Path, variant: Sm120AotVariant) -> Pa
 
 def test_sm120_aot_variant_matrix_is_deterministic():
     variants = iter_sm120_aot_variants(
-        ("fp16", "bf16"),
+        ("fp16", "bf16", "fp8"),
         (2, 1, 2),
         (True, False),
         (3, 0),
     )
 
-    assert len(variants) == 16
+    assert len(variants) == 20
+    assert sum(variant.is_fp8 for variant in variants) == 4
     assert tuple(variant.name for variant in variants) == tuple(
         sorted(variant.name for variant in variants)
     )
     assert all("split" not in variant.name for variant in variants)
+
+    default_variants = iter_sm120_aot_variants(
+        ("bf16", "fp16", "fp8"),
+        (1, 2, 4, 8, 16, 32, 64),
+        (False, True),
+        (0, 1, 2, 3),
+    )
+    assert len(default_variants) == 120
+    assert sum(variant.is_fp8 for variant in default_variants) == 8
 
 
 def test_sm120_aot_variant_round_trip_and_validation():
@@ -99,21 +117,59 @@ def test_sm120_aot_variant_round_trip_and_validation():
     assert Sm120AotVariant.from_dict(variant.to_dict()) == variant
     assert variant.name == "bsa_sm120_blk64_bf16_gqa8_bn1_bs3_dyn"
 
+    fp8_variant = Sm120AotVariant("fp8", 1, True, 3)
+    assert fp8_variant.is_fp8
+    assert fp8_variant.has_block_sizes
+    assert fp8_variant.name == "bsa_sm120_blk64_fp8_gqa1_bn1_bs3_dyn"
+    assert Sm120AotVariant.from_dict(fp8_variant.to_dict()) == fp8_variant
+
     with pytest.raises(ValueError, match="dtype"):
         Sm120AotVariant("fp32", 1, False, 0)
     with pytest.raises(ValueError, match="gqa_ratio"):
         Sm120AotVariant("bf16", 0, False, 0)
     with pytest.raises(ValueError, match="block_sizes_mode"):
         Sm120AotVariant("bf16", 1, False, 4)
+    with pytest.raises(ValueError, match="gqa_ratio=1"):
+        Sm120AotVariant("fp8", 2, False, 0)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    tuple(
+        Sm120AotVariant("fp8", 1, has_block_nums, block_sizes_mode)
+        for has_block_nums in (False, True)
+        for block_sizes_mode in range(4)
+    ),
+)
+def test_sm120_fp8_aot_fake_abi(variant: Sm120AotVariant):
+    args = make_sm120_aot_fake_args(variant)
+
+    assert len(args) == 14
+    assert args[0].element_type is cutlass.Float8E4M3FN
+    assert args[1].element_type is cutlass.Float8E4M3FN
+    assert args[2].element_type is cutlass.Float8E4M3FN
+    assert args[3].element_type is cutlass.BFloat16
+    assert args[4].element_type is cutlass.Float32
+    assert args[5].element_type is cutlass.Float32
+    assert args[6].element_type is cutlass.Float32
+    assert args[7].element_type is cutlass.Float32
+    assert args[8].element_type is cutlass.Int32
+    assert args[9].element_type is cutlass.Int32
+    assert args[11].element_type is cutlass.Int32
+    assert (args[9] is not args[8]) == variant.has_block_nums
+    if variant.has_block_sizes:
+        assert args[11] is not args[9]
+    else:
+        assert args[11] is args[9]
 
 
 def test_sm120_aot_requires_dynamic_layout_capable_dsl():
-    assert SM120_AOT_MIN_CUTLASS_DSL_VERSION == "4.5.2"
-    require_sm120_aot_cutlass_dsl_version("4.5.2")
-    require_sm120_aot_cutlass_dsl_version("4.6.0.dev0")
+    assert SM120_AOT_MIN_CUTLASS_DSL_VERSION == "4.6.1"
+    require_sm120_aot_cutlass_dsl_version("4.6.1")
+    require_sm120_aot_cutlass_dsl_version("4.7.0.dev0")
 
-    with pytest.raises(RuntimeError, match="nvidia-cutlass-dsl>=4.5.2"):
-        require_sm120_aot_cutlass_dsl_version("4.4.2")
+    with pytest.raises(RuntimeError, match="nvidia-cutlass-dsl>=4.6.1"):
+        require_sm120_aot_cutlass_dsl_version("4.6.0")
     with pytest.raises(RuntimeError, match="Cannot parse"):
         require_sm120_aot_cutlass_dsl_version("unknown")
 
@@ -155,13 +211,24 @@ def test_sm120_aot_loader_verifies_and_caches_artifact(tmp_path: Path, monkeypat
     _write_compatible_sm120_artifact(tmp_path, variant)
     kernel = object()
     load_calls = []
+    fingerprint_calls = []
+    source_fingerprint = compute_sm120_aot_source_fingerprint()
 
     def fake_load_module(path, enable_tvm_ffi):
         load_calls.append((path, enable_tvm_ffi))
         return SimpleNamespace(**{variant.name: kernel})
 
+    def fake_compute_source_fingerprint():
+        fingerprint_calls.append(None)
+        return source_fingerprint
+
     clear_sm120_aot_runtime_cache()
     monkeypatch.setattr(aot_runtime.cute.runtime, "load_module", fake_load_module)
+    monkeypatch.setattr(
+        aot_runtime,
+        "compute_sm120_aot_source_fingerprint",
+        fake_compute_source_fingerprint,
+    )
     tensor = torch.empty((2, 3))
 
     first = get_sm120_aot_kernel(variant, 120, (tensor,), root=tmp_path)
@@ -170,7 +237,15 @@ def test_sm120_aot_loader_verifies_and_caches_artifact(tmp_path: Path, monkeypat
     assert first is kernel
     assert second is kernel
     assert len(load_calls) == 1
+    assert len(fingerprint_calls) == 1
     assert load_calls[0][1] is False
+
+    clear_sm120_aot_runtime_cache()
+    third = get_sm120_aot_kernel(variant, 120, (tensor,), root=tmp_path)
+
+    assert third is kernel
+    assert len(load_calls) == 2
+    assert len(fingerprint_calls) == 2
     clear_sm120_aot_runtime_cache()
 
 
@@ -344,9 +419,16 @@ def test_sm120_aot_loader_rejects_cuda_runtime_mismatch(
     os.getenv("BSA_TEST_SM120_AOT_BUILD") != "1",
     reason="Set BSA_TEST_SM120_AOT_BUILD=1 to run the SM120 cross-compile test",
 )
-def test_build_sm120_aot_artifact(tmp_path: Path):
-    variant = Sm120AotVariant("bf16", 1, False, 0)
-
+@pytest.mark.parametrize(
+    "variant",
+    (
+        Sm120AotVariant("bf16", 1, False, 0),
+        Sm120AotVariant("fp8", 1, False, 0),
+        Sm120AotVariant("fp8", 1, True, 3),
+    ),
+    ids=("bf16", "fp8-fixed", "fp8-variable-masked"),
+)
+def test_build_sm120_aot_artifact(tmp_path: Path, variant: Sm120AotVariant):
     manifest_path = build_sm120_aot_artifacts(
         tmp_path,
         (variant,),
@@ -637,6 +719,180 @@ def test_sm120_aot_only_forward_matrix(
         has_block_nums,
         block_sizes_mode,
     )
+
+
+@pytest.mark.skipif(
+    _SKIP_RUNTIME_TEST,
+    reason="Set BSA_TEST_SM120_AOT_RUNTIME=1 and run on SM120",
+)
+@pytest.mark.parametrize(
+    (
+        "heads",
+        "seqlen_q",
+        "seqlen_k",
+        "capacity",
+        "has_block_nums",
+        "block_sizes_mode",
+    ),
+    (
+        (2, 96, 209, 3, False, 0),
+        (3, 65, 127, 2, True, 3),
+        (4, 128, 256, 3, False, 0),
+        (4, 128, 256, 3, True, 0),
+        (4, 128, 256, 3, False, 1),
+        (4, 128, 256, 3, True, 1),
+        (8, 64, 320, 4, False, 2),
+        (8, 64, 320, 4, True, 2),
+        (8, 64, 320, 4, False, 3),
+        (8, 64, 320, 4, True, 3),
+    ),
+)
+def test_sm120_aot_only_fp8_forward(
+    heads,
+    seqlen_q,
+    seqlen_k,
+    capacity,
+    has_block_nums,
+    block_sizes_mode,
+    monkeypatch,
+):
+    assert os.getenv(SM120_AOT_DIR_ENV), f"{SM120_AOT_DIR_ENV} must be set"
+    monkeypatch.setenv(SM120_AOT_ONLY_ENV, "1")
+
+    def fail_compile(*args, **kwargs):
+        raise AssertionError("cute.compile must not run during FP8 AOT validation")
+
+    monkeypatch.setattr(bsa_attn_interface.cute, "compile", fail_compile)
+    torch.manual_seed(1208)
+    batch, head_dim = 1, 128
+    q = torch.randn(
+        (batch, heads, seqlen_q, head_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    k = torch.randn(
+        (batch, heads, seqlen_k, head_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    v = torch.randn_like(k)
+    q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale = quantize_sage_bhsd(
+        q,
+        k,
+        v,
+    )
+    num_q_blocks = math.ceil(seqlen_q / 64)
+    num_kv_blocks = math.ceil(seqlen_k / 64)
+    indices = torch.empty(
+        (batch, heads, num_q_blocks, capacity),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    base_indices = torch.arange(
+        num_kv_blocks,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    for head_idx in range(heads):
+        for q_block_idx in range(num_q_blocks):
+            shift = (head_idx + q_block_idx) % num_kv_blocks
+            indices[0, head_idx, q_block_idx] = torch.roll(
+                base_indices,
+                shifts=shift,
+            )[:capacity]
+    if has_block_nums:
+        block_nums = torch.empty(
+            (batch, heads, num_q_blocks),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        for head_idx in range(heads):
+            for q_block_idx in range(num_q_blocks):
+                block_nums[0, head_idx, q_block_idx] = 1 + (
+                    head_idx + q_block_idx
+                ) % capacity
+    else:
+        block_nums = None
+    block_sizes = _make_runtime_block_sizes(
+        block_sizes_mode,
+        batch,
+        heads,
+        seqlen_k,
+        torch.device("cuda"),
+    )
+    softmax_scale = head_dim**-0.5
+
+    out = bsa_fp8_blk64_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_scale,
+        k_scale,
+        v_scale,
+        indices,
+        0 if has_block_nums else capacity,
+        softmax_scale,
+        block_sizes=block_sizes if block_sizes.numel() else None,
+        q2k_block_nums=block_nums,
+    )
+
+    q_dequant = q_fp8.float() * q_scale.unsqueeze(-1)
+    k_dequant = (
+        k_fp8.float()
+        * k_scale.repeat_interleave(16, dim=-1)[..., :seqlen_k].unsqueeze(-1)
+    )
+    v_dequant = v_fp8.float() * v_scale.view(1, heads, 1, head_dim)
+    ref = torch.empty_like(out, dtype=torch.float32)
+    for head_idx in range(heads):
+        for q_block_idx in range(num_q_blocks):
+            count = (
+                int(block_nums[0, head_idx, q_block_idx])
+                if block_nums is not None
+                else capacity
+            )
+            token_ids = []
+            for physical_idx in indices[
+                0, head_idx, q_block_idx, :count
+            ].tolist():
+                block_size = _runtime_block_size(
+                    block_sizes,
+                    block_sizes_mode,
+                    0,
+                    head_idx,
+                    physical_idx,
+                    seqlen_k,
+                )
+                token_ids.extend(
+                    range(
+                        physical_idx * 64,
+                        physical_idx * 64 + block_size,
+                    )
+                )
+            kv_tokens = torch.tensor(
+                token_ids,
+                dtype=torch.long,
+                device="cuda",
+            )
+            q_tile = q_dequant[
+                0,
+                head_idx,
+                q_block_idx * 64 : (q_block_idx + 1) * 64,
+            ]
+            k_tile = k_dequant[0, head_idx].index_select(0, kv_tokens)
+            v_tile = v_dequant[0, head_idx].index_select(0, kv_tokens)
+            probabilities = torch.softmax(
+                q_tile @ k_tile.transpose(0, 1) * softmax_scale,
+                dim=-1,
+            )
+            ref[
+                0,
+                head_idx,
+                q_block_idx * 64 : (q_block_idx + 1) * 64,
+            ] = probabilities @ v_tile
+
+    diff = (out.float() - ref).abs()
+    assert diff.max().item() < 0.15
+    assert (diff.mean() / ref.abs().mean()).item() < 0.029
 
 
 @pytest.mark.skipif(

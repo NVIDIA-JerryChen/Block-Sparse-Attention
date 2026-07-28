@@ -1,4 +1,4 @@
-"""Public import shim for the forward-only SM100 FP8 blk64 BSA."""
+"""Public import shim for forward-only SM100 and SM120 FP8 blk64 BSA."""
 
 if __package__:
     from .bsa_attn_interface import bsa_fp8_blk64_fwd

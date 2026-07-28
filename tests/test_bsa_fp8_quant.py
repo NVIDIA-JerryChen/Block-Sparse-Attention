@@ -13,8 +13,36 @@ def test_quantize_sage_bhsd_rejects_cpu_inputs():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_quantize_sage_bhsd_rejects_unaligned_sequences():
+def test_quantize_sage_bhsd_sequence_alignment_contract():
     from bsa_fp8_quant import quantize_sage_bhsd
+
+    q = torch.empty((1, 4, 65, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.empty((1, 4, 64, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.empty_like(k)
+    if torch.cuda.get_device_capability()[0] == 12:
+        actual = quantize_sage_bhsd(q, k, v)
+        assert actual[0].shape == q.shape
+        assert actual[1].shape == k.shape
+        assert actual[2].shape == v.shape
+    else:
+        with pytest.raises(ValueError, match="multiples of 64"):
+            quantize_sage_bhsd(q, k, v)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_quantize_sage_bhsd_preserves_sm100_v1_contract(monkeypatch):
+    from bsa_fp8_quant import quantize_sage_bhsd
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda device=None: (10, 0),
+    )
+    q = torch.empty((1, 2, 64, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.empty_like(q)
+    v = torch.empty_like(k)
+    with pytest.raises(ValueError, match=r"H in \{4, 8\}"):
+        quantize_sage_bhsd(q, k, v)
 
     q = torch.empty((1, 4, 65, 128), device="cuda", dtype=torch.bfloat16)
     k = torch.empty((1, 4, 64, 128), device="cuda", dtype=torch.bfloat16)

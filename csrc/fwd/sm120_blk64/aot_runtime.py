@@ -64,6 +64,12 @@ def is_sm120_aot_layout_supported(tensors: Iterable[torch.Tensor]) -> bool:
     return all(stride != 0 for tensor in tensors for stride in tensor.stride())
 
 
+@functools.cache
+def _compute_sm120_aot_source_fingerprint_cached() -> str:
+    """Compute the runtime source fingerprint once per cache lifetime."""
+    return compute_sm120_aot_source_fingerprint()
+
+
 def _validate_manifest_compatibility(manifest: dict, target_arch: str) -> None:
     if manifest["target_arch"] != target_arch:
         raise Sm120AotArtifactError(
@@ -90,7 +96,7 @@ def _validate_manifest_compatibility(manifest: dict, target_arch: str) -> None:
                 f"SM120 AOT CUDA version mismatch: manifest has "
                 f"{manifest_cuda_version}, runtime has {cuda_version}"
             )
-    source_fingerprint = compute_sm120_aot_source_fingerprint()
+    source_fingerprint = _compute_sm120_aot_source_fingerprint_cached()
     if manifest.get("source_fingerprint") != source_fingerprint:
         raise Sm120AotArtifactError(
             "SM120 AOT source fingerprint mismatch; rebuild the AOT artifacts "
@@ -127,6 +133,7 @@ def _load_kernel_cached(
 
 
 def clear_sm120_aot_runtime_cache() -> None:
+    _compute_sm120_aot_source_fingerprint_cached.cache_clear()
     _load_manifest_cached.cache_clear()
     _load_kernel_cached.cache_clear()
 

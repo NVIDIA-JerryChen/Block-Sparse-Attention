@@ -24,11 +24,15 @@ from block_sparse_attention.csrc.fwd.sm120_blk64.aot_utils import (
 from block_sparse_attention.csrc.fwd.sm120_blk64.bsa_fwd_sm120 import (
     BlockSparseAttnForwardSm120Blk64,
 )
+from block_sparse_attention.csrc.fwd.sm120_blk64.bsa_fwd_sm120_fp8 import (
+    BlockSparseAttnForwardFp8Sm120Blk64,
+)
 
 
 _DTYPES = {
     "bf16": cutlass.BFloat16,
     "fp16": cutlass.Float16,
+    "fp8": cutlass.Float8E4M3FN,
 }
 
 
@@ -51,7 +55,8 @@ def make_sm120_aot_fake_args(variant: Sm120AotVariant):
     q = _make_dynamic_fake_tensor(dtype, 4, 1, 128)
     k = _make_dynamic_fake_tensor(dtype, 4, 1, 128)
     v = _make_dynamic_fake_tensor(dtype, 4, 0, 128)
-    out = _make_dynamic_fake_tensor(dtype, 4, 1, 128)
+    out_dtype = cutlass.BFloat16 if variant.is_fp8 else dtype
+    out = _make_dynamic_fake_tensor(out_dtype, 4, 1, 128)
     lse = _make_dynamic_fake_tensor(cutlass.Float32, 3, 0, 4)
     indices = _make_dynamic_fake_tensor(cutlass.Int32, 4, 0, None)
     if variant.has_block_nums:
@@ -66,6 +71,26 @@ def make_sm120_aot_fake_args(variant: Sm120AotVariant):
             variant.block_sizes_mode,
             0,
             None,
+        )
+    if variant.is_fp8:
+        q_scale = _make_dynamic_fake_tensor(cutlass.Float32, 3, 0, 4)
+        k_scale = _make_dynamic_fake_tensor(cutlass.Float32, 3, 0, 4)
+        v_scale = _make_dynamic_fake_tensor(cutlass.Float32, 2, 0, 4)
+        return (
+            q,
+            k,
+            v,
+            out,
+            lse,
+            q_scale,
+            k_scale,
+            v_scale,
+            indices,
+            block_nums,
+            cutlass.Int32(1),
+            block_sizes,
+            cutlass.Float32(128**-0.5),
+            cute.runtime.make_fake_stream(),
         )
     return (
         q,
@@ -83,6 +108,22 @@ def make_sm120_aot_fake_args(variant: Sm120AotVariant):
 
 
 def compile_sm120_aot_variant(variant: Sm120AotVariant, target_arch: str):
+    if variant.is_fp8:
+        kernel = BlockSparseAttnForwardFp8Sm120Blk64(
+            gqa_ratio=variant.gqa_ratio,
+            head_dim=128,
+            value_dim=128,
+            dtype=_DTYPES[variant.dtype],
+            acc_dtype=cutlass.Float32,
+            has_block_sizes=variant.has_block_sizes,
+            has_block_nums=variant.has_block_nums,
+            block_sizes_mode=variant.block_sizes_mode,
+        )
+        return cute.compile(
+            kernel,
+            *make_sm120_aot_fake_args(variant),
+            options=f"--gpu-arch {target_arch} --opt-level 3",
+        )
     kernel = BlockSparseAttnForwardSm120Blk64(
         gqa_ratio=variant.gqa_ratio,
         head_dim=128,
@@ -191,7 +232,7 @@ def _create_argument_parser() -> argparse.ArgumentParser:
         default=Path("agent/agent_space/sm120_aot"),
     )
     parser.add_argument("--target-arch", default="sm_120f")
-    parser.add_argument("--dtypes", default="bf16,fp16")
+    parser.add_argument("--dtypes", default="bf16,fp16,fp8")
     parser.add_argument("--gqa-ratios", default="1,2,4,8,16,32,64")
     parser.add_argument("--block-sizes-modes", default="0,1,2,3")
     parser.add_argument(

@@ -163,7 +163,7 @@ def produce_bsa_k2q_csr_q_loads_bwd_sm100(
             load_Q(m_block_safe, producer_state=producer_state_Q_LSE)
             pipeline_Q.producer_commit(producer_state_Q_LSE)
             pipeline_LSE.producer_acquire(producer_state_Q_LSE)
-            with cute.arch.elect_one():
+            with copy_utils.bulk_copy_elect_one():
                 copy_stats(
                     gLSE[None, m_block_safe],
                     sLSE[None, producer_state_Q_LSE.index],
@@ -176,7 +176,7 @@ def produce_bsa_k2q_csr_q_loads_bwd_sm100(
             load_dO(m_block_safe, producer_state=producer_state_dO_dPsum)
             pipeline_dO.producer_commit(producer_state_dO_dPsum)
             pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
-            with cute.arch.elect_one():
+            with copy_utils.bulk_copy_elect_one():
                 copy_stats(
                     gdPsum[None, m_block_safe],
                     sdPsum[None, producer_state_dO_dPsum.index],
@@ -188,7 +188,7 @@ def produce_bsa_k2q_csr_q_loads_bwd_sm100(
             load_Q(m_block_safe, producer_state=producer_state_Q_LSE)
             pipeline_Q.producer_commit(producer_state_Q_LSE)
             pipeline_LSE.producer_acquire(producer_state_Q_LSE)
-            with cute.arch.elect_one():
+            with copy_utils.bulk_copy_elect_one():
                 copy_stats(
                     gLSE[None, m_block_safe],
                     sLSE[None, producer_state_Q_LSE.index],
@@ -200,7 +200,7 @@ def produce_bsa_k2q_csr_q_loads_bwd_sm100(
             load_dO(m_block_safe, producer_state=producer_state_dO_dPsum)
             pipeline_dO.producer_commit(producer_state_dO_dPsum)
             pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
-            with cute.arch.elect_one():
+            with copy_utils.bulk_copy_elect_one():
                 copy_stats(
                     gdPsum[None, m_block_safe],
                     sdPsum[None, producer_state_dO_dPsum.index],
