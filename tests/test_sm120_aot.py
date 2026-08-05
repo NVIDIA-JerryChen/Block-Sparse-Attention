@@ -11,7 +11,9 @@ from block_sparse_attention import (
     bsa_attn_fwd,
     bsa_attn_interface,
     bsa_fp8_blk64_fwd,
+    bsa_sage_blk64_fwd,
     quantize_sage_bhsd,
+    quantize_sage_qkv_sm120,
 )
 from block_sparse_attention.csrc.fwd.sm120_blk64.aot_build import (
     build_sm120_aot_artifacts,
@@ -44,6 +46,9 @@ from block_sparse_attention.csrc.fwd.sm120_blk64.aot_utils import (
 
 _RUNTIME_TEST_ENABLED = os.getenv("BSA_TEST_SM120_AOT_RUNTIME") == "1"
 _IS_SM120 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12
+_IS_SM120_SAGE = (
+    torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
+)
 _SKIP_RUNTIME_TEST = not _RUNTIME_TEST_ENABLED or not _IS_SM120
 
 
@@ -81,27 +86,29 @@ def _write_compatible_sm120_artifact(root: Path, variant: Sm120AotVariant) -> Pa
 
 def test_sm120_aot_variant_matrix_is_deterministic():
     variants = iter_sm120_aot_variants(
-        ("fp16", "bf16", "fp8"),
+        ("fp16", "bf16", "fp8", "sage"),
         (2, 1, 2),
         (True, False),
         (3, 0),
     )
 
-    assert len(variants) == 20
+    assert len(variants) == 24
     assert sum(variant.is_fp8 for variant in variants) == 4
+    assert sum(variant.is_sage for variant in variants) == 4
     assert tuple(variant.name for variant in variants) == tuple(
         sorted(variant.name for variant in variants)
     )
     assert all("split" not in variant.name for variant in variants)
 
     default_variants = iter_sm120_aot_variants(
-        ("bf16", "fp16", "fp8"),
+        ("bf16", "fp16", "fp8", "sage"),
         (1, 2, 4, 8, 16, 32, 64),
         (False, True),
         (0, 1, 2, 3),
     )
-    assert len(default_variants) == 120
+    assert len(default_variants) == 128
     assert sum(variant.is_fp8 for variant in default_variants) == 8
+    assert sum(variant.is_sage for variant in default_variants) == 8
 
 
 def test_sm120_aot_variant_round_trip_and_validation():
@@ -123,6 +130,12 @@ def test_sm120_aot_variant_round_trip_and_validation():
     assert fp8_variant.name == "bsa_sm120_blk64_fp8_gqa1_bn1_bs3_dyn"
     assert Sm120AotVariant.from_dict(fp8_variant.to_dict()) == fp8_variant
 
+    sage_variant = Sm120AotVariant("sage", 1, False, 0)
+    assert sage_variant.is_sage
+    assert not sage_variant.is_fp8
+    assert sage_variant.name == "bsa_sm120_blk64_sage_gqa1_bn0_bs0_dyn"
+    assert Sm120AotVariant.from_dict(sage_variant.to_dict()) == sage_variant
+
     with pytest.raises(ValueError, match="dtype"):
         Sm120AotVariant("fp32", 1, False, 0)
     with pytest.raises(ValueError, match="gqa_ratio"):
@@ -131,6 +144,8 @@ def test_sm120_aot_variant_round_trip_and_validation():
         Sm120AotVariant("bf16", 1, False, 4)
     with pytest.raises(ValueError, match="gqa_ratio=1"):
         Sm120AotVariant("fp8", 2, False, 0)
+    with pytest.raises(ValueError, match="gqa_ratio=1"):
+        Sm120AotVariant("sage", 2, False, 0)
 
 
 @pytest.mark.parametrize(
@@ -161,6 +176,35 @@ def test_sm120_fp8_aot_fake_abi(variant: Sm120AotVariant):
         assert args[11] is not args[9]
     else:
         assert args[11] is args[9]
+
+
+@pytest.mark.parametrize(
+    "variant",
+    tuple(
+        Sm120AotVariant("sage", 1, has_block_nums, block_sizes_mode)
+        for has_block_nums in (False, True)
+        for block_sizes_mode in range(4)
+    ),
+)
+def test_sm120_sage_aot_fake_abi(variant: Sm120AotVariant):
+    args = make_sm120_aot_fake_args(variant)
+
+    assert len(args) == 13
+    assert args[0].element_type is cutlass.Int8
+    assert args[1].element_type is cutlass.Int8
+    assert args[2].element_type is cutlass.Float8E4M3FN
+    assert args[3].element_type is cutlass.BFloat16
+    assert args[4].element_type is cutlass.Float32
+    assert args[5].element_type is cutlass.Float32
+    assert args[6].element_type is cutlass.Float32
+    assert args[7].element_type is cutlass.Int32
+    assert args[8].element_type is cutlass.Int32
+    assert args[10].element_type is cutlass.Int32
+    assert (args[8] is not args[7]) == variant.has_block_nums
+    if variant.has_block_sizes:
+        assert args[10] is not args[8]
+    else:
+        assert args[10] is args[8]
 
 
 def test_sm120_aot_requires_dynamic_layout_capable_dsl():
@@ -425,8 +469,9 @@ def test_sm120_aot_loader_rejects_cuda_runtime_mismatch(
         Sm120AotVariant("bf16", 1, False, 0),
         Sm120AotVariant("fp8", 1, False, 0),
         Sm120AotVariant("fp8", 1, True, 3),
+        Sm120AotVariant("sage", 1, False, 0),
     ),
-    ids=("bf16", "fp8-fixed", "fp8-variable-masked"),
+    ids=("bf16", "fp8-fixed", "fp8-variable-masked", "sage-fixed"),
 )
 def test_build_sm120_aot_artifact(tmp_path: Path, variant: Sm120AotVariant):
     manifest_path = build_sm120_aot_artifacts(
@@ -443,6 +488,18 @@ def test_build_sm120_aot_artifact(tmp_path: Path, variant: Sm120AotVariant):
     shared_library = artifact_dir / entry["shared_library"]
     assert shared_library.is_file()
     assert sha256_file(shared_library) == entry["sha256"]
+    quantization = manifest["quantization"]
+    quant_library = artifact_dir / quantization["shared_library"]
+    assert quant_library.is_file()
+    assert sha256_file(quant_library) == quantization["sha256"]
+    assert set(quantization["functions"]) == {
+        "q",
+        "stats_partial",
+        "stats_finalize",
+        "kv",
+    }
+    assert all((artifact_dir / name).is_file() for name in quantization["sources"])
+    assert all((artifact_dir / name).is_file() for name in quantization["headers"])
 
     clear_sm120_aot_runtime_cache()
     kernel = get_sm120_aot_kernel(
@@ -893,6 +950,78 @@ def test_sm120_aot_only_fp8_forward(
     diff = (out.float() - ref).abs()
     assert diff.max().item() < 0.15
     assert (diff.mean() / ref.abs().mean()).item() < 0.029
+
+
+@pytest.mark.skipif(
+    not _RUNTIME_TEST_ENABLED or not _IS_SM120_SAGE,
+    reason="Set BSA_TEST_SM120_AOT_RUNTIME=1 and run on SM120",
+)
+def test_sm120_aot_only_sage_forward(tmp_path: Path, monkeypatch):
+    artifact_root = os.getenv(SM120_AOT_DIR_ENV)
+    assert artifact_root, f"{SM120_AOT_DIR_ENV} must be set"
+
+    batch, heads, seqlen_q, seqlen_k, capacity = 2, 3, 137, 309, 3
+    torch.manual_seed(1210)
+    q = torch.randn(
+        (batch, heads, seqlen_q, 128),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    k = torch.randn(
+        (batch, heads, seqlen_k, 128),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    v = torch.randn_like(k)
+    num_q_blocks = math.ceil(seqlen_q / 64)
+    num_kv_blocks = math.ceil(seqlen_k / 64)
+    indices = torch.empty(
+        (batch, heads, num_q_blocks, capacity),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    for batch_idx in range(batch):
+        for head_idx in range(heads):
+            for q_block_idx in range(num_q_blocks):
+                selected = torch.randperm(num_kv_blocks, device="cuda")[:capacity]
+                indices[batch_idx, head_idx, q_block_idx] = selected.sort().values
+
+    # Force a JIT baseline even when an AOT bundle is configured externally.
+    monkeypatch.setenv(SM120_AOT_DIR_ENV, str(tmp_path / "missing-aot"))
+    monkeypatch.delenv(SM120_AOT_ONLY_ENV, raising=False)
+    clear_sm120_aot_runtime_cache()
+    launcher = bsa_attn_interface._bsa_attn_fwd_sm120_sage_blk64
+    launcher.compile_cache.clear()
+    quantized = quantize_sage_qkv_sm120(q, k, v)
+    expected = bsa_sage_blk64_fwd(*quantized, indices, capacity)
+    torch.cuda.synchronize()
+
+    monkeypatch.setenv(SM120_AOT_DIR_ENV, artifact_root)
+    monkeypatch.setenv(SM120_AOT_ONLY_ENV, "1")
+    clear_sm120_aot_runtime_cache()
+    launcher.compile_cache.clear()
+
+    class FailJitCache:
+        def __contains__(self, key):
+            raise AssertionError(f"Sage attention JIT cache used for key {key}")
+
+    def fail_compile(*args, **kwargs):
+        raise AssertionError("cute.compile must not run during Sage AOT validation")
+
+    monkeypatch.setattr(launcher, "compile_cache", FailJitCache())
+    monkeypatch.setattr(bsa_attn_interface.cute, "compile", fail_compile)
+    out_buffer = torch.empty_like(q)
+    actual = bsa_sage_blk64_fwd(
+        *quantized,
+        indices,
+        capacity,
+        out=out_buffer,
+    )
+    torch.cuda.synchronize()
+
+    assert actual is out_buffer
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+    clear_sm120_aot_runtime_cache()
 
 
 @pytest.mark.skipif(

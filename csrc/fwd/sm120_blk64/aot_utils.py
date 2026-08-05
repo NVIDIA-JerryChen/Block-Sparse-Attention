@@ -25,7 +25,7 @@ class Sm120AotVariant:
     layout_mode: str = SM120_AOT_LAYOUT_MODE
 
     def __post_init__(self) -> None:
-        if self.dtype not in ("bf16", "fp16", "fp8"):
+        if self.dtype not in ("bf16", "fp16", "fp8", "sage"):
             raise ValueError(f"Unsupported SM120 AOT dtype: {self.dtype}")
         if self.gqa_ratio < 1:
             raise ValueError("gqa_ratio must be >= 1")
@@ -33,9 +33,11 @@ class Sm120AotVariant:
             raise ValueError("block_sizes_mode must be one of 0, 1, 2, or 3")
         if self.layout_mode != SM120_AOT_LAYOUT_MODE:
             raise ValueError(f"Unsupported SM120 AOT layout mode: {self.layout_mode}")
-        if self.dtype == "fp8":
+        if self.dtype in ("fp8", "sage"):
             if self.gqa_ratio != 1:
-                raise ValueError("SM120 Sage FP8 AOT currently requires gqa_ratio=1")
+                raise ValueError(
+                    "SM120 quantized AOT variants currently require gqa_ratio=1"
+                )
 
     @property
     def has_block_sizes(self) -> bool:
@@ -44,6 +46,10 @@ class Sm120AotVariant:
     @property
     def is_fp8(self) -> bool:
         return self.dtype == "fp8"
+
+    @property
+    def is_sage(self) -> bool:
+        return self.dtype == "sage"
 
     @property
     def name(self) -> str:
@@ -78,7 +84,7 @@ def iter_sm120_aot_variants(
         for gqa_ratio in gqa_ratios:
             for has_block_nums in has_block_nums_values:
                 for block_sizes_mode in block_sizes_modes:
-                    if dtype == "fp8" and gqa_ratio != 1:
+                    if dtype in ("fp8", "sage") and gqa_ratio != 1:
                         continue
                     variants.add(
                         Sm120AotVariant(
@@ -141,6 +147,8 @@ def compute_sm120_aot_source_fingerprint(repo_root: Path | None = None) -> str:
         repo_root = Path(__file__).resolve().parents[3]
     source_paths = [
         repo_root / "bsa_attn_interface.py",
+        repo_root / "bsa_sage_blk64.py",
+        repo_root / "bsa_sage_quant.py",
         repo_root / "utils" / "cache_utils.py",
         *sorted((repo_root / "csrc" / "fwd" / "sm120_blk64").glob("*.py")),
         *sorted((repo_root / "csrc" / "utils").glob("*.py")),
@@ -178,6 +186,38 @@ def validate_sm120_aot_manifest(manifest: dict) -> dict:
         for field in ("function_name", "object", "header", "shared_library", "sha256"):
             if not entry.get(field):
                 raise ValueError(f"SM120 AOT variant {name} is missing {field}")
+    quantization = manifest.get("quantization")
+    if quantization is not None:
+        if not isinstance(quantization, dict):
+            raise ValueError("SM120 AOT manifest quantization must be an object")
+        for field in (
+            "triton_version",
+            "shared_library",
+            "sha256",
+            "functions",
+            "sources",
+            "headers",
+        ):
+            if not quantization.get(field):
+                raise ValueError(
+                    f"SM120 AOT quantization entry is missing {field}"
+                )
+        functions = quantization["functions"]
+        if not isinstance(functions, dict):
+            raise ValueError("SM120 AOT quantization functions must be an object")
+        for name in ("q", "stats_partial", "stats_finalize", "kv"):
+            if not functions.get(name):
+                raise ValueError(
+                    f"SM120 AOT quantization functions are missing {name}"
+                )
+        for field in ("sources", "headers"):
+            paths = quantization[field]
+            if not isinstance(paths, list) or not all(
+                isinstance(path, str) and path for path in paths
+            ):
+                raise ValueError(
+                    f"SM120 AOT quantization {field} must be a non-empty string list"
+                )
     return manifest
 
 

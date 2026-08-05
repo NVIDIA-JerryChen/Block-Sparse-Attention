@@ -43,6 +43,9 @@ from block_sparse_attention.csrc.fwd.sm120_blk64.bsa_fwd_sm120 import (
 from block_sparse_attention.csrc.fwd.sm120_blk64.bsa_fwd_sm120_fp8 import (
     BlockSparseAttnForwardFp8Sm120Blk64,
 )
+from block_sparse_attention.csrc.fwd.sm120_blk64.bsa_fwd_sm120_sage import (
+    BlockSparseAttnForwardSageSm120Blk64,
+)
 from block_sparse_attention.csrc.fwd.sm120_blk64.aot_runtime import get_sm120_aot_kernel
 from block_sparse_attention.csrc.fwd.sm120_blk64.aot_utils import Sm120AotVariant
 
@@ -186,6 +189,7 @@ def _workaround_cutlass_hash_import_bug():
 
 
 torch2cute_dtype_map = {
+    torch.int8: cutlass.Int8,
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
@@ -371,6 +375,29 @@ def _sm120_fp8_fwd_compile_key(
         ),
         tensors,
         leading_dims=(1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0),
+    )
+
+
+def _sm120_sage_fwd_compile_key(
+    arch: int,
+    has_block_nums: bool,
+    has_block_sizes: bool,
+    block_sizes_mode: int,
+    tensors: tuple[torch.Tensor, ...],
+):
+    """Build the SM120 Sage INT8/FP8 key from its dynamic native ABI."""
+    assert len(tensors) == 10
+    return _dynamic_tensors_compile_key(
+        "sm120_blk64_sage_fwd",
+        (
+            int(arch),
+            SM120_FWD_BLOCK_SIZE,
+            bool(has_block_nums),
+            bool(has_block_sizes),
+            int(block_sizes_mode),
+        ),
+        tensors,
+        leading_dims=(1, 1, 1, 1, 0, 0, 0, 0, 0, 0),
     )
 
 
@@ -1398,6 +1425,165 @@ def _bsa_attn_fwd_sm120_fp8_blk64(
 
 _bsa_attn_fwd_sm120_fp8_blk64.compile_cache = get_jit_cache(
     "bsa_fwd_sm120_fp8_blk64"
+)
+
+
+def _bsa_attn_fwd_sm120_sage_blk64(
+    q_int8: torch.Tensor,
+    k_int8: torch.Tensor,
+    v_fp8: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    block_sparse_num: int,
+    softmax_scale: float,
+    block_sizes: Optional[torch.Tensor] = None,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Launch the native SM120 Sage INT8-QK/FP8-PV blk64 kernel."""
+    batch, num_heads, seqlen_q, head_dim = q_int8.shape
+    seqlen_k = k_int8.shape[2]
+    num_q_blocks = _ceil_div_int(seqlen_q, SM120_FWD_BLOCK_SIZE)
+    num_kv_blocks = _ceil_div_int(seqlen_k, SM120_FWD_BLOCK_SIZE)
+    (
+        has_block_nums,
+        has_block_sizes,
+        block_sizes_mode,
+        q2k_t,
+        q2k_nums_t,
+        block_sizes_t,
+    ) = _prepare_sm120_sparse_metadata(
+        q2k_block_index,
+        q2k_block_nums,
+        block_sizes,
+        block_sparse_num,
+        batch_size=batch,
+        num_heads=num_heads,
+        num_q_blocks=num_q_blocks,
+        num_kv_blocks=num_kv_blocks,
+        device=q_int8.device,
+    )
+
+    if out is None:
+        out = torch.empty(
+            (batch, num_heads, seqlen_q, head_dim),
+            dtype=torch.bfloat16,
+            device=q_int8.device,
+        )
+
+    q_t = q_int8.permute(2, 3, 1, 0)
+    k_t = k_int8.permute(2, 3, 1, 0)
+    v_t = v_fp8.permute(2, 3, 1, 0)
+    out_t = out.permute(2, 3, 1, 0)
+    q_scale_t = q_scale.permute(2, 1, 0)
+    k_scale_t = k_scale.permute(2, 1, 0)
+    v_scale_t = v_scale.permute(2, 1, 0)
+
+    q_cute = _to_cute_tensor(
+        q_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False
+    )
+    k_cute = _to_cute_tensor(
+        k_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False
+    )
+    v_cute = _to_cute_tensor(
+        v_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False
+    )
+    out_cute = _to_cute_tensor(
+        out_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False
+    )
+    q_scale_cute = _to_cute_tensor(
+        q_scale_t, assumed_align=4, leading_dim=0, enable_tvm_ffi=False
+    )
+    k_scale_cute = _to_cute_tensor(
+        k_scale_t, assumed_align=4, leading_dim=0, enable_tvm_ffi=False
+    )
+    v_scale_cute = _to_cute_tensor(
+        v_scale_t, assumed_align=4, leading_dim=0, enable_tvm_ffi=False
+    )
+    q2k_cute = _to_cute_tensor(
+        q2k_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False
+    )
+    q2k_nums_cute = _to_cute_tensor(
+        q2k_nums_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False
+    )
+    block_sizes_cute = _to_cute_tensor(
+        block_sizes_t,
+        assumed_align=None,
+        leading_dim=0,
+        enable_tvm_ffi=False,
+    )
+
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    fwd_kernel = BlockSparseAttnForwardSageSm120Blk64(
+        gqa_ratio=1,
+        head_dim=head_dim,
+        value_dim=head_dim,
+        blocksparse_blocksize_q=SM120_FWD_BLOCK_SIZE,
+        blocksparse_blocksize_k=SM120_FWD_BLOCK_SIZE,
+        has_block_sizes=has_block_sizes,
+        has_block_nums=has_block_nums,
+        block_sizes_mode=block_sizes_mode,
+    )
+    runtime_tensors = (
+        q_t,
+        k_t,
+        v_t,
+        out_t,
+        q_scale_t,
+        k_scale_t,
+        v_scale_t,
+        q2k_t,
+        q2k_nums_t,
+        block_sizes_t,
+    )
+    compile_key = _sm120_sage_fwd_compile_key(
+        _get_device_arch(),
+        has_block_nums,
+        has_block_sizes,
+        block_sizes_mode,
+        runtime_tensors,
+    )
+    args = (
+        q_cute,
+        k_cute,
+        v_cute,
+        out_cute,
+        q_scale_cute,
+        k_scale_cute,
+        v_scale_cute,
+        q2k_cute,
+        q2k_nums_cute,
+        block_sparse_num,
+        block_sizes_cute,
+        softmax_scale,
+        current_stream,
+    )
+    variant = Sm120AotVariant(
+        dtype="sage",
+        gqa_ratio=1,
+        has_block_nums=has_block_nums,
+        block_sizes_mode=block_sizes_mode,
+    )
+    launch_kernel = _resolve_sm120_fwd_callable(
+        variant,
+        _get_device_arch(),
+        runtime_tensors,
+        compile_key,
+        fwd_kernel,
+        args,
+        _bsa_attn_fwd_sm120_sage_blk64.compile_cache,
+    )
+
+    if not is_fake_mode():
+        with torch.cuda.nvtx.range("bsa_attn_fwd_sm120_sage_blk64_kernel"):
+            launch_kernel(*args)
+    return out
+
+
+_bsa_attn_fwd_sm120_sage_blk64.compile_cache = get_jit_cache(
+    "bsa_fwd_sm120_sage_blk64"
 )
 
 

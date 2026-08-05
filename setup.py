@@ -46,6 +46,8 @@ class BuildPy(_BuildPy):
                     (package, "bsa_attn_interface", "bsa_attn_interface.py"),
                     (package, "bsa_fp8_blk64", "bsa_fp8_blk64.py"),
                     (package, "bsa_fp8_quant", "bsa_fp8_quant.py"),
+                    (package, "bsa_sage_blk64", "bsa_sage_blk64.py"),
+                    (package, "bsa_sage_quant", "bsa_sage_quant.py"),
                 )
             )
         return modules

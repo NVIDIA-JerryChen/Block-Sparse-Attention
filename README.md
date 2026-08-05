@@ -6,7 +6,7 @@
 
 | | SM120 blk64 (CuTe DSL / AOT + JIT) | SM100 blk128 (CuTe DSL / JIT) | SM90 blk64 (CuTe DSL / AOT + JIT) | SM100/SM110 blk64 (CuTe DSL / JIT) |
 |---|---|---|---|---|
-| Dtype | bf16, fp16, Sage FP8 | bf16, fp16 | bf16, fp16 | bf16, Sage FP8 |
+| Dtype | bf16, fp16, Sage FP8, Sage INT8/FP8 | bf16, fp16 | bf16, fp16 | bf16, Sage FP8 |
 | Head dim | 128 only | 64, 96, 128 | 64, 96, 128 | 128 only |
 | Attention | MHA, GQA, MQA (FP8: MHA) | MHA, GQA, MQA | MHA, GQA, MQA | MHA only |
 | pack_gqa | No | Yes | No | No |
@@ -58,8 +58,11 @@ BSA/
 │   ├── sm120_blk64/                  # blk64 — SM120 CuTe DSL / AOT + JIT
 │   │   ├── bsa_fwd_sm120.py          # SM120 forward kernel
 │   │   ├── bsa_fwd_sm120_fp8.py      # SM120 Sage FP8 forward kernel
+│   │   ├── bsa_fwd_sm120_sage.py     # SM120 Sage INT8/FP8 forward kernel
+│   │   ├── bsa_quant_sm120_sage.py   # Native Sage quantization kernels
 │   │   ├── aot_build.py              # Offline native-ABI artifact builder
 │   │   ├── aot_runtime.py            # Manifest validation and runtime loader
+│   │   ├── quant_aot_runtime.py       # Triton quantization AOT loader
 │   │   └── aot_utils.py              # Variant and artifact metadata
 │   │
 │   └── sm100_blk64/                  # blk64 — SM100/SM110 implementation
@@ -109,6 +112,8 @@ BSA/
 - CUDA 13.0+
 - CuTe DSL (`nvidia-cutlass-dsl>=4.6.1`; AOT artifacts must be built and loaded
   with the same DSL version)
+- Triton (the native Sage quantization AOT library must be loaded with the same
+  Triton version used to build it)
 
 ### Setup
 
@@ -125,7 +130,8 @@ make setup
 ```
 
 The unified wheel and source distribution expose `bsa_attn_fwd`,
-`bsa_attn_bwd`, `bsa_fp8_blk64_fwd`, and `quantize_sage_bhsd` as public APIs.
+`bsa_attn_bwd`, `bsa_fp8_blk64_fwd`, `bsa_sage_blk64_fwd`, and both Sage FP8
+and INT8/FP8 quantization helpers as public APIs.
 They contain all supported forward and backward CuTe DSL kernels, the Sage FP8
 quantization path, and shared Python utilities. They do not contain the SM100
 blk64 C++ implementation, a prebuilt CUDA extension, or the
@@ -269,15 +275,16 @@ block-size layouts, and empty-row cases.
 ### SM120 CuTe DSL AOT
 
 SM120 blk64 forward can be compiled offline and loaded through the CuTe native
-ABI. This removes `cute.compile()` from the deployment process and avoids its
-first-call memory peak. The Python attention API remains unchanged.
+ABI. The native Sage QK INT8 + PV FP8 path also exports its four Triton
+quantization kernels as a self-contained shared library. This removes both
+`cute.compile()` and Triton JIT compilation from AOT-only deployment.
 
 #### Supported configurations
 
 - Target: `sm_120f`
-- Dtype: BF16, FP16, and Sage FP8 E4M3
+- Dtype: BF16, FP16, Sage FP8 E4M3, and Sage QK INT8 + PV FP8
 - QK/value head dimension: 128
-- Attention: MHA, GQA, and MQA for BF16/FP16; MHA for Sage FP8
+- Attention: MHA, GQA, and MQA for BF16/FP16; MHA for both quantized paths
 - Block counts: fixed `block_sparse_num` or runtime `q2k_block_nums`
 - `block_sizes`: absent, `[N]`, `[B, N]`, or `[B, Hq, N]`
 - Split-KV: disabled; SM120 only accepts `kv_splits=1`
@@ -287,7 +294,9 @@ Batch size, absolute head counts, sequence lengths, sparse index capacity,
 active topK, and non-leading tensor strides are runtime dynamic. Dtype, D=128,
 GQA ratio, fixed/variable block-count mode, and `block_sizes` rank select the
 static AOT variant. For example, one `gqa2` artifact can run both `Hq/Hkv=4/2`
-and `8/4`, but ratio 6 requires a `gqa6` artifact. Sage FP8 remains MHA-only.
+and `8/4`, but ratio 6 requires a `gqa6` artifact. Both quantized paths remain
+MHA-only. Sage quantization accepts dynamic B/H/S and does not create
+sequence-length-specific AOT variants.
 
 #### Build artifacts
 
@@ -295,21 +304,22 @@ Build the final artifacts with the same CPU architecture, CUDA runtime, CUTLASS
 DSL version, and BSA source revision as the deployment environment.
 
 ```bash
-# Default matrix: bf16/fp16, GQA ratios 1/2/4/8/16/32/64,
-# fixed/variable block counts, and block_sizes modes 0/1/2/3.
+# Default matrix: bf16/fp16/fp8/sage, GQA ratios 1/2/4/8/16/32/64,
+# fixed/variable block counts, block_sizes modes 0/1/2/3, and Sage quantization.
 make aot-sm120 SM120_AOT_DIR=/shared/bsa-sm120-aot
 
 # A smaller deployment-specific matrix is usually preferable.
 make aot-sm120 \
   SM120_AOT_DIR=/shared/bsa-sm120-aot \
-  SM120_AOT_ARGS='--dtypes bf16,fp16,fp8 --gqa-ratios 1,2,6 --block-nums both --block-sizes-modes 0,1,2,3'
+  SM120_AOT_ARGS='--dtypes bf16,fp16,fp8,sage --gqa-ratios 1,2,6 --block-nums both --block-sizes-modes 0,1,2,3'
 
 # List the default variants without compiling them.
 python -m csrc.fwd.sm120_blk64.aot_build --dry-run
 ```
 
-The default matrix contains 120 variants. A deployment-specific subset is
-recommended to reduce build time and package size.
+The default matrix contains 128 attention variants. A deployment-specific
+subset is recommended to reduce build time and package size. Pass
+`--no-sage-quant` only when the native Sage quantization API is not deployed.
 
 The output bundle is self-describing:
 
@@ -322,11 +332,16 @@ The output bundle is self-describing:
         ├── bsa_sm120_blk64_bf16_gqa1_bn0_bs0_dyn.h
         ├── bsa_sm120_blk64_bf16_gqa1_bn0_bs0_dyn.so
         ├── bsa_sm120_blk64_fp8_gqa1_bn0_bs0_dyn.so
+        ├── bsa_sm120_blk64_sage_gqa1_bn0_bs0_dyn.so
+        ├── bsa_sm120_sage_quant.so
+        ├── bsa_sm120_sage_quant_q.<signature>.c
         └── ...
 ```
 
 The manifest records the CPU/GPU target, CUTLASS DSL and CUDA runtime versions,
 BSA source fingerprint, variant metadata, filenames, and `.so` SHA256 values.
+The quantization entry additionally records the exact Triton version and four
+exported function names.
 
 #### Deploy and load
 
@@ -343,22 +358,74 @@ export BSA_SM120_AOT_ONLY=1
 to the directory containing `manifest.json`. If it is unset, BSA searches
 `csrc/fwd/sm120_blk64/aot_artifacts/<cpu-arch>/sm_120f/`.
 
-With `BSA_SM120_AOT_ONLY=1`, a missing artifact, missing variant, or unsupported
-layout fails before JIT and `cute.compile()` is never called. Without this flag,
-a missing manifest or variant falls back to the existing JIT cache. Version,
+With `BSA_SM120_AOT_ONLY=1`, a missing artifact, missing attention variant,
+missing quantization entry, or unsupported layout fails before JIT; neither
+`cute.compile()` nor Triton JIT launch is used. Without this flag, a missing
+manifest or entry falls back to the existing JIT cache. Version,
 source-fingerprint, and checksum failures always report an error.
 
 #### Call the SM120 kernel
 
 Call `bsa_attn_fwd` with `sparse_block_size=64`. For fixed block counts, omit
 `q2k_block_nums`; for variable counts, pass a `[B, Hq, Q_blocks]` int32 tensor.
-For FP8, call `quantize_sage_bhsd` followed by `bsa_fp8_blk64_fwd`; the API and
-scale contract are identical for AOT and JIT. On SM120, pass optional
+For all-FP8, call `quantize_sage_bhsd` followed by `bsa_fp8_blk64_fwd`. For the
+native Sage mixed path, call `quantize_sage_qkv_sm120` followed by
+`bsa_sage_blk64_fwd`; Q/K are signed INT8, V is E4M3, and output is BF16. Both
+contracts are identical for AOT and JIT. On SM120, pass optional
 `q2k_block_nums=[B, H, Q_blocks]` and `block_sizes=[N]`, `[B, N]`, or
 `[B, H, N]` keyword arguments to select the corresponding sparse metadata
 variant. When `q2k_block_nums` is present, the scalar `topk_num` is ignored.
-SM120 Sage FP8 accepts any positive batch/head counts and non-aligned Q/KV
-tails. SM100/SM110 retain the B=1, H in {4, 8}, and 64-aligned v1 contract.
+Both SM120 quantized paths accept any positive batch/head counts and non-aligned
+Q/KV tails. SM100/SM110 retain the B=1, H in {4, 8}, and 64-aligned v1
+contract.
+
+The native Sage mixed path uses the following quantization and physical-layout
+contract:
+
+- **Q INT8:** each group of 32 query tokens shares one FP32 scale. The
+  quantized tensor keeps the logical `[B, H, Sq, 128]` layout.
+- **K64 INT8:** `K64` means 64 consecutive tokens along the KV sequence
+  dimension, not a head dimension of 64. Each `64 x 128` K tile shares one
+  FP32 scale after channelwise mean centering. This K64 tile is also one
+  `sparse_block_size=64` KV block. The final tile may contain fewer than 64
+  valid tokens and is masked by `block_sizes`.
+- **V FP8 HDS:** V uses one FP32 scale per `[B, H, D]` channel and is emitted as
+  E4M3 with shape `[B, H, 128, Sk_padded]`, where
+  `Sk_padded = ceil(Sk / 64) * 64`. Thus each batch slice has physical HDS
+  rather than logical HSD storage. Within every 16-token group, physical slots
+  contain logical tokens in this order:
+
+  ```text
+  [0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15]
+  ```
+
+  This transpose and permutation are performed by the quantization kernel so
+  that V already matches the FP8 PV Tensor Core operand layout. The attention
+  kernel therefore avoids an in-kernel V transpose and can map the P fragment
+  with lane-local `PRMT` operations instead of cross-lane shuffles. Treat this
+  as an internal physical layout and pass `v_fp8` directly to
+  `bsa_sage_blk64_fwd`; it is not a logical BHSD tensor.
+
+```python
+from block_sparse_attention import (
+    bsa_sage_blk64_fwd,
+    quantize_sage_qkv_sm120,
+)
+
+q_int8, k_int8, v_fp8, q_scale, k_scale, v_scale = (
+    quantize_sage_qkv_sm120(q, k, v)
+)
+out = bsa_sage_blk64_fwd(
+    q_int8,
+    k_int8,
+    v_fp8,
+    q_scale,
+    k_scale,
+    v_scale,
+    q2k_block_index,
+    topk_num,
+)
+```
 
 ```python
 import torch
@@ -398,7 +465,7 @@ Run the AOT-only matrix after building the variants required by the test:
 BSA_SM120_AOT_DIR=/shared/bsa-sm120-aot \
 BSA_SM120_AOT_ONLY=1 \
 BSA_TEST_SM120_AOT_RUNTIME=1 \
-python -m pytest tests/test_sm120_aot.py -q
+python -m pytest tests/test_sm120_aot.py tests/test_sm120_sage_quant_aot.py -q
 ```
 
 The validation monkeypatches `cute.compile()` to fail, so every passing launch
@@ -415,6 +482,7 @@ Common deployment errors:
 | `CUDA version mismatch` | Rebuild under the deployment CUDA runtime. |
 | `source fingerprint mismatch` | Use artifacts built from the delivered BSA source revision. |
 | `checksum mismatch` | Replace the damaged or modified `.so`. |
+| `Triton version mismatch` | Use the build-time Triton version or rebuild the quantization artifacts. |
 | `stride-0 broadcast layouts` | Materialize expanded tensors with `.contiguous()`. |
 | `does not support split-KV` | Set `kv_splits=1`. |
 

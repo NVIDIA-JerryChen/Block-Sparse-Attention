@@ -45,6 +45,8 @@ def packaging_source(tmp_path_factory: pytest.TempPathFactory) -> Path:
         "bsa_attn_interface.py",
         "bsa_fp8_blk64.py",
         "bsa_fp8_quant.py",
+        "bsa_sage_blk64.py",
+        "bsa_sage_quant.py",
         "pyproject.toml",
         "setup.py",
     ):
@@ -123,6 +125,8 @@ def test_source_tree_keeps_existing_layout() -> None:
     assert (REPO_ROOT / "bsa_attn_interface.py").is_file()
     assert (REPO_ROOT / "bsa_fp8_blk64.py").is_file()
     assert (REPO_ROOT / "bsa_fp8_quant.py").is_file()
+    assert (REPO_ROOT / "bsa_sage_blk64.py").is_file()
+    assert (REPO_ROOT / "bsa_sage_quant.py").is_file()
     assert (REPO_ROOT / "csrc" / "__init__.py").is_file()
     assert (REPO_ROOT / "utils" / "__init__.py").is_file()
     assert not (REPO_ROOT / "block_sparse_attention" / "bsa_attn_interface.py").exists()
@@ -144,9 +148,12 @@ def test_wheel_contains_single_import_package(built_wheel: Path) -> None:
         "block_sparse_attention/bsa_attn_interface.py",
         "block_sparse_attention/bsa_fp8_blk64.py",
         "block_sparse_attention/bsa_fp8_quant.py",
+        "block_sparse_attention/bsa_sage_blk64.py",
+        "block_sparse_attention/bsa_sage_quant.py",
         "block_sparse_attention/csrc/fwd/sm90_blk64/aot_build.py",
         "block_sparse_attention/csrc/fwd/sm90_blk64/aot_runtime.py",
         "block_sparse_attention/csrc/fwd/sm90_blk64/aot_utils.py",
+        "block_sparse_attention/csrc/fwd/sm120_blk64/quant_aot_runtime.py",
         "block_sparse_attention/csrc/fwd/sm100_blk64/cutedsl/bsa_fwd_sm100.py",
         "block_sparse_attention/utils/cache_utils.py",
     } <= names
@@ -181,9 +188,12 @@ def test_sdist_contains_mapped_sources_without_legacy_cpp(built_sdist: Path) -> 
         "bsa_attn_interface.py",
         "bsa_fp8_blk64.py",
         "bsa_fp8_quant.py",
+        "bsa_sage_blk64.py",
+        "bsa_sage_quant.py",
         "csrc/fwd/sm90_blk64/aot_build.py",
         "csrc/fwd/sm90_blk64/aot_runtime.py",
         "csrc/fwd/sm90_blk64/aot_utils.py",
+        "csrc/fwd/sm120_blk64/quant_aot_runtime.py",
         "csrc/fwd/sm100_blk64/cutedsl/bsa_fwd_sm100.py",
         "setup.py",
         "utils/cache_utils.py",
@@ -222,7 +232,12 @@ from block_sparse_attention import (
     bsa_attn_bwd,
     bsa_attn_fwd,
     bsa_fp8_blk64_fwd,
+    bsa_sage_blk64_fwd,
     quantize_sage_bhsd,
+    quantize_sage_kv_sm120,
+    quantize_sage_q_sm120,
+    quantize_sage_qkv_sm120,
+    sage_sm120_kv_quant_workspace_size,
 )
 from block_sparse_attention.bsa_fp8_blk64 import (
     bsa_fp8_blk64_fwd as module_bsa_fp8_blk64_fwd,
@@ -239,7 +254,12 @@ public_apis = {
     "bsa_attn_bwd": bsa_attn_bwd,
     "bsa_attn_fwd": bsa_attn_fwd,
     "bsa_fp8_blk64_fwd": bsa_fp8_blk64_fwd,
+    "bsa_sage_blk64_fwd": bsa_sage_blk64_fwd,
     "quantize_sage_bhsd": quantize_sage_bhsd,
+    "quantize_sage_kv_sm120": quantize_sage_kv_sm120,
+    "quantize_sage_q_sm120": quantize_sage_q_sm120,
+    "quantize_sage_qkv_sm120": quantize_sage_qkv_sm120,
+    "sage_sm120_kv_quant_workspace_size": sage_sm120_kv_quant_workspace_size,
 }
 assert set(block_sparse_attention.__all__) == set(public_apis)
 assert len(block_sparse_attention.__dir__()) == len(set(block_sparse_attention.__dir__()))
@@ -259,6 +279,7 @@ for module_name in (
     "block_sparse_attention.csrc.fwd.sm90_blk64.aot_runtime",
     "block_sparse_attention.csrc.fwd.sm100_blk128.bsa_fwd_sm100",
     "block_sparse_attention.csrc.fwd.sm120_blk64.aot_runtime",
+    "block_sparse_attention.csrc.fwd.sm120_blk64.quant_aot_runtime",
     "block_sparse_attention.utils.cache_utils",
 ):
     importlib.import_module(module_name)
@@ -329,7 +350,12 @@ from block_sparse_attention import (
     bsa_attn_bwd,
     bsa_attn_fwd,
     bsa_fp8_blk64_fwd,
+    bsa_sage_blk64_fwd,
     quantize_sage_bhsd,
+    quantize_sage_kv_sm120,
+    quantize_sage_q_sm120,
+    quantize_sage_qkv_sm120,
+    sage_sm120_kv_quant_workspace_size,
 )
 from block_sparse_attention.bsa_fp8_blk64 import (
     bsa_fp8_blk64_fwd as module_bsa_fp8_blk64_fwd,
@@ -342,7 +368,12 @@ for api in (
     bsa_attn_bwd,
     bsa_attn_fwd,
     bsa_fp8_blk64_fwd,
+    bsa_sage_blk64_fwd,
     quantize_sage_bhsd,
+    quantize_sage_kv_sm120,
+    quantize_sage_q_sm120,
+    quantize_sage_qkv_sm120,
+    sage_sm120_kv_quant_workspace_size,
 ):
     assert callable(api)
 assert module_bsa_fp8_blk64_fwd is bsa_fp8_blk64_fwd
@@ -350,7 +381,12 @@ assert set(block_sparse_attention.__all__) == {
     "bsa_attn_bwd",
     "bsa_attn_fwd",
     "bsa_fp8_blk64_fwd",
+    "bsa_sage_blk64_fwd",
     "quantize_sage_bhsd",
+    "quantize_sage_kv_sm120",
+    "quantize_sage_q_sm120",
+    "quantize_sage_qkv_sm120",
+    "sage_sm120_kv_quant_workspace_size",
 }
 for old_name in ("bsa_attn_fwd_blk64", "bsa_attn_fwd_blk64_cutedsl"):
     assert not hasattr(block_sparse_attention, old_name)
