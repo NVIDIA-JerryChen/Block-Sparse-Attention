@@ -2,7 +2,6 @@ import hashlib
 import json
 import os
 import platform
-import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
@@ -13,7 +12,6 @@ from cuda.bindings import runtime as cuda_runtime
 SM90_AOT_SCHEMA_VERSION = 1
 SM90_AOT_MANIFEST = "manifest.json"
 SM90_AOT_LAYOUT_MODE = "dynamic_strided_nonbroadcast"
-SM90_AOT_MIN_CUTLASS_DSL_VERSION = "4.6.1"
 SM90_AOT_COMBINE_TILE_M = 16
 SM90_AOT_COMBINE_K_BLOCK_SIZE = 64
 SM90_AOT_COMBINE_NUM_THREADS = 128
@@ -181,21 +179,6 @@ def get_cuda_runtime_version() -> str:
     major = int(version) // 1000
     minor = (int(version) % 1000) // 10
     return f"{major}.{minor}"
-
-
-def require_sm90_aot_cutlass_dsl_version(version: str) -> None:
-    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version)
-    if match is None:
-        raise RuntimeError(f"Cannot parse CUTLASS DSL version: {version!r}")
-    current = tuple(int(value) for value in match.groups())
-    minimum = tuple(
-        int(value) for value in SM90_AOT_MIN_CUTLASS_DSL_VERSION.split(".")
-    )
-    if current < minimum:
-        raise RuntimeError(
-            "SM90 dynamic-layout AOT requires nvidia-cutlass-dsl>="
-            f"{SM90_AOT_MIN_CUTLASS_DSL_VERSION}, got {version}"
-        )
 
 
 def get_sm90_aot_artifact_dir(root: Path | str, target_arch: str) -> Path:

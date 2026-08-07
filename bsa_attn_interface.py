@@ -7,12 +7,11 @@ from typing import Optional, Tuple
 
 import torch
 
-import cuda.bindings.driver as cuda
-
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32
 from cutlass.cute.runtime import from_dlpack
+import cuda.bindings.driver as cuda
 from block_sparse_attention.utils.cache_utils import get_jit_cache
 from block_sparse_attention.utils.testing import is_fake_mode
 
@@ -48,6 +47,16 @@ from block_sparse_attention.csrc.fwd.sm120_blk64.bsa_fwd_sm120_sage import (
 )
 from block_sparse_attention.csrc.fwd.sm120_blk64.aot_runtime import get_sm120_aot_kernel
 from block_sparse_attention.csrc.fwd.sm120_blk64.aot_utils import Sm120AotVariant
+from block_sparse_attention.csrc.fwd.sm100_blk64.aot_runtime import (
+    Sm100AotArtifactError,
+    get_sm100_aot_combine_kernel,
+    get_sm100_aot_kernel,
+    is_sm100_aot_only,
+)
+from block_sparse_attention.csrc.fwd.sm100_blk64.aot_utils import (
+    Sm100AotCombineVariant,
+    Sm100AotVariant,
+)
 
 try:
     from block_sparse_attention.csrc.fwd.sm100_blk64.cutedsl.bsa_fwd_combine import (
@@ -100,9 +109,26 @@ from block_sparse_attention.csrc.bwd.bucketed_k2q_csr import build_bucketed_k2q_
 
 
 @lru_cache(maxsize=None)
-def _get_device_arch():
-    major, minor = torch.cuda.get_device_capability()
+def _get_device_arch_for_device(device_index: int) -> int:
+    major, minor = torch.cuda.get_device_capability(device_index)
     return major * 10 + int(minor)
+
+
+def _get_device_arch(device: Optional[torch.device | str | int] = None) -> int:
+    if isinstance(device, int):
+        device_index = device
+    elif device is None:
+        device_index = torch.cuda.current_device()
+    else:
+        cuda_device = torch.device(device)
+        if cuda_device.type != "cuda":
+            raise ValueError(f"expected a CUDA device, got {cuda_device}")
+        device_index = (
+            torch.cuda.current_device()
+            if cuda_device.index is None
+            else cuda_device.index
+        )
+    return _get_device_arch_for_device(device_index)
 
 
 def maybe_contiguous(x):
@@ -681,7 +707,7 @@ _bsa_fp8_blk64_combine_fast_cache = {}
 
 def _bsa_fp8_blk64_fast_key(q: torch.Tensor, kv_splits: int) -> tuple:
     return (
-        _get_device_arch(),
+        _get_device_arch(q.device),
         q.device.index,
         int(kv_splits),
         fa_logging.get_fa_log_level(),
@@ -1633,6 +1659,81 @@ def _make_blk64_combine_cute_args(
     )
 
 
+def _make_sm100_blk64_cute_args(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    q_scale: Optional[torch.Tensor],
+    k_scale: Optional[torch.Tensor],
+    v_scale: Optional[torch.Tensor],
+    softmax_scale: float,
+    q2k_block_index: torch.Tensor,
+    block_sizes: Optional[torch.Tensor],
+    block_sparse_num: int,
+    q2k_block_nums: Optional[torch.Tensor],
+    split_offsets: Optional[torch.Tensor],
+    current_stream,
+    *,
+    enable_tvm_ffi: bool,
+) -> tuple:
+    """Build the SM100 blk64 CuTe ABI without changing optional arguments."""
+    return (
+        _to_cute_tensor(q, enable_tvm_ffi=enable_tvm_ffi),
+        _to_cute_tensor(k, enable_tvm_ffi=enable_tvm_ffi),
+        _to_cute_tensor(v, enable_tvm_ffi=enable_tvm_ffi),
+        _to_cute_tensor(out, enable_tvm_ffi=enable_tvm_ffi),
+        _to_cute_tensor(lse, assumed_align=4, enable_tvm_ffi=enable_tvm_ffi),
+        (
+            _to_cute_tensor(
+                q_scale,
+                assumed_align=4,
+                enable_tvm_ffi=enable_tvm_ffi,
+            )
+            if q_scale is not None
+            else None
+        ),
+        (
+            _to_cute_tensor(
+                k_scale,
+                assumed_align=4,
+                enable_tvm_ffi=enable_tvm_ffi,
+            )
+            if k_scale is not None
+            else None
+        ),
+        (
+            _to_cute_tensor(
+                v_scale,
+                assumed_align=4,
+                enable_tvm_ffi=enable_tvm_ffi,
+            )
+            if v_scale is not None
+            else None
+        ),
+        softmax_scale,
+        _to_cute_tensor(q2k_block_index, enable_tvm_ffi=enable_tvm_ffi),
+        (
+            _to_cute_tensor(block_sizes, enable_tvm_ffi=enable_tvm_ffi)
+            if block_sizes is not None
+            else None
+        ),
+        block_sparse_num,
+        (
+            _to_cute_tensor(q2k_block_nums, enable_tvm_ffi=enable_tvm_ffi)
+            if q2k_block_nums is not None
+            else None
+        ),
+        (
+            _to_cute_tensor(split_offsets, enable_tvm_ffi=enable_tvm_ffi)
+            if split_offsets is not None
+            else None
+        ),
+        current_stream,
+    )
+
+
 def _combine_blk64_kv_bucketed_partials(
     q: torch.Tensor,
     o_partial_phys: torch.Tensor,
@@ -1702,9 +1803,9 @@ def _combine_blk64_kv_bucketed_partials(
     current_stream = (
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         if is_fake_mode()
-        else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        else cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     )
-    device_arch = _get_device_arch()
+    device_arch = _get_device_arch(q.device)
     aot_kernel = None
     if device_arch == 90:
         combine_variant = Sm90AotCombineVariant(
@@ -1713,6 +1814,27 @@ def _combine_blk64_kv_bucketed_partials(
             log_max_splits=log_max_splits,
         )
         aot_kernel = get_sm90_aot_combine_kernel(combine_variant, device_arch)
+    elif (
+        device_arch in (100, 103)
+        and q.dtype == torch.bfloat16
+        and output_dtype == torch.bfloat16
+    ):
+        combine_variant = Sm100AotCombineVariant(
+            dtype="bf16",
+            value_dim=head_dim,
+            log_max_splits=log_max_splits,
+            num_threads=combine_num_threads,
+        )
+        aot_kernel = get_sm100_aot_combine_kernel(
+            combine_variant,
+            device_arch,
+            device_index=q.device.index,
+        )
+        if aot_kernel is None and is_sm100_aot_only():
+            raise Sm100AotArtifactError(
+                "SM100 AOT-only mode is missing the required split-combine "
+                f"variant {combine_variant.name}"
+            )
 
     if aot_kernel is not None:
         if not is_fake_mode():
@@ -1795,11 +1917,12 @@ def _get_precompiled_blk64_kv_combine(
     head_dim: int,
     kv_splits: int,
     use_fast_16_split: bool,
+    device: torch.device,
 ):
     """Return a combine callable already populated by the general warmup path."""
     dtype = torch2cute_dtype_map[output_dtype]
     compile_key = _bsa_fwd_blk64_kv_bucketed_combine_compile_key(
-        _get_device_arch(),
+        _get_device_arch(device),
         dtype,
         head_dim,
         16,
@@ -1853,7 +1976,7 @@ def _combine_blk64_kv_bucketed_partials_precompiled(
         dtype=torch.float32,
         device=q.device,
     )
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    current_stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     compiled_fn(
         o_partial,
         lse_partial,
@@ -1961,7 +2084,7 @@ def _bsa_attn_fwd_blk64(
     """
     assert q.is_cuda and k.is_cuda and v.is_cuda
     assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
-    arch = _get_device_arch()
+    arch = _get_device_arch(q.device)
     arch_family = arch // 10
     if arch_family in (10, 11):
         return _bsa_attn_fwd_sm100_blk64(
@@ -2170,8 +2293,11 @@ def _bsa_attn_fwd_sm100_blk64(
         assert block_sizes is None, "FP8 v1 requires full 64-token KV blocks"
     else:
         assert k_scale is None and v_scale is None, "Q/K/V scales must be provided together"
-        assert q.dtype == torch.bfloat16, "blk64 CuTeDSL requires bf16"
+        assert q.dtype == k.dtype == v.dtype == torch.bfloat16, (
+            "blk64 CuTeDSL requires Q/K/V to all use bf16"
+        )
     assert q.is_cuda and k.is_cuda and v.is_cuda
+    assert q.device == k.device == v.device, "Q/K/V must be on the same CUDA device"
     assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
     auto_kv_splits = isinstance(kv_splits, str)
     if auto_kv_splits:
@@ -2230,19 +2356,30 @@ def _bsa_attn_fwd_sm100_blk64(
         assert requested_lse.shape == (batch_size, num_head, seqlen_q)
         assert requested_lse.dtype == torch.float32
         assert requested_lse.device == q_bhsd.device
+    num_q_blocks = (seqlen_q + 63) // 64
+    num_kv_blocks = (seqlen_k + 63) // 64
     assert q2k_block_index.dtype == torch.int32
+    assert q2k_block_index.device == q_bhsd.device
+    assert q2k_block_index.ndim == 4
+    assert q2k_block_index.shape[:3] == (
+        batch_size,
+        num_head,
+        num_q_blocks,
+    )
     q2k_block_index = maybe_contiguous(q2k_block_index)
     has_block_sizes = block_sizes is not None and block_sizes.numel() > 0
     if has_block_sizes:
         block_sizes = maybe_contiguous(block_sizes)
         assert block_sizes.dtype == torch.int32
+        assert block_sizes.device == q_bhsd.device
+        assert block_sizes.shape == (num_kv_blocks,)
     else:
         block_sizes = None
-    num_q_blocks = (seqlen_q + 63) // 64
     has_variable_block_nums = q2k_block_nums is not None and q2k_block_nums.numel() > 0
     if has_variable_block_nums:
         q2k_block_nums = maybe_contiguous(q2k_block_nums)
         assert q2k_block_nums.dtype == torch.int32
+        assert q2k_block_nums.device == q_bhsd.device
         assert q2k_block_nums.shape == (
             batch_size,
             num_head,
@@ -2277,7 +2414,7 @@ def _bsa_attn_fwd_sm100_blk64(
         softmax_scale = head_dim ** -0.5
 
     dtype = torch2cute_dtype_map[q_bhsd.dtype]
-    arch = _get_device_arch()
+    arch = _get_device_arch(q_bhsd.device)
     sparse_block_size = 64
     qhead_per_kvhead = 1
     tile_m = 64
@@ -2362,7 +2499,7 @@ def _bsa_attn_fwd_sm100_blk64(
     current_stream = (
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         if is_fake_mode()
-        else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        else cuda.CUstream(torch.cuda.current_stream(q_bhsd.device).cuda_stream)
     )
 
     compile_key = _dynamic_tensors_compile_key(
@@ -2406,23 +2543,73 @@ def _bsa_attn_fwd_sm100_blk64(
         ),
     )
 
-    if compile_key not in _bsa_attn_fwd_sm100_blk64.compile_cache:
+    aot_kernel = None
+    sm100_aot_only = is_sm100_aot_only()
+    if is_sage_fp8:
+        if sm100_aot_only:
+            raise Sm100AotArtifactError(
+                "SM100 AOT-only mode supports BF16 forward only; "
+                "Sage/FP8 remains JIT-only"
+            )
+    elif arch in (100, 103):
+        aot_variant = Sm100AotVariant(
+            dtype="bf16",
+            has_block_nums=has_variable_block_nums,
+            allow_empty_block_nums=allow_empty_block_nums,
+            has_block_sizes=has_block_sizes,
+            kv_splits=kv_splits_i,
+            use_clc_scheduler=use_clc_scheduler,
+            use_int64_kv_strides=use_int64_kv_strides,
+        )
+        aot_runtime_tensors = (
+            q_bhsd,
+            k_bhsd,
+            v_bhsd,
+            out_bhsd,
+            lse,
+            q2k_block_index,
+            block_sizes,
+            q2k_block_nums,
+            split_offsets,
+        )
+        aot_kernel = get_sm100_aot_kernel(
+            aot_variant,
+            arch,
+            aot_runtime_tensors,
+        )
+        if aot_kernel is None and sm100_aot_only:
+            raise Sm100AotArtifactError(
+                "SM100 AOT-only mode is missing the required forward variant "
+                f"{aot_variant.name}"
+            )
+    elif sm100_aot_only:
+        raise Sm100AotArtifactError(
+            "SM100 AOT-only mode supports compute capabilities 10.0 and 10.3"
+        )
+
+    if (
+        aot_kernel is None
+        and compile_key not in _bsa_attn_fwd_sm100_blk64.compile_cache
+    ):
         _workaround_cutlass_hash_import_bug()
-        q_tensor, k_tensor, v_tensor, o_tensor = [
-            _to_cute_tensor(t) for t in (q_bhsd, k_bhsd, v_bhsd, out_bhsd)
-        ]
-        lse_tensor = _to_cute_tensor(lse, assumed_align=4)
-        block_index_tensor = _to_cute_tensor(q2k_block_index)
-        block_sizes_tensor = _to_cute_tensor(block_sizes) if has_block_sizes else None
-        block_nums_tensor = (
-            _to_cute_tensor(q2k_block_nums) if has_variable_block_nums else None
+        jit_args = _make_sm100_blk64_cute_args(
+            q_bhsd,
+            k_bhsd,
+            v_bhsd,
+            out_bhsd,
+            lse,
+            q_scale,
+            k_scale,
+            v_scale,
+            softmax_scale,
+            q2k_block_index,
+            block_sizes,
+            uniform_block_sparse_num,
+            q2k_block_nums,
+            split_offsets,
+            current_stream,
+            enable_tvm_ffi=True,
         )
-        split_offsets_tensor = (
-            _to_cute_tensor(split_offsets) if split_offsets is not None else None
-        )
-        q_scale_tensor = _to_cute_tensor(q_scale, assumed_align=4) if is_sage_fp8 else None
-        k_scale_tensor = _to_cute_tensor(k_scale, assumed_align=4) if is_sage_fp8 else None
-        v_scale_tensor = _to_cute_tensor(v_scale, assumed_align=4) if is_sage_fp8 else None
 
         bsa_fwd = BlockSparseAttnForwardSm100Blk64(
             head_dim,
@@ -2442,27 +2629,35 @@ def _bsa_attn_fwd_sm100_blk64(
 
         _bsa_attn_fwd_sm100_blk64.compile_cache[compile_key] = cute.compile(
             bsa_fwd,
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            o_tensor,
-            lse_tensor,
-            q_scale_tensor,
-            k_scale_tensor,
-            v_scale_tensor,
-            softmax_scale,
-            block_index_tensor,
-            block_sizes_tensor,
-            uniform_block_sparse_num,
-            block_nums_tensor,
-            split_offsets_tensor,
-            current_stream,
+            *jit_args,
             options="--enable-tvm-ffi",
         )
 
     if not is_fake_mode():
         with torch.cuda.nvtx.range("bsa_attn_fwd_sm100_blk64_kernel"):
-            compiled_fn = _bsa_attn_fwd_sm100_blk64.compile_cache[compile_key]
+            if aot_kernel is not None:
+                native_args = _make_sm100_blk64_cute_args(
+                    q_bhsd,
+                    k_bhsd,
+                    v_bhsd,
+                    out_bhsd,
+                    lse,
+                    None,
+                    None,
+                    None,
+                    softmax_scale,
+                    q2k_block_index,
+                    block_sizes,
+                    uniform_block_sparse_num,
+                    q2k_block_nums,
+                    split_offsets,
+                    current_stream,
+                    enable_tvm_ffi=False,
+                )
+                aot_kernel(*native_args)
+                compiled_fn = None
+            else:
+                compiled_fn = _bsa_attn_fwd_sm100_blk64.compile_cache[compile_key]
             if is_sage_fp8 and _bsa_fp8_blk64_fast_layout(
                 q_bhsd,
                 k_bhsd,
@@ -2475,23 +2670,24 @@ def _bsa_attn_fwd_sm100_blk64(
                 _bsa_fp8_blk64_fast_cache[
                     _bsa_fp8_blk64_fast_key(q_bhsd, kv_splits_i)
                 ] = compiled_fn
-            compiled_fn(
-                q_bhsd.detach(),
-                k_bhsd.detach(),
-                v_bhsd.detach(),
-                out_bhsd.detach(),
-                lse,
-                q_scale.detach() if is_sage_fp8 else None,
-                k_scale.detach() if is_sage_fp8 else None,
-                v_scale.detach() if is_sage_fp8 else None,
-                softmax_scale,
-                q2k_block_index.detach(),
-                block_sizes.detach() if has_block_sizes else None,
-                uniform_block_sparse_num,
-                q2k_block_nums.detach() if has_variable_block_nums else None,
-                split_offsets.detach() if split_offsets is not None else None,
-                current_stream,
-            )
+            if compiled_fn is not None:
+                compiled_fn(
+                    q_bhsd.detach(),
+                    k_bhsd.detach(),
+                    v_bhsd.detach(),
+                    out_bhsd.detach(),
+                    lse,
+                    q_scale.detach() if is_sage_fp8 else None,
+                    k_scale.detach() if is_sage_fp8 else None,
+                    v_scale.detach() if is_sage_fp8 else None,
+                    softmax_scale,
+                    q2k_block_index.detach(),
+                    block_sizes.detach() if has_block_sizes else None,
+                    uniform_block_sparse_num,
+                    q2k_block_nums.detach() if has_variable_block_nums else None,
+                    split_offsets.detach() if split_offsets is not None else None,
+                    current_stream,
+                )
 
     if kv_splits_i > 1:
         out_bhsd, lse = _combine_blk64_kv_bucketed_partials(
@@ -2559,7 +2755,7 @@ def _bsa_fp8_blk64_launch_cached(
             device=q_fp8.device,
         )
 
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    current_stream = cuda.CUstream(torch.cuda.current_stream(q_fp8.device).cuda_stream)
     compiled_fn(
         q_fp8,
         k_fp8,
@@ -2586,6 +2782,7 @@ def _bsa_fp8_blk64_launch_cached(
                 128,
                 kv_splits,
                 kv_splits == 16 and topk_num >= kv_splits,
+                q_fp8.device,
             )
             _bsa_fp8_blk64_combine_fast_cache[combine_key] = combine_compiled
         out, _ = _combine_blk64_kv_bucketed_partials_precompiled(
@@ -2633,10 +2830,15 @@ def bsa_fp8_blk64_fwd(
     assert k_fp8.dtype == q_fp8.dtype and v_fp8.dtype == q_fp8.dtype
     assert q_fp8.is_cuda and k_fp8.is_cuda and v_fp8.is_cuda
     assert k_fp8.device == q_fp8.device and v_fp8.device == q_fp8.device
-    arch_family = _get_device_arch() // 10
+    arch_family = _get_device_arch(q_fp8.device) // 10
     assert arch_family in (10, 12), (
         "FP8 blk64 BSA only supports SM100 and SM120"
     )
+    if arch_family == 10 and is_sm100_aot_only():
+        raise Sm100AotArtifactError(
+            "SM100 AOT-only mode supports BF16 forward only; "
+            "Sage/FP8 remains JIT-only"
+        )
     if arch_family == 12:
         assert batch >= 1 and heads >= 1, (
             "SM120 FP8 blk64 requires positive batch and head counts"

@@ -22,7 +22,6 @@ from block_sparse_attention.csrc.fwd.sm90_blk64.aot_runtime import (
 )
 from block_sparse_attention.csrc.fwd.sm90_blk64.aot_utils import (
     SM90_AOT_LAYOUT_MODE,
-    SM90_AOT_MIN_CUTLASS_DSL_VERSION,
     SM90_AOT_SCHEMA_VERSION,
     Sm90AotCombineVariant,
     Sm90AotVariant,
@@ -33,7 +32,6 @@ from block_sparse_attention.csrc.fwd.sm90_blk64.aot_utils import (
     iter_sm90_aot_combine_variants,
     iter_sm90_aot_variants,
     load_sm90_aot_manifest,
-    require_sm90_aot_cutlass_dsl_version,
     sha256_file,
     write_sm90_aot_manifest,
 )
@@ -193,17 +191,6 @@ def test_sm90_aot_variant_round_trip_and_validation():
         _variant(kv_splits=257)
     with pytest.raises(ValueError, match="allow_empty"):
         _variant(kv_splits=2, allow_empty_block_nums=True)
-
-
-def test_sm90_aot_requires_dynamic_layout_capable_dsl():
-    assert SM90_AOT_MIN_CUTLASS_DSL_VERSION == "4.6.1"
-    require_sm90_aot_cutlass_dsl_version("4.6.1")
-    require_sm90_aot_cutlass_dsl_version("4.7.0.dev0")
-
-    with pytest.raises(RuntimeError, match="nvidia-cutlass-dsl>=4.6.1"):
-        require_sm90_aot_cutlass_dsl_version("4.6.0")
-    with pytest.raises(RuntimeError, match="Cannot parse"):
-        require_sm90_aot_cutlass_dsl_version("unknown")
 
 
 def test_sm90_aot_manifest_round_trip(tmp_path: Path):
@@ -435,7 +422,9 @@ def test_sm90_aot_only_resolution_never_falls_back_to_jit(
 
 def test_sm90_split_combine_aot_hit_never_jits(monkeypatch):
     aot_kernel = object()
-    monkeypatch.setattr(bsa_attn_interface, "_get_device_arch", lambda: 90)
+    monkeypatch.setattr(
+        bsa_attn_interface, "_get_device_arch", lambda _device=None: 90
+    )
     monkeypatch.setattr(bsa_attn_interface, "is_fake_mode", lambda: True)
     monkeypatch.setattr(bsa_attn_interface, "BlockSparseAttnForwardCombine", None)
     monkeypatch.setattr(

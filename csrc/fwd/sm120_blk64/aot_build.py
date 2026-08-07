@@ -414,7 +414,7 @@ def build_sm120_aot_artifacts(
     cc: str = "gcc",
     include_sage_quant: bool = True,
 ) -> Path:
-    require_sm120_aot_cutlass_dsl_version(str(cutlass.__version__))
+    require_sm120_aot_cutlass_dsl_version(str(cutlass.__version__), variants)
     if target_arch != "sm_120f":
         raise ValueError(
             f"Unsupported SM120 AOT target: {target_arch}; expected sm_120f"

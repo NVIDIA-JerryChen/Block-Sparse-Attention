@@ -30,7 +30,7 @@ from block_sparse_attention.csrc.fwd.sm120_blk64.aot_runtime import (
 
 from block_sparse_attention.csrc.fwd.sm120_blk64.aot_utils import (
     SM120_AOT_LAYOUT_MODE,
-    SM120_AOT_MIN_CUTLASS_DSL_VERSION,
+    SM120_QUANTIZED_AOT_MIN_CUTLASS_DSL_VERSION,
     SM120_AOT_SCHEMA_VERSION,
     Sm120AotVariant,
     compute_sm120_aot_source_fingerprint,
@@ -207,15 +207,23 @@ def test_sm120_sage_aot_fake_abi(variant: Sm120AotVariant):
         assert args[10] is args[8]
 
 
-def test_sm120_aot_requires_dynamic_layout_capable_dsl():
-    assert SM120_AOT_MIN_CUTLASS_DSL_VERSION == "4.6.1"
-    require_sm120_aot_cutlass_dsl_version("4.6.1")
-    require_sm120_aot_cutlass_dsl_version("4.7.0.dev0")
+def test_sm120_quantized_aot_requires_fp8_warp_mma_capable_dsl():
+    bf16 = Sm120AotVariant("bf16", 1, False, 0)
+    fp8 = Sm120AotVariant("fp8", 1, False, 0)
+    sage = Sm120AotVariant("sage", 1, False, 0)
 
-    with pytest.raises(RuntimeError, match="nvidia-cutlass-dsl>=4.6.1"):
-        require_sm120_aot_cutlass_dsl_version("4.6.0")
+    assert SM120_QUANTIZED_AOT_MIN_CUTLASS_DSL_VERSION == "4.5.0"
+    require_sm120_aot_cutlass_dsl_version("4.4.2", (bf16,))
+    require_sm120_aot_cutlass_dsl_version("unknown", (bf16,))
+    require_sm120_aot_cutlass_dsl_version("4.5.0", (fp8,))
+    require_sm120_aot_cutlass_dsl_version("4.6.1", (sage,))
+
+    with pytest.raises(RuntimeError, match="nvidia-cutlass-dsl>=4.5.0"):
+        require_sm120_aot_cutlass_dsl_version("4.4.2", (fp8,))
+    with pytest.raises(RuntimeError, match="nvidia-cutlass-dsl>=4.5.0"):
+        require_sm120_aot_cutlass_dsl_version("4.4.2", (sage,))
     with pytest.raises(RuntimeError, match="Cannot parse"):
-        require_sm120_aot_cutlass_dsl_version("unknown")
+        require_sm120_aot_cutlass_dsl_version("unknown", (fp8,))
 
 
 def test_sm120_aot_manifest_round_trip(tmp_path: Path):

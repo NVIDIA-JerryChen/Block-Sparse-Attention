@@ -26,7 +26,6 @@ from block_sparse_attention.csrc.fwd.sm90_blk64.aot_utils import (
     get_sm90_aot_artifact_dir,
     iter_sm90_aot_combine_variants,
     iter_sm90_aot_variants,
-    require_sm90_aot_cutlass_dsl_version,
     sha256_file,
     write_sm90_aot_manifest,
 )
@@ -248,7 +247,6 @@ def build_sm90_aot_artifacts(
     target_arch: str = "sm_90a",
     cc: str = "gcc",
 ) -> Path:
-    require_sm90_aot_cutlass_dsl_version(str(cutlass.__version__))
     if target_arch != "sm_90a":
         raise ValueError(
             f"Unsupported SM90 AOT target: {target_arch}; expected sm_90a"

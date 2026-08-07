@@ -13,7 +13,7 @@ from cuda.bindings import runtime as cuda_runtime
 SM120_AOT_SCHEMA_VERSION = 1
 SM120_AOT_MANIFEST = "manifest.json"
 SM120_AOT_LAYOUT_MODE = "dynamic_strided_nonbroadcast"
-SM120_AOT_MIN_CUTLASS_DSL_VERSION = "4.6.1"
+SM120_QUANTIZED_AOT_MIN_CUTLASS_DSL_VERSION = "4.5.0"
 
 
 @dataclass(frozen=True)
@@ -115,18 +115,24 @@ def get_cuda_runtime_version() -> str:
     return f"{major}.{minor}"
 
 
-def require_sm120_aot_cutlass_dsl_version(version: str) -> None:
+def require_sm120_aot_cutlass_dsl_version(
+    version: str,
+    variants: Iterable[Sm120AotVariant],
+) -> None:
+    if not any(variant.is_fp8 or variant.is_sage for variant in variants):
+        return
     match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version)
     if match is None:
         raise RuntimeError(f"Cannot parse CUTLASS DSL version: {version!r}")
     current = tuple(int(value) for value in match.groups())
     minimum = tuple(
-        int(value) for value in SM120_AOT_MIN_CUTLASS_DSL_VERSION.split(".")
+        int(value)
+        for value in SM120_QUANTIZED_AOT_MIN_CUTLASS_DSL_VERSION.split(".")
     )
     if current < minimum:
         raise RuntimeError(
-            "SM120 dynamic-layout AOT requires nvidia-cutlass-dsl>="
-            f"{SM120_AOT_MIN_CUTLASS_DSL_VERSION}, got {version}"
+            "SM120 FP8/Sage AOT requires nvidia-cutlass-dsl>="
+            f"{SM120_QUANTIZED_AOT_MIN_CUTLASS_DSL_VERSION}, got {version}"
         )
 
 

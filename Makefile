@@ -2,6 +2,7 @@
 #
 # Usage:
 #   make wheel                - Build the unified CuTe DSL wheel
+#   make aot-sm100            - Build SM100/SM103 forward/combine AOT artifacts
 #   make setup                - Reinstall wheel in a provisioned environment
 #   make aot-sm90             - Build SM90 forward/combine AOT artifacts
 #   make aot-sm120            - Build SM120 forward AOT artifacts
@@ -39,10 +40,12 @@ WHEEL_DIR ?= dist
 NCU_DIR := $(AGENT_PROFILES)/ncu
 SM90_AOT_DIR ?= $(AGENT_SPACE)/sm90_aot
 SM90_AOT_ARGS ?=
+SM100_AOT_DIR ?= $(AGENT_SPACE)/sm100_aot
+SM100_AOT_ARGS ?=
 SM120_AOT_DIR ?= $(AGENT_SPACE)/sm120_aot
 SM120_AOT_ARGS ?=
 
-.PHONY: wheel setup aot-sm90 aot-sm120 tt vt ttb vtb bb bbb profile bm bm-cli clean help
+.PHONY: wheel setup aot-sm90 aot-sm100 aot-sm120 tt vt ttb vtb bb bbb profile bm bm-cli clean help
 
 wheel:
 	mkdir -p $(WHEEL_DIR)
@@ -57,6 +60,12 @@ setup: wheel
 aot-sm90:
 	$(PYTHON) -m csrc.fwd.sm90_blk64.aot_build \
 		--output-dir $(SM90_AOT_DIR) $(SM90_AOT_ARGS)
+
+aot-sm100:
+	CUTE_DSL_ARCH=sm_100a $(PYTHON) -m csrc.fwd.sm100_blk64.aot_build \
+		--output-dir $(SM100_AOT_DIR) --target-arch sm_100a $(SM100_AOT_ARGS)
+	CUTE_DSL_ARCH=sm_103a $(PYTHON) -m csrc.fwd.sm100_blk64.aot_build \
+		--output-dir $(SM100_AOT_DIR) --target-arch sm_103a $(SM100_AOT_ARGS)
 
 aot-sm120:
 	$(PYTHON) -m csrc.fwd.sm120_blk64.aot_build \
@@ -122,6 +131,7 @@ help:
 	@echo "BSA (Block Sparse Attention) — Development Targets"
 	@echo ""
 	@echo "  make wheel                      Build unified CuTe DSL wheel"
+	@echo "  make aot-sm100                  Build SM100/SM103 forward/combine CuTe DSL AOT artifacts"
 	@echo "  make setup                      Reinstall wheel (dependencies preinstalled)"
 	@echo "  make aot-sm90                   Build SM90 forward/combine CuTe DSL AOT artifacts"
 	@echo "  make aot-sm120                  Build SM120 CuTe DSL AOT artifacts"
@@ -140,4 +150,5 @@ help:
 	@echo "  Profile toggles: VAR_BN=0|1  BLKSZ=0|1"
 	@echo "    e.g. make bm-cli BLK=64 VAR_BN=1 BLKSZ=1"
 	@echo "  SM90 AOT: SM90_AOT_DIR=<root> SM90_AOT_ARGS='<builder args>'"
+	@echo "  SM100 AOT: SM100_AOT_DIR=<root> SM100_AOT_ARGS='<builder args>'"
 	@echo "  SM120 AOT: SM120_AOT_DIR=<root> SM120_AOT_ARGS='<builder args>'"

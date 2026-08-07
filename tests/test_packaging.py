@@ -165,14 +165,14 @@ def test_wheel_contains_single_import_package(built_wheel: Path) -> None:
     )
 
 
-def test_wheel_requires_supported_cutedsl_range(built_wheel: Path) -> None:
+def test_wheel_uses_local_cutedsl_version(built_wheel: Path) -> None:
     with zipfile.ZipFile(built_wheel) as wheel:
         metadata_name = next(
             name for name in wheel.namelist() if name.endswith(".dist-info/METADATA")
         )
         metadata = BytesParser().parsebytes(wheel.read(metadata_name))
 
-    assert "nvidia-cutlass-dsl>=4.6.1" in metadata.get_all("Requires-Dist")
+    assert "nvidia-cutlass-dsl" in metadata.get_all("Requires-Dist")
 
 
 def test_sdist_contains_mapped_sources_without_legacy_cpp(built_sdist: Path) -> None:

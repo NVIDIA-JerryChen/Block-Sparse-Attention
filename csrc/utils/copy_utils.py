@@ -5,6 +5,7 @@
 # maintained locally so BSA does not require Quack at runtime.
 
 import contextlib
+import re
 from typing import Callable, Optional, Tuple, Type
 
 import cutlass
@@ -20,13 +21,17 @@ import cutlass.pipeline
 
 def _cute_dsl_bulk_copy_self_elects() -> bool:
     """Return whether cute.copy elects a lane for bulk-async copies."""
+    version = getattr(cutlass, "__version__", None)
     try:
-        major, minor = (int(part) for part in cutlass.__version__.split(".")[:2])
-    except (AttributeError, TypeError, ValueError) as exc:
+        match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version)
+    except TypeError as exc:
         raise RuntimeError(
-            f"Cannot parse CUTLASS DSL version {getattr(cutlass, '__version__', None)!r}"
+            f"Cannot parse CUTLASS DSL version {version!r}"
         ) from exc
-    return (major, minor) >= (4, 6)
+    if match is None:
+        raise RuntimeError(f"Cannot parse CUTLASS DSL version {version!r}")
+    current = tuple(int(part) for part in match.groups())
+    return (4, 6, 0) <= current < (4, 6, 2)
 
 
 _BULK_COPY_SELF_ELECTS = _cute_dsl_bulk_copy_self_elects()
@@ -35,10 +40,11 @@ _BULK_COPY_SELF_ELECTS = _cute_dsl_bulk_copy_self_elects()
 def bulk_copy_elect_one():
     """Select a lane only when the installed DSL does not do so internally.
 
-    CUTLASS DSL 4.6 added an internal warp-collective election to
+    CUTLASS DSL 4.6.0 and 4.6.1 add an internal warp-collective election to
     ``cute.copy`` for bulk-async atoms. Nesting that copy inside
     ``cute.arch.elect_one()`` leaves one lane at the inner collective and
-    deadlocks the warp. CUTLASS DSL 4.5 still requires the outer guard.
+    deadlocks the warp. Earlier versions and 4.6.2 or newer require the outer
+    guard.
     """
     if _BULK_COPY_SELF_ELECTS:
         return contextlib.nullcontext()

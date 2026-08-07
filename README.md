@@ -4,9 +4,9 @@
 
 **Forward backends:**
 
-| | SM120 blk64 (CuTe DSL / AOT + JIT) | SM100 blk128 (CuTe DSL / JIT) | SM90 blk64 (CuTe DSL / AOT + JIT) | SM100/SM110 blk64 (CuTe DSL / JIT) |
+| | SM120 blk64 (CuTe DSL / AOT + JIT) | SM100/SM103 blk128 (CuTe DSL / JIT) | SM90 blk64 (CuTe DSL / AOT + JIT) | SM100/SM103 blk64 (CuTe DSL / AOT + JIT) |
 |---|---|---|---|---|
-| Dtype | bf16, fp16, Sage FP8, Sage INT8/FP8 | bf16, fp16 | bf16, fp16 | bf16, Sage FP8 |
+| Dtype | bf16, fp16, Sage FP8, Sage INT8/FP8 | bf16, fp16 | bf16, fp16 | bf16 (AOT or JIT), Sage FP8 (JIT only where supported) |
 | Head dim | 128 only | 64, 96, 128 | 64, 96, 128 | 128 only |
 | Attention | MHA, GQA, MQA (FP8: MHA) | MHA, GQA, MQA | MHA, GQA, MQA | MHA only |
 | pack_gqa | No | Yes | No | No |
@@ -17,7 +17,7 @@
 
 **Backward backends:**
 
-| | SM90 blk64 (CuTe DSL / JIT) | SM100/SM110 blk64 (CuTe DSL / JIT) | SM100/SM110 blk128 (CuTe DSL / JIT) |
+| | SM90 blk64 (CuTe DSL / JIT) | SM100/SM103 blk64 (CuTe DSL / JIT) | SM100/SM103 blk128 (CuTe DSL / JIT) |
 |---|---|---|---|
 | Dtype | bf16 | bf16 | bf16 |
 | Head dim | 128 | 128 | 64, 128 |
@@ -26,7 +26,7 @@
 
 **Not supported (current sparse kernels):** causal, local, mask_mod, score_mod, paged_kv, softcap, varlen
 
-Split-KV is supported by the SM90/SM100/SM110 blk64 forward paths. SM120 deliberately
+Split-KV is supported by the SM90/SM100/SM103 blk64 forward paths. SM120 deliberately
 keeps `kv_splits=1`; explicit split counts are rejected so no FP32 partial
 workspace is allocated. The blk128 and backward paths do not support split-KV.
 
@@ -43,6 +43,7 @@ BSA/
 │   ├── test_flash_fwd.py          # Forward tests & benchmarks (blk64 + blk128)
 │   ├── test_flash_bwd.py          # Backward tests & benchmarks (blk64 + blk128)
 │   ├── test_sm90_aot.py           # SM90 producer/combine AOT validation
+│   ├── test_sm100_aot.py          # SM100/SM103 CuTe DSL AOT validation
 │   └── test_sm120_aot.py          # SM120 forward AOT validation
 ├── requirements.txt               # Python dependencies
 ├── Makefile                       # Build & test automation
@@ -65,12 +66,15 @@ BSA/
 │   │   ├── quant_aot_runtime.py       # Triton quantization AOT loader
 │   │   └── aot_utils.py              # Variant and artifact metadata
 │   │
-│   └── sm100_blk64/                  # blk64 — SM100/SM110 implementation
+│   └── sm100_blk64/                  # blk64 — SM100/SM103 implementation
+│       ├── aot_build.py                # SM100/SM103 offline AOT builder
+│       ├── aot_runtime.py              # Native loader and ABI validation
+│       ├── aot_utils.py                # AOT variants and manifest metadata
 │       ├── cutedsl/                      # Packaged CuTe DSL / JIT backend
 │       │   ├── bsa_fwd_sm100.py          # Forward kernel
 │       │   ├── bsa_fwd_helpers.py        # SM100 device helpers
 │       │   └── bsa_fwd_combine.py        # Split-KV combine kernel
-│       └── cpp/                          # Legacy development sources; excluded from wheel
+│       └── cpp/                          # Deprecated sources; excluded from wheel
 │
 ├── csrc/bwd/
 │   ├── bsa_bwd_preprocess.py             # Shared backward preprocess kernel
@@ -110,8 +114,8 @@ BSA/
 - Python 3.10+
 - PyTorch 2.5+ built for the installed CUDA runtime
 - CUDA 13.0+
-- CuTe DSL (`nvidia-cutlass-dsl>=4.6.1`; AOT artifacts must be built and loaded
-  with the same DSL version)
+- CuTe DSL: use the locally installed `nvidia-cutlass-dsl` version; build and
+  run AOT artifacts with the same version
 - Triton (the native Sage quantization AOT library must be loaded with the same
   Triton version used to build it)
 
@@ -135,8 +139,9 @@ and INT8/FP8 quantization helpers as public APIs.
 They contain all supported forward and backward CuTe DSL kernels, the Sage FP8
 quantization path, and shared Python utilities. They do not contain the SM100
 blk64 C++ implementation, a prebuilt CUDA extension, or the
-`third_party/cutlass` submodule. SM100/SM110 blk64 forward dispatches to the
-packaged CuTe DSL implementation and JIT-compiles it on first use. `make setup`
+`third_party/cutlass` submodule. In the ordinary wheel, SM100/SM103 blk64
+forward dispatches to the packaged CuTe DSL implementation and JIT-compiles it
+on first use. `make setup`
 uses `--no-deps` for fast development reinstalls; use `pip install .` or install
 the wheel directly in a fresh environment to resolve runtime dependencies.
 All installed modules live under the `block_sparse_attention` package; the
@@ -144,10 +149,10 @@ wheel does not install top-level `csrc`, `utils`, or `bsa_attn_interface`
 modules. The source tree remains in its existing layout; the build configuration
 maps those files to their package-qualified installation paths.
 
-The wheel includes the SM90 and SM120 AOT builders and runtime loaders, but not
-generated `.o`, `.h`, or `.so` artifacts. On those architectures, a compatible
-artifact bundle is used when present; otherwise dispatch falls back to JIT unless
-the corresponding AOT-only mode is enabled.
+The wheel includes the SM90, SM100/SM103, and SM120 AOT builders and runtime
+loaders, but no generated `.o`, `.h`, or `.so` artifacts. A compatible external
+artifact bundle is used when present; otherwise dispatch falls back to JIT
+unless the corresponding AOT-only mode is enabled.
 
 API migration note: the former `bsa_attn_fwd_blk64` and
 `bsa_attn_fwd_blk64_cutedsl` names are removed. Both unified entry points
@@ -155,6 +160,94 @@ default to `sparse_block_size=64`; existing blk128 callers must pass
 `sparse_block_size=128` explicitly so their metadata is not reinterpreted.
 
 For an editable development install with tests, use `pip install -e '.[test]'`.
+
+### SM100/SM103 CuTe DSL AOT
+
+SM100 and SM103 blk64 BF16 forward can be compiled offline and loaded through
+the CuTe native ABI, following the same artifact-bundle model as SM90 and
+SM120. The public `bsa_attn_fwd` API first resolves the matching AOT producer
+and, for split-KV, its AOT combine kernel. No deprecated C++ implementation is
+used. Sage/FP8 remains JIT-only and is rejected in SM100 AOT-only mode.
+
+#### Supported configurations
+
+- Targets: `sm_100a` (compute capability 10.0) and `sm_103a` (10.3)
+- Dtype: BF16 input/output; split producers use FP32 partial output
+- Head dimensions: QK=128 and value=128
+- Attention: MHA
+- Fixed `block_sparse_num` or runtime `q2k_block_nums`
+- `block_sizes`: absent or rank-1 int32
+- Static or CLC scheduling
+- 32-bit or 64-bit K/V stride lowering
+- Exact split count from 1 through 256; the default matrix builds 1, 2, 4, and 8
+- Build and deployment use the same locally installed CuTe DSL version
+- Matching build/runtime CUDA runtime version when both sides can detect it
+
+The default matrix contains 72 forward variants and three deduplicated combine
+variants per target. Batch/head counts, sequence lengths, sparse-index capacity,
+active topK, and non-leading strides remain runtime dynamic.
+
+#### Build artifacts
+
+Build both targets with the currently installed CuTe DSL:
+
+```bash
+make aot-sm100 SM100_AOT_DIR=/shared/bsa-sm100-aot
+```
+
+`make aot-sm100` invokes the builder once per target in a fresh process with
+the corresponding `CUTE_DSL_ARCH`. The bundle layout is:
+
+```text
+/shared/bsa-sm100-aot/
+└── <cpu-arch>/
+    ├── sm_100a/
+    │   ├── manifest.json
+    │   └── *.so
+    └── sm_103a/
+        ├── manifest.json
+        └── *.so
+```
+
+To build a deployment-specific subset, pass builder axes explicitly. Every
+runtime combination used in AOT-only mode must be present:
+
+```bash
+make aot-sm100 \
+  SM100_AOT_ARGS='--kv-splits 1,2 --block-nums both --allow-empty-block-nums both --block-sizes both --use-clc both --int64-kv-strides both'
+
+# List one target's variants without compiling.
+python -m csrc.fwd.sm100_blk64.aot_build \
+  --target-arch sm_100a --dry-run
+```
+
+#### Deploy and load
+
+Set the artifact root before importing or calling BSA:
+
+```bash
+export BSA_SM100_AOT_DIR=/shared/bsa-sm100-aot
+export BSA_SM100_AOT_ONLY=1
+```
+
+`BSA_SM100_AOT_DIR` may point to the bundle root or directly to the target
+directory containing `manifest.json`. If unset, BSA searches
+`csrc/fwd/sm100_blk64/aot_artifacts/<cpu-arch>/<target>/`. Without AOT-only
+mode, a missing compatible variant falls back to the existing CuTe DSL JIT
+path. Manifest version, source fingerprint, and checksum mismatches are errors.
+
+The native ABI accepts only its compiled ranks and dtypes on one CUDA device,
+with aligned pointers, unit trailing strides, and no stride-0 broadcast modes.
+Materialize expanded inputs with `.contiguous()` before an AOT-only call.
+
+Validate an artifact bundle from the source tree with:
+
+```bash
+BSA_SM100_AOT_DIR=/shared/bsa-sm100-aot \
+BSA_SM100_AOT_ONLY=1 \
+BSA_TEST_SM100_AOT_RUNTIME=1 \
+python -m pytest tests/test_sm100_aot.py -q
+```
 
 ### SM90 CuTe DSL AOT
 
@@ -173,7 +266,7 @@ deduplicated combine kernel, so AOT-only execution does not invoke
 - `block_sizes`: absent or present; input ranks 1/2/3 share one normalized ABI
 - Split-KV: exact `kv_splits` values from 1 through 256; the default bundle
   contains 1, 2, 4, and 8
-- Supported DSL range: `nvidia-cutlass-dsl>=4.6.1`
+- CuTe DSL: use the locally installed version for both AOT build and deployment
 
 Batch size, absolute head counts, sequence lengths, sparse-index capacity,
 active topK, and non-leading tensor strides are runtime dynamic. Dtype, QK/value
@@ -288,7 +381,8 @@ quantization kernels as a self-contained shared library. This removes both
 - Block counts: fixed `block_sparse_num` or runtime `q2k_block_nums`
 - `block_sizes`: absent, `[N]`, `[B, N]`, or `[B, Hq, N]`
 - Split-KV: disabled; SM120 only accepts `kv_splits=1`
-- Supported DSL range: `nvidia-cutlass-dsl>=4.6.1`
+- FP8/Sage AOT requires `nvidia-cutlass-dsl>=4.5.0`; BF16/FP16 use the locally
+  installed DSL without an additional SM120 version gate
 
 Batch size, absolute head counts, sequence lengths, sparse index capacity,
 active topK, and non-leading tensor strides are runtime dynamic. Dtype, D=128,
@@ -376,7 +470,7 @@ contracts are identical for AOT and JIT. On SM120, pass optional
 `[B, H, N]` keyword arguments to select the corresponding sparse metadata
 variant. When `q2k_block_nums` is present, the scalar `topk_num` is ignored.
 Both SM120 quantized paths accept any positive batch/head counts and non-aligned
-Q/KV tails. SM100/SM110 retain the B=1, H in {4, 8}, and 64-aligned v1
+Q/KV tails. SM100/SM103 retain the B=1, H in {4, 8}, and 64-aligned v1
 contract.
 
 The native Sage mixed path uses the following quantization and physical-layout
@@ -469,8 +563,8 @@ python -m pytest tests/test_sm120_aot.py tests/test_sm120_sage_quant_aot.py -q
 ```
 
 The validation monkeypatches `cute.compile()` to fail, so every passing launch
-must come from a precompiled `.so`. AOT artifacts are DSL-version-specific:
-bundles built with CUTLASS DSL 4.5.2 must be rebuilt with 4.6.1 before use.
+must come from a precompiled `.so`. AOT artifacts are DSL-version-specific and
+must be built and loaded with the same CUTLASS DSL version.
 
 Common deployment errors:
 
@@ -507,7 +601,7 @@ out_fixed, lse_fixed = bsa_attn_fwd(
     sparse_block_size=64,
 )
 
-# Split long KV lists on SM90/SM100/SM110. SM120 must keep kv_splits=1.
+# Split long KV lists on SM90/SM100/SM103. SM120 must keep kv_splits=1.
 out_split, lse_split = bsa_attn_fwd(
     q, k, v, q2k_block_index, block_sparse_num, block_sizes,
     q2k_block_nums=q2k_block_nums,
@@ -574,7 +668,7 @@ the construction of `q2k_block_index` and `block_sizes` is unambiguous.
 
 **Default tensor layout:** `(batch, num_heads, seqlen, head_dim)` (`BHSD`), last dim contiguous, 16-byte aligned.
 When `layout="bshd"`, inputs and outputs use `(batch, seqlen, num_heads, head_dim)`.
-The wrapper canonicalizes them at the backend boundary; SM100/SM110 blk64 uses
+The wrapper canonicalizes them at the backend boundary; SM100/SM103 blk64 uses
 contiguous BHSD compatibility buffers, while other paths use views where their
 kernel layout permits.
 The last dimension must be `head_dim` with stride 1. Physical `BHDS` / non-contiguous-head-dim layouts are not supported.
@@ -604,7 +698,7 @@ an `lse` output buffer is supplied.
 
 | Parameter | Shape | Type | Description |
 |-----------|-------|------|-------------|
-| `q2k_block_nums` | (batch, num_heads, num_q_blocks) | int32 | Per-Q-block KV block count. When provided, `block_sparse_num` is ignored. Empty rows are supported by SM90 and SM100/SM110; SM120 requires values >= 1 |
+| `q2k_block_nums` | (batch, num_heads, num_q_blocks) | int32 | Per-Q-block KV block count. When provided, `block_sparse_num` is ignored. Empty rows are supported by SM90 and SM100/SM103; SM120 requires values >= 1 |
 | `allow_empty_block_nums` | scalar | bool | Default True. When False, all `q2k_block_nums` values must be >= 1, enabling compile-time elimination of empty-tile branches (~2-3% faster) |
 
 #### Other Parameters
@@ -613,12 +707,12 @@ an `lse` output buffer is supplied.
 |-----------|---------|-------------|
 | `softmax_scale` | `1/sqrt(head_dim)` | Softmax scale factor |
 | `sparse_block_size` | `64` | Sparse Q/KV block size; must be 64 or 128 |
-| `pack_gqa` | `None` (auto) | Whether to pack GQA heads; applies to the SM100/SM110 blk128 backend |
+| `pack_gqa` | `None` (auto) | Whether to pack GQA heads; applies to the SM100/SM103 blk128 backend |
 | `return_lse` | `False` | Return `(out, lse)` when true; otherwise return `(out, None)` unless gradients require LSE or an `lse` buffer is supplied |
 | `out` | `None` | Pre-allocated output tensor |
 | `lse` | `None` | Pre-allocated LSE tensor |
 | `layout` | `"bhsd"` | Input/output layout: `"bhsd"` or `"bshd"` |
-| `use_clc` | `None` (auto) | Scheduler selection for SM100/SM110 blk64 |
+| `use_clc` | `None` (auto) | Scheduler selection for SM100/SM103 blk64 |
 | `kv_splits` | `1` | KV-list split count for blk64, or `"auto"`; see below |
 
 #### Dense Attention
@@ -634,11 +728,11 @@ block_sizes = [tile_n] * N            # last block adjusted for seqlen remainder
 
 #### blk64 split-KV
 
-With `sparse_block_size=64`, the SM90 and SM100/SM110 forward paths can split
-each Q block's active KV list. SM100/SM110 dispatches to the packaged CuTe DSL
+With `sparse_block_size=64`, the SM90 and SM100/SM103 forward paths can split
+each Q block's active KV list. SM100/SM103 dispatches to the packaged CuTe DSL
 backend; the backend is an implementation detail rather than a separate API.
 
-BHSD is the zero-copy layout. On SM100/SM110, `layout="bshd"` is a compatibility
+BHSD is the zero-copy layout. On SM100/SM103, `layout="bshd"` is a compatibility
 path that materializes contiguous BHSD inputs before launching the CuTe DSL
 kernel, then materializes the BSHD output.
 
@@ -654,7 +748,7 @@ kernel, then materializes the BSHD output.
   counts report an error instead.
 
 SM90 split-KV supports the same MHA/GQA/MQA and QK/V dimensions (64, 96, or
-128) as its single-kernel path. SM100/SM110 blk64 retains its existing shape
+128) as its single-kernel path. SM100/SM103 blk64 retains its existing shape
 constraints. Its split path supports `use_clc=True` for persistent scheduling;
 `use_clc=False` selects one tile per CTA. The default `use_clc=None` keeps CLC
 disabled when `kv_splits>1` because the automatic scheduler policy has not been
@@ -667,7 +761,7 @@ fall back independently to JIT.
 
 ### `bsa_attn_bwd(dout, q, k, v, out, lse, q2k_block_index, block_sparse_num, block_sizes, ..., sparse_block_size=64)`
 
-SM90/SM100/SM110 block-sparse backward attention. Pass the same
+SM90/SM100/SM103 block-sparse backward attention. Pass the same
 `sparse_block_size` used to construct the forward metadata; the value must be
 64 or 128 and defaults to 64.
 
@@ -712,7 +806,7 @@ The block-sparse arguments have the same meaning as forward:
 #### Backward Limitations
 
 Backward currently supports BF16 MHA only (`num_heads == num_heads_kv`). SM90
-supports blk64 with head dimension 128. SM100/SM110 supports blk64 with head
+supports blk64 with head dimension 128. SM100/SM103 supports blk64 with head
 dimension 128 and blk128 with head dimension 64 or 128. SM120 backward is not
 available.
 
@@ -727,7 +821,7 @@ this task representation.
 The main backward kernel runs one task per `(q_group, kv_block)` and uses fp32 workspace accumulation for `dQ/dK/dV` before the final conversion/writeback.
 
 Default bucket sizing is backend-owned. SM90 uses its blk64 default, while
-SM100/SM110 selects the blk64 or blk128 default from `sparse_block_size`. Pass
+SM100/SM103 selects the blk64 or blk128 default from `sparse_block_size`. Pass
 `bucket_size_blocks` explicitly to override it for experiments.
 
 | Parameter | Default | Description |
@@ -740,6 +834,7 @@ SM100/SM110 selects the blk64 or blk128 default from `sparse_block_size`. Pass
 make wheel                      # Build the unified CuTe DSL wheel
 make setup                      # Reinstall wheel after dependencies are provisioned
 make aot-sm90                   # Build the default 140 main + 6 combine SM90 matrix
+make aot-sm100                  # Build SM100/SM103 BF16 AOT artifacts
 make aot-sm120                  # Build the default SM120 native-ABI AOT matrix
 make tt                         # Quick correctness test (default: blk128)
 make tt BLK=64                  # Quick test blk64 only
@@ -756,6 +851,12 @@ make help                       # Show all targets
 
 python test_flash_bwd.py                    # Backward quick correctness tests
 python test_flash_bwd.py benchmark          # Backward benchmark
+
+# On an SM100/SM103 host after building both target bundles:
+BSA_SM100_AOT_DIR=/shared/bsa-sm100-aot \
+BSA_SM100_AOT_ONLY=1 \
+BSA_TEST_SM100_AOT_RUNTIME=1 \
+python -m pytest tests/test_sm100_aot.py -q
 
 # On an SM90 deployment host after building the required AOT variants:
 BSA_SM90_AOT_DIR=/shared/bsa-sm90-aot \
