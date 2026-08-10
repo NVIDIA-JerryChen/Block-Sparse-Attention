@@ -67,14 +67,12 @@ BSA/
 │   │   └── aot_utils.py              # Variant and artifact metadata
 │   │
 │   └── sm100_blk64/                  # blk64 — SM100/SM103 implementation
-│       ├── aot_build.py                # SM100/SM103 offline AOT builder
-│       ├── aot_runtime.py              # Native loader and ABI validation
-│       ├── aot_utils.py                # AOT variants and manifest metadata
-│       ├── cutedsl/                      # Packaged CuTe DSL / JIT backend
-│       │   ├── bsa_fwd_sm100.py          # Forward kernel
-│       │   ├── bsa_fwd_helpers.py        # SM100 device helpers
-│       │   └── bsa_fwd_combine.py        # Split-KV combine kernel
-│       └── cpp/                          # Deprecated sources; excluded from wheel
+│       ├── aot_build.py              # SM100/SM103 offline AOT builder
+│       ├── aot_runtime.py            # Native loader and ABI validation
+│       ├── aot_utils.py              # AOT variants and manifest metadata
+│       ├── bsa_fwd_sm100.py          # CuTe DSL forward kernel
+│       ├── bsa_fwd_helpers.py        # SM100 device helpers
+│       └── bsa_fwd_combine.py        # Split-KV combine kernel
 │
 ├── csrc/bwd/
 │   ├── bsa_bwd_preprocess.py             # Shared backward preprocess kernel
@@ -102,9 +100,6 @@ BSA/
 │   ├── benchmark.py              # benchmark_forward
 │   ├── bench_utils.py            # FLOPS computation
 │   └── fa_logging.py             # Debug logging
-│
-└── third_party/
-    └── cutlass/                  # Development-only submodule; excluded from wheel
 ```
 
 ## Quick Start
@@ -137,11 +132,9 @@ The unified wheel and source distribution expose `bsa_attn_fwd`,
 `bsa_attn_bwd`, `bsa_fp8_blk64_fwd`, `bsa_sage_blk64_fwd`, and both Sage FP8
 and INT8/FP8 quantization helpers as public APIs.
 They contain all supported forward and backward CuTe DSL kernels, the Sage FP8
-quantization path, and shared Python utilities. They do not contain the SM100
-blk64 C++ implementation, a prebuilt CUDA extension, or the
-`third_party/cutlass` submodule. In the ordinary wheel, SM100/SM103 blk64
-forward dispatches to the packaged CuTe DSL implementation and JIT-compiles it
-on first use. `make setup`
+quantization path, and shared Python utilities. They do not contain generated
+CUDA artifacts. In the ordinary wheel, SM100/SM103 blk64 forward dispatches to
+the packaged CuTe DSL implementation and JIT-compiles it on first use. `make setup`
 uses `--no-deps` for fast development reinstalls; use `pip install .` or install
 the wheel directly in a fresh environment to resolve runtime dependencies.
 All installed modules live under the `block_sparse_attention` package; the
@@ -166,8 +159,8 @@ For an editable development install with tests, use `pip install -e '.[test]'`.
 SM100 and SM103 blk64 BF16 forward can be compiled offline and loaded through
 the CuTe native ABI, following the same artifact-bundle model as SM90 and
 SM120. The public `bsa_attn_fwd` API first resolves the matching AOT producer
-and, for split-KV, its AOT combine kernel. No deprecated C++ implementation is
-used. Sage/FP8 remains JIT-only and is rejected in SM100 AOT-only mode.
+and, for split-KV, its AOT combine kernel. Sage/FP8 remains JIT-only and is
+rejected in SM100 AOT-only mode.
 
 #### Supported configurations
 

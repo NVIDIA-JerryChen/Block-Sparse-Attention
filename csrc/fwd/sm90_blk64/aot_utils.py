@@ -203,7 +203,6 @@ def compute_sm90_aot_source_fingerprint(repo_root: Path | None = None) -> str:
         / "csrc"
         / "fwd"
         / "sm100_blk64"
-        / "cutedsl"
         / "bsa_fwd_combine.py",
         *sorted((repo_root / "csrc" / "fwd" / "sm90_blk64").glob("*.py")),
         *sorted((repo_root / "csrc" / "utils").glob("*.py")),

@@ -9,7 +9,7 @@ import cutlass
 import cutlass.cute as cute
 
 import block_sparse_attention.utils.cache_utils  # noqa: F401  # Preload runtime symbols for export_to_c.
-from block_sparse_attention.csrc.fwd.sm100_blk64.cutedsl.bsa_fwd_combine import (
+from block_sparse_attention.csrc.fwd.sm100_blk64.bsa_fwd_combine import (
     BlockSparseAttnForwardCombine,
 )
 from block_sparse_attention.csrc.fwd.sm90_blk64.aot_utils import (

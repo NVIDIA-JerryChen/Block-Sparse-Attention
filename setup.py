@@ -6,8 +6,6 @@ from setuptools.command.build_py import build_py as _BuildPy
 
 
 _CSRC_EXCLUDE = (
-    "fwd.sm100_blk64.cpp*",
-    "fwd.sm100_blk64.instantiations*",
     "*.__pycache__*",
     "*.egg-info*",
 )

@@ -3,4 +3,3 @@ include bsa_fp8_blk64.py
 include bsa_fp8_quant.py
 include bsa_sage_blk64.py
 include bsa_sage_quant.py
-prune csrc/fwd/sm100_blk64/cpp

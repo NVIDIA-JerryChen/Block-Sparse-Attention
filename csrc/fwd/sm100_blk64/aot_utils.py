@@ -257,8 +257,8 @@ def compute_sm100_aot_source_fingerprint(
         repo_root / "bsa_attn_interface.py",
         repo_root / "utils" / "cache_utils.py",
         *sorted(
-            (repo_root / "csrc" / "fwd" / "sm100_blk64" / "cutedsl").glob(
-                "*.py"
+            (repo_root / "csrc" / "fwd" / "sm100_blk64").glob(
+                "bsa_fwd*.py"
             )
         ),
         *sorted((repo_root / "csrc" / "fwd" / "sm100_blk64").glob("aot_*.py")),

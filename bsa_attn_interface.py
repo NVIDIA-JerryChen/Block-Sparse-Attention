@@ -59,12 +59,12 @@ from block_sparse_attention.csrc.fwd.sm100_blk64.aot_utils import (
 )
 
 try:
-    from block_sparse_attention.csrc.fwd.sm100_blk64.cutedsl.bsa_fwd_combine import (
+    from block_sparse_attention.csrc.fwd.sm100_blk64.bsa_fwd_combine import (
         BlockSparseAttnForwardCombine,
     )
 except ImportError:
     BlockSparseAttnForwardCombine = None
-from block_sparse_attention.csrc.fwd.sm100_blk64.cutedsl.bsa_fwd_sm100 import (
+from block_sparse_attention.csrc.fwd.sm100_blk64.bsa_fwd_sm100 import (
     BlockSparseAttnForwardSm100Blk64,
 )
 from block_sparse_attention.csrc.bwd.sm100_blk64.bsa_bwd_sm100 import (

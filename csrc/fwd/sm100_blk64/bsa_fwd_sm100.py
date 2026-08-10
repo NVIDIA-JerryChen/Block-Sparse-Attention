@@ -33,7 +33,7 @@ from block_sparse_attention.csrc.utils import pipeline as pipeline_custom
 from block_sparse_attention.csrc.utils.softmax import SoftmaxSm100
 from block_sparse_attention.csrc.utils.seqlen_info import SeqlenInfoQK
 from block_sparse_attention.csrc.utils.pack_gqa import PackGQA, pack_gqa_layout
-from block_sparse_attention.csrc.fwd.sm100_blk64.cutedsl import bsa_fwd_helpers
+from block_sparse_attention.csrc.fwd.sm100_blk64 import bsa_fwd_helpers
 from block_sparse_attention.csrc.utils.named_barrier import NamedBarrierFwdSm100
 from block_sparse_attention.csrc.utils.cute_dsl_utils import ParamsBase
 import cutlass.pipeline as cutlass_pipeline
@@ -91,8 +91,8 @@ class BlockSparseAttnForwardSm100Blk64:
         # If split_P_arrive, the softmax warps write some columns of P first, signal to the MMA warp
         # to being the P @ V MMA, then write the rest of P and signal again. This allows some overlap
         # between compute the last couple columns of P and the P @ V MMA.
-        # Match C++ blk64 kSplitNumer/kSplitDenom = 1/4:
-        # softmax releases the first 32 P columns early, then MMA waits on
+        # Split the numerator work at 1/4: softmax releases the first 32 P
+        # columns early, then MMA waits on
         # p_lastsplit before consuming the remaining P fragments.
         self.split_P_arrive = 32
         self.arch = BaseDSL._get_dsl().get_arch_enum()
@@ -104,7 +104,7 @@ class BlockSparseAttnForwardSm100Blk64:
             self.n_block_size,
             self.head_dim_padded,
         )
-        # WS TS PV follows the C++ blk64 trait: M=64, N=256, K=128.
+        # WS TS PV uses M=64, N=256, K=128.
         # The final 128 output columns are recovered by the correction epilogue's
         # WS TMEM load/store mapping.
         self.mma_tiler_pv = (
@@ -156,7 +156,7 @@ class BlockSparseAttnForwardSm100Blk64:
         )
 
         self.s_stage = 2  # Always 2: for q_stage=1 it's n-direction
-        # Match C++ blk64: two 128-column S/P stages and two 128-column O stages.
+        # Use two 128-column S/P stages and two 128-column O stages.
         self.tmem_s_offset = [0, 128]
         self.tmem_o_offset = [256, 384]
         self.tmem_total = 512
@@ -298,7 +298,7 @@ class BlockSparseAttnForwardSm100Blk64:
         num_splits = Int32(self.num_splits)
         mO = cute.make_tensor(mO.iterator, cute.select(mO.layout, mode=O_layout_transpose))
         mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose)) if const_expr(mLSE is not None) else None
-        # The fast rank-6 view matches the C++ sparse-block layout. CuTe DSL
+        # The fast rank-6 view matches the sparse-block layout. CuTe DSL
         # cannot lower an Int64 basis in that rank-6 TMA view, so layouts with
         # large active strides use a rank-5 Int64 view and divide it into
         # sparse blocks in the device kernel instead.
@@ -513,7 +513,7 @@ class BlockSparseAttnForwardSm100Blk64:
         )
         sK_layout = sm100_utils_basic.make_smem_layout_b(tiled_mma_qk, self.mma_tiler_qk, self.k_dtype, self.kv_stage)
         tP_layout = sm100_utils_basic.make_smem_layout_a(tiled_mma_pv, self.mma_tiler_pv, self.q_dtype, self.s_stage)
-        # C++ SmemLayoutVDual in the MMA-fragment shape expected by CuTeDSL.
+        # V dual layout in the MMA-fragment shape expected by CuTe DSL.
         # The K-groups must stay nested as (4,2): the second dim half jumps by
         # 16384 elements, while groups inside one half advance by 1024.
         if const_expr(self.is_sage_fp8):
@@ -545,7 +545,7 @@ class BlockSparseAttnForwardSm100Blk64:
                     ),
                 ),
             )
-        # Exact C++ SmemLayoutKWide:
+        # Wide K shared-memory layout:
         #   Sw<3,4,3> o _0 o (_64,_64,_2):(_64,_1,_16384)
         # A sparse sub-block advances by 4096 elements, while the second
         # dim half jumps by the full 256-token half stride.
@@ -567,7 +567,7 @@ class BlockSparseAttnForwardSm100Blk64:
                     stride=(k_dim_half, 1, self.n_block_size * k_dim_half),
                 ),
             )
-        # Exact C++ SmemLayoutVWide:
+        # Wide V shared-memory layout:
         #   Sw<3,4,3> o _0 o (_64,_64,_2):(_1,_64,_4096)
         # It writes both 64-dim halves for one sparse 64-token block while
         # preserving the offsets consumed by the full VDual PV layout.
@@ -631,7 +631,7 @@ class BlockSparseAttnForwardSm100Blk64:
                 tiled_mma_qk,
             )
 
-        # K/V are sparse 64-block indexed. C++ blk64 issues four TMAs per
+        # K/V are sparse 64-block indexed. Issue four TMAs per
         # 64x256 KV iteration; each copy targets a sub-tile of the full
         # 256x128 WS SMEM layout.
         tma_atom_K, mK = cpasync.make_tiled_tma_atom(
@@ -971,7 +971,7 @@ class BlockSparseAttnForwardSm100Blk64:
         # (MMA, MMA_K, MMA_D, PIPE)
         # Strip swizzle info to reuse smem
         sV = cute.make_tensor(cute.recast_ptr(sKV_ptr, sV_layout.inner), sV_layout.outer)
-        # Match the C++ blk64 SharedStorage union: epilogue exchange/sO reuses
+        # The epilogue exchange and sO reuse
         # the large KV buffer after the mainloop has finished consuming it.
         sO = cute.make_tensor(
             cute.recast_ptr(sKV_ptr + self.epi_sO_input_offset, sO_layout.inner, self.o_dtype),
@@ -1200,7 +1200,7 @@ class BlockSparseAttnForwardSm100Blk64:
                 mSplitOffsets=mSplitOffsets,
             )
 
-            # Keep stage constexpr, matching the C++ template<int Stage> path.
+            # Keep stage constexpr so each softmax path has a fixed stage.
             # Runtime stage selection leaves TMEM offsets, barrier indices, and
             # stats strides as uniform arithmetic in the hot softmax loop.
             if warp_idx < self.softmax1_warp_ids[0]:
@@ -1404,7 +1404,7 @@ class BlockSparseAttnForwardSm100Blk64:
             tile_block_indices_base = mBlockIndex[batch_idx, head_idx, m_block, None]
 
             # n_block(i): maps logical index i to actual KV block index via q2k_block_index
-            # C++ blk64 groups four sparse 64-blocks into one 64x256 KV iteration.
+            # Group four sparse 64-blocks into one 64x256 KV iteration.
             # raw count is padded to a multiple of 8, then divided by 4 so the
             # number of KV iterations is even.
             # max_i clamps phantom block indices to the last valid entry.
@@ -1427,7 +1427,7 @@ class BlockSparseAttnForwardSm100Blk64:
             )
 
             if process_tile:
-                # Match C++ blk64: issue the one-shot Q TMA first, then K[N-1]/K[N-2].
+                # Issue the one-shot Q TMA first, then K[N-1]/K[N-2].
                 if const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]:
                     pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
                     tma_bar_ptr = pipeline_q.sync_object_full.get_barrier(0)
@@ -2540,7 +2540,7 @@ class BlockSparseAttnForwardSm100Blk64:
         reduce_mbar_addr: Int32,
         mLSE_cur: Optional[cute.Tensor] = None,
     ):
-        """C++ blk64-style WS epilogue combine using raw TMEM/SMEM addressing."""
+        """Combine the WS epilogue using raw TMEM/SMEM addressing."""
         corr_warp = tidx // cute.arch.WARP_SIZE
         lane_idx = tidx % cute.arch.WARP_SIZE
         partner_warp = corr_warp ^ 2

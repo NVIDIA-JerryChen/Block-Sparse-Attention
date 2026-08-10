@@ -123,8 +123,6 @@ clean:
 	rm -rf build/ dist/ artifacts/wheels/ $(AGENT_SPACE)/wheels/ *.egg-info
 	rm -rf csrc/fwd/sm100_blk64/build/ csrc/fwd/sm100_blk64/dist/
 	rm -rf csrc/fwd/sm100_blk64/*.egg-info csrc/fwd/sm100_blk64/*.so
-	rm -rf csrc/fwd/sm100_blk64/cpp/build/ csrc/fwd/sm100_blk64/cpp/dist/
-	rm -rf csrc/fwd/sm100_blk64/cpp/*.egg-info csrc/fwd/sm100_blk64/cpp/*.so
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
 help:

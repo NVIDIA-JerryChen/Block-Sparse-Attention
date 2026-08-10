@@ -1,4 +1,6 @@
 # Copyright (c) 2025, Tri Dao.
+"""Device helpers for the SM100 block-64 forward kernel."""
+
 from typing import Optional, Tuple
 
 import cutlass

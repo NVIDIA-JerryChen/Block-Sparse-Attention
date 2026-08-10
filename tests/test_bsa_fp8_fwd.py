@@ -5,7 +5,7 @@ import torch
 
 
 def test_bsa_fp8_probability_scale_contract():
-    from csrc.fwd.sm100_blk64.cutedsl.bsa_fwd_sm100 import (
+    from csrc.fwd.sm100_blk64.bsa_fwd_sm100 import (
         SAGE_P_QUANT_SCALE,
         SAGE_P_RESCALE_THRESHOLD,
     )

@@ -69,9 +69,6 @@ def built_wheel(
         / "lib"
         / "block_sparse_attention"
         / "csrc"
-        / "fwd"
-        / "sm100_blk64"
-        / "cpp"
         / "stale.txt",
     )
     for stale_output in stale_outputs:
@@ -154,15 +151,11 @@ def test_wheel_contains_single_import_package(built_wheel: Path) -> None:
         "block_sparse_attention/csrc/fwd/sm90_blk64/aot_runtime.py",
         "block_sparse_attention/csrc/fwd/sm90_blk64/aot_utils.py",
         "block_sparse_attention/csrc/fwd/sm120_blk64/quant_aot_runtime.py",
-        "block_sparse_attention/csrc/fwd/sm100_blk64/cutedsl/bsa_fwd_sm100.py",
+        "block_sparse_attention/csrc/fwd/sm100_blk64/bsa_fwd_sm100.py",
         "block_sparse_attention/utils/cache_utils.py",
     } <= names
     assert "bsa_attn_interface.py" not in names
     assert not any(name.startswith(("csrc/", "utils/")) for name in names)
-    assert not any(
-        name.startswith("block_sparse_attention/csrc/fwd/sm100_blk64/cpp/")
-        for name in names
-    )
 
 
 def test_wheel_uses_local_cutedsl_version(built_wheel: Path) -> None:
@@ -175,7 +168,7 @@ def test_wheel_uses_local_cutedsl_version(built_wheel: Path) -> None:
     assert "nvidia-cutlass-dsl" in metadata.get_all("Requires-Dist")
 
 
-def test_sdist_contains_mapped_sources_without_legacy_cpp(built_sdist: Path) -> None:
+def test_sdist_contains_mapped_sources(built_sdist: Path) -> None:
     with tarfile.open(built_sdist) as sdist:
         names = {
             name.partition("/")[2]
@@ -194,11 +187,10 @@ def test_sdist_contains_mapped_sources_without_legacy_cpp(built_sdist: Path) -> 
         "csrc/fwd/sm90_blk64/aot_runtime.py",
         "csrc/fwd/sm90_blk64/aot_utils.py",
         "csrc/fwd/sm120_blk64/quant_aot_runtime.py",
-        "csrc/fwd/sm100_blk64/cutedsl/bsa_fwd_sm100.py",
+        "csrc/fwd/sm100_blk64/bsa_fwd_sm100.py",
         "setup.py",
         "utils/cache_utils.py",
     } <= names
-    assert not any(name.startswith("csrc/fwd/sm100_blk64/cpp/") for name in names)
 
 
 def test_wheel_exports_public_api_from_isolated_install(

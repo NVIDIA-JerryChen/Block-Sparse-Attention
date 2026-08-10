@@ -26,10 +26,10 @@ from block_sparse_attention.csrc.fwd.sm100_blk64.aot_utils import (
     sha256_file,
     write_sm100_aot_manifest,
 )
-from block_sparse_attention.csrc.fwd.sm100_blk64.cutedsl.bsa_fwd_combine import (
+from block_sparse_attention.csrc.fwd.sm100_blk64.bsa_fwd_combine import (
     BlockSparseAttnForwardCombine,
 )
-from block_sparse_attention.csrc.fwd.sm100_blk64.cutedsl.bsa_fwd_sm100 import (
+from block_sparse_attention.csrc.fwd.sm100_blk64.bsa_fwd_sm100 import (
     BlockSparseAttnForwardSm100Blk64,
 )
 
