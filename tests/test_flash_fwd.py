@@ -412,6 +412,179 @@ def _test_single(bs, seqlen_q, seqlen_k, nheads, nheads_kv, d, dtype=torch.bfloa
     assert passed, f"kernel_diff={kernel_diff} > tol={tol}, lse_diff={lse_max_diff} > lse_tol={lse_tol}"
 
 
+def _make_variable_boundary_case(
+    block_counts, use_block_sizes, block_size, head_dim=128
+):
+    """Build deterministic variable-count metadata with live padded entries."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size = 1
+    num_heads = 1
+    num_q_blocks = len(block_counts)
+    capacity = max(block_counts)
+    seqlen_q = num_q_blocks * block_size
+    seqlen_k = capacity * block_size
+
+    torch.manual_seed(20260812)
+    q = torch.randn(
+        batch_size,
+        num_heads,
+        seqlen_q,
+        head_dim,
+        device=device,
+        dtype=dtype,
+    )
+    k = torch.randn(
+        batch_size,
+        num_heads,
+        seqlen_k,
+        head_dim,
+        device=device,
+        dtype=dtype,
+    )
+    v = torch.randn_like(k)
+
+    block_ids = torch.arange(capacity, device=device, dtype=torch.int32)
+    q2k_block_index = torch.empty(
+        batch_size,
+        num_heads,
+        num_q_blocks,
+        capacity,
+        device=device,
+        dtype=torch.int32,
+    )
+    for q_block_idx in range(num_q_blocks):
+        # Keep every padded entry valid but distinct so consuming beyond the
+        # runtime count changes the numerical result instead of faulting.
+        q2k_block_index[0, 0, q_block_idx] = torch.roll(
+            block_ids, shifts=q_block_idx
+        )
+    q2k_block_nums = torch.tensor(
+        block_counts, device=device, dtype=torch.int32
+    ).view(batch_size, num_heads, num_q_blocks)
+
+    if use_block_sizes:
+        block_sizes = block_size - (block_ids * 11) % 31
+    else:
+        block_sizes = None
+    return q, k, v, q2k_block_index, q2k_block_nums, block_sizes
+
+
+def _reference_variable_case(
+    q,
+    k,
+    v,
+    q2k_block_index,
+    q2k_block_nums,
+    block_sizes,
+    block_size,
+):
+    """Compute an FP32 reference without sanitizing empty-row kernel output."""
+    softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+    ref_out = torch.zeros_like(q, dtype=torch.float32)
+    ref_lse = torch.full(
+        q.shape[:3], float("-inf"), device=q.device, dtype=torch.float32
+    )
+    num_q_blocks = q2k_block_nums.shape[-1]
+
+    for q_block_idx in range(num_q_blocks):
+        block_count = int(q2k_block_nums[0, 0, q_block_idx].item())
+        if block_count == 0:
+            continue
+        selected_tokens = []
+        for logical_idx in range(block_count):
+            kv_block_idx = int(
+                q2k_block_index[0, 0, q_block_idx, logical_idx].item()
+            )
+            valid_tokens = (
+                block_size
+                if block_sizes is None
+                else int(block_sizes[kv_block_idx].item())
+            )
+            selected_tokens.append(
+                torch.arange(
+                    kv_block_idx * block_size,
+                    kv_block_idx * block_size + valid_tokens,
+                    device=q.device,
+                )
+            )
+        token_indices = torch.cat(selected_tokens)
+        q_begin = q_block_idx * block_size
+        q_end = q_begin + block_size
+        q_tile = q[:, :, q_begin:q_end].float()
+        k_selected = k.index_select(2, token_indices).float()
+        v_selected = v.index_select(2, token_indices).float()
+        scores = torch.matmul(q_tile, k_selected.transpose(-1, -2))
+        scores *= softmax_scale
+        ref_out[:, :, q_begin:q_end] = torch.matmul(
+            torch.softmax(scores, dim=-1), v_selected
+        )
+        ref_lse[:, :, q_begin:q_end] = torch.logsumexp(scores, dim=-1)
+    return ref_out, ref_lse
+
+
+def _assert_variable_fwd_case(
+    *,
+    block_counts,
+    use_block_sizes,
+    allow_empty_block_nums,
+    use_clc,
+    block_size,
+    head_dim=128,
+    kv_splits=1,
+):
+    (
+        q,
+        k,
+        v,
+        q2k_block_index,
+        q2k_block_nums,
+        block_sizes,
+    ) = _make_variable_boundary_case(
+        block_counts, use_block_sizes, block_size, head_dim
+    )
+    ref_out, ref_lse = _reference_variable_case(
+        q,
+        k,
+        v,
+        q2k_block_index,
+        q2k_block_nums,
+        block_sizes,
+        block_size,
+    )
+
+    # A conflicting nonzero scalar verifies that runtime per-row counts take
+    # precedence. Live entries after each valid prefix verify tail masking.
+    out, lse = bsa_attn_fwd(
+        q,
+        k,
+        v,
+        q2k_block_index,
+        q2k_block_index.shape[-1],
+        block_sizes,
+        q2k_block_nums=q2k_block_nums,
+        allow_empty_block_nums=allow_empty_block_nums,
+        return_lse=True,
+        sparse_block_size=block_size,
+        use_clc=use_clc,
+        kv_splits=kv_splits,
+    )
+
+    empty_q_blocks = q2k_block_nums[0, 0] == 0
+    if empty_q_blocks.any():
+        empty_rows = empty_q_blocks.repeat_interleave(block_size)
+        assert torch.count_nonzero(out[0, 0, empty_rows]) == 0
+        assert torch.isneginf(lse[0, 0, empty_rows]).all()
+
+    torch.testing.assert_close(
+        out.float(), ref_out, rtol=3e-2, atol=3e-2
+    )
+    finite_rows = ref_lse.isfinite()
+    torch.testing.assert_close(
+        lse[finite_rows], ref_lse[finite_rows], rtol=2e-3, atol=2e-3
+    )
+
+
 # ============== Pytest ==============
 
 @pytest.mark.parametrize(
@@ -672,6 +845,153 @@ def test_sm90_blk64_empty_variable_row():
         out[:, :, blk:].float(), ref_out, rtol=3e-2, atol=3e-2
     )
     torch.testing.assert_close(lse[:, :, blk:], ref_lse, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] in (10, 11)
+    ),
+    reason="SM100/SM110 required",
+)
+@pytest.mark.parametrize(
+    "use_clc,use_block_sizes,allow_empty_block_nums",
+    [
+        (False, True, True),
+        (True, False, True),
+        (False, False, False),
+        (True, True, False),
+    ],
+    ids=[
+        "static-block-sizes-empty",
+        "clc-no-block-sizes-empty",
+        "static-no-block-sizes-nonempty",
+        "clc-block-sizes-nonempty",
+    ],
+)
+def test_sm100_blk64_variable_count_boundaries(
+    use_clc, use_block_sizes, allow_empty_block_nums
+):
+    """Cover phantom padding boundaries and both empty specializations."""
+    block_counts = [1, 2, 3, 4, 7, 8, 9, 15, 16, 17]
+    if allow_empty_block_nums:
+        block_counts[0] = 0
+    _assert_variable_fwd_case(
+        block_counts=block_counts,
+        use_block_sizes=use_block_sizes,
+        allow_empty_block_nums=allow_empty_block_nums,
+        use_clc=use_clc,
+        block_size=64,
+    )
+
+
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 9
+    ),
+    reason="SM90 required",
+)
+@pytest.mark.parametrize(
+    "use_block_sizes,allow_empty_block_nums",
+    [(True, True), (False, False)],
+    ids=["block-sizes-empty", "no-block-sizes-nonempty"],
+)
+def test_sm90_blk64_variable_count_boundaries(
+    use_block_sizes, allow_empty_block_nums
+):
+    """Cover zero, singleton, odd, even, and capacity counts on SM90."""
+    block_counts = [1, 2, 3, 7, 8, 9, 16, 17]
+    if allow_empty_block_nums:
+        block_counts[0] = 0
+    _assert_variable_fwd_case(
+        block_counts=block_counts,
+        use_block_sizes=use_block_sizes,
+        allow_empty_block_nums=allow_empty_block_nums,
+        use_clc=False,
+        block_size=64,
+    )
+
+
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] in (10, 11)
+    ),
+    reason="SM100/SM110 required",
+)
+@pytest.mark.parametrize(
+    "kv_splits,use_clc",
+    [(2, False), (4, True)],
+    ids=["splits2-static", "splits4-clc"],
+)
+def test_sm100_blk64_split_kv_variable_count_boundaries(kv_splits, use_clc):
+    """Exercise even and 8-block-aligned split offset branches on SM100."""
+    _assert_variable_fwd_case(
+        block_counts=[0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33],
+        use_block_sizes=True,
+        allow_empty_block_nums=True,
+        use_clc=use_clc,
+        block_size=64,
+        kv_splits=kv_splits,
+    )
+
+
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 9
+    ),
+    reason="SM90 required",
+)
+@pytest.mark.parametrize("kv_splits", [2, 4], ids=["splits2", "splits4"])
+def test_sm90_blk64_split_kv_variable_count_boundaries(kv_splits):
+    """Exercise empty splits and aligned split offsets on SM90."""
+    _assert_variable_fwd_case(
+        block_counts=[0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33],
+        use_block_sizes=True,
+        allow_empty_block_nums=True,
+        use_clc=False,
+        block_size=64,
+        kv_splits=kv_splits,
+    )
+
+
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] in (10, 11)
+    ),
+    reason="SM100/SM110 required",
+)
+@pytest.mark.parametrize(
+    "head_dim,use_block_sizes,allow_empty_block_nums",
+    [
+        (64, True, True),
+        (96, False, False),
+        (128, True, False),
+    ],
+    ids=[
+        "d64-block-sizes-empty",
+        "d96-no-block-sizes-nonempty",
+        "d128-block-sizes-nonempty",
+    ],
+)
+def test_sm100_blk128_variable_count_boundaries(
+    head_dim, use_block_sizes, allow_empty_block_nums
+):
+    """Cover odd-count padding and supported head dimensions on blk128."""
+    block_counts = [1, 2, 3, 4, 5, 5]
+    if allow_empty_block_nums:
+        block_counts[0] = 0
+    _assert_variable_fwd_case(
+        block_counts=block_counts,
+        use_block_sizes=use_block_sizes,
+        allow_empty_block_nums=allow_empty_block_nums,
+        use_clc=None,
+        block_size=128,
+        head_dim=head_dim,
+    )
 
 
 # ============== Quick test (make tt) ==============

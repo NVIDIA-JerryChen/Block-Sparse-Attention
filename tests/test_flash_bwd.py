@@ -385,6 +385,123 @@ def _test_bwd_topk_blk128(
     _assert_bwd_close(f"blk128 topk={topk}", (dq, dk, dv), refs, tols)
 
 
+def _test_bwd_variable_count_boundaries(
+    *,
+    block_size,
+    block_counts,
+    use_block_sizes,
+    bucket_size_blocks,
+    head_dim=128,
+):
+    """Check runtime count boundaries with valid entries in every padded slot."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size = 1
+    num_heads = 1
+    num_q_blocks = len(block_counts)
+    capacity = max(block_counts)
+    seqlen_q = num_q_blocks * block_size
+    seqlen_k = capacity * block_size
+
+    torch.manual_seed(20260812 + block_size + head_dim)
+    q = torch.randn(
+        batch_size,
+        num_heads,
+        seqlen_q,
+        head_dim,
+        device=device,
+        dtype=dtype,
+    )
+    k = torch.randn(
+        batch_size,
+        num_heads,
+        seqlen_k,
+        head_dim,
+        device=device,
+        dtype=dtype,
+    )
+    v = torch.randn_like(k)
+    dout = torch.randn_like(q)
+
+    block_ids = torch.arange(capacity, device=device, dtype=torch.int32)
+    q2k_block_index = torch.empty(
+        batch_size,
+        num_heads,
+        num_q_blocks,
+        capacity,
+        device=device,
+        dtype=torch.int32,
+    )
+    for q_block_idx in range(num_q_blocks):
+        # Keep the inactive suffix live so an over-read changes the gradients.
+        q2k_block_index[0, 0, q_block_idx] = torch.roll(
+            block_ids, shifts=q_block_idx
+        )
+    q2k_block_nums = torch.tensor(
+        block_counts, device=device, dtype=torch.int32
+    ).view(batch_size, num_heads, num_q_blocks)
+
+    if use_block_sizes:
+        ref_block_sizes = block_size - (block_ids * 11) % 31
+        block_sizes = ref_block_sizes
+    else:
+        ref_block_sizes = torch.full_like(block_ids, block_size)
+        block_sizes = None
+    attn_bias = block_sparse_to_attn_bias(
+        q2k_block_index,
+        capacity,
+        ref_block_sizes,
+        seqlen_q,
+        seqlen_k,
+        blk_m=block_size,
+        blk_n=block_size,
+        q2k_block_nums=q2k_block_nums,
+    )
+
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+    empty_rows = (q2k_block_nums == 0).repeat_interleave(block_size, dim=-1)
+    if empty_rows.any():
+        # Isolate fully masked rows from the dense PyTorch softmax reference.
+        # Their output is constant zero, so they contribute no input gradients.
+        ref_attn_bias = attn_bias.masked_fill(empty_rows.unsqueeze(-1), 0.0)
+        ref_dout = dout.masked_fill(empty_rows.unsqueeze(-1), 0.0)
+    else:
+        ref_attn_bias = attn_bias
+        ref_dout = dout
+    out_ref, lse_ref, dq_ref, dk_ref, dv_ref = _torch_ref_bwd(
+        q, k, v, ref_dout, ref_attn_bias, softmax_scale
+    )
+    _, _, dq_pt, dk_pt, dv_pt = _torch_ref_bwd(
+        q, k, v, ref_dout, ref_attn_bias, softmax_scale, upcast=False
+    )
+    if empty_rows.any():
+        out_ref = out_ref.masked_fill(empty_rows.unsqueeze(-1), 0.0)
+        lse_ref = lse_ref.masked_fill(empty_rows, float("-inf"))
+    refs = _sanitize_grads(dq_ref, dk_ref, dv_ref)
+    tols = _grad_tols(refs, _sanitize_grads(dq_pt, dk_pt, dv_pt))
+
+    grads = bsa_attn_bwd(
+        dout,
+        q,
+        k,
+        v,
+        out_ref,
+        lse_ref,
+        q2k_block_index,
+        capacity,
+        block_sizes,
+        q2k_block_nums=q2k_block_nums,
+        softmax_scale=softmax_scale,
+        bucket_size_blocks=bucket_size_blocks,
+        sparse_block_size=block_size,
+    )
+    label = (
+        f"blk{block_size} variable counts d={head_dim} "
+        f"block_sizes={use_block_sizes} bucket={bucket_size_blocks}"
+    )
+    _assert_bwd_close(label, grads, refs, tols)
+
+
 def _test_bwd_layout_equivalence():
     device = "cuda"
     dtype = torch.bfloat16
@@ -776,6 +893,83 @@ def test_flash_bwd_sm100_blk128_dk_zero_init_transition(num_q_blocks):
         topk=2,
         use_block_sizes=False,
         shared_kv_blocks=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "block_size,head_dim,use_block_sizes,bucket_size_blocks,block_counts",
+    [
+        pytest.param(
+            BLK,
+            128,
+            False,
+            2,
+            [0, 1, 2, 3, 4, 7, 8, 9, 15, 16, 17],
+            id="blk64-d128-no-block-sizes-small-bucket",
+        ),
+        pytest.param(
+            BLK128,
+            64,
+            False,
+            None,
+            [0, 1, 2, 3, 4, 5],
+            id="blk128-d64-no-block-sizes-default-bucket",
+        ),
+        pytest.param(
+            BLK128,
+            128,
+            False,
+            2,
+            [1, 2, 3, 4, 5],
+            id="blk128-d128-no-block-sizes-small-bucket",
+        ),
+    ],
+)
+def test_flash_bwd_sm100_variable_count_boundaries(
+    block_size,
+    head_dim,
+    use_block_sizes,
+    bucket_size_blocks,
+    block_counts,
+):
+    if _cuda_major() not in [10, 11]:
+        pytest.skip("SM100/SM110 variable-count bwd test")
+    _test_bwd_variable_count_boundaries(
+        block_size=block_size,
+        block_counts=block_counts,
+        use_block_sizes=use_block_sizes,
+        bucket_size_blocks=bucket_size_blocks,
+        head_dim=head_dim,
+    )
+
+
+@pytest.mark.parametrize(
+    "use_block_sizes,bucket_size_blocks,block_counts",
+    [
+        pytest.param(
+            True,
+            None,
+            [0, 1, 2, 3, 4, 7, 8, 9, 15, 16, 17],
+            id="block-sizes-empty-default-bucket",
+        ),
+        pytest.param(
+            False,
+            2,
+            [1, 2, 3, 4, 7, 8, 9, 15, 16, 17],
+            id="no-block-sizes-small-bucket",
+        ),
+    ],
+)
+def test_flash_bwd_sm90_blk64_variable_count_boundaries(
+    use_block_sizes, bucket_size_blocks, block_counts
+):
+    if _cuda_major() != 9:
+        pytest.skip("SM90 variable-count bwd test")
+    _test_bwd_variable_count_boundaries(
+        block_size=BLK,
+        block_counts=block_counts,
+        use_block_sizes=use_block_sizes,
+        bucket_size_blocks=bucket_size_blocks,
     )
 
 
