@@ -284,11 +284,6 @@ def _sm100_blk64_requires_int64_kv_strides(
     coord_stride_limit = 1 << 27
     for tensor in (k, v):
         batch, heads, seqlen_k, _ = tensor.shape
-        # The rank-6 view rounds its sparse-block mode up to 64 tokens.
-        # Keep KV tails on the exact rank-5 view for every batch count so the
-        # layout rule does not depend on a batch-specific fast path.
-        if seqlen_k % 64 != 0:
-            return True
         stride_b, stride_h, stride_s, stride_d = map(int, tensor.stride())
         rank6_shape = (64, 64, 2, heads, (seqlen_k + 63) // 64, batch)
         rank6_stride = (
@@ -2421,7 +2416,10 @@ def _bsa_attn_fwd_sm100_blk64(
         block_sizes,
         q2k_block_nums,
     )
-    use_int64_kv_strides = _sm100_blk64_requires_int64_kv_strides(k_bhsd, v_bhsd)
+    use_exact_kv_layout = _sm100_blk64_requires_int64_kv_strides(
+        k_bhsd,
+        v_bhsd,
+    )
 
     if softmax_scale is None:
         softmax_scale = head_dim ** -0.5
@@ -2536,7 +2534,7 @@ def _bsa_attn_fwd_sm100_blk64(
             is_persistent,
             use_clc_scheduler,
             input_layout,
-            use_int64_kv_strides,
+            use_exact_kv_layout,
             is_sage_fp8,
             "tvm_ffi_env_stream_v1",
         ),
@@ -2637,7 +2635,7 @@ def _bsa_attn_fwd_sm100_blk64(
             allow_empty_block_nums=allow_empty_block_nums,
             has_block_sizes=has_block_sizes,
             num_splits=kv_splits_i,
-            use_int64_kv_strides=use_int64_kv_strides,
+            use_exact_kv_layout=use_exact_kv_layout,
         )
 
         _bsa_attn_fwd_sm100_blk64.compile_cache[compile_key] = cute.compile(

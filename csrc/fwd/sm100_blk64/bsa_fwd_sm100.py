@@ -67,7 +67,7 @@ class BlockSparseAttnForwardSm100Blk64:
         allow_empty_block_nums: cutlass.Constexpr[bool] = False,
         has_block_sizes: cutlass.Constexpr[bool] = True,
         num_splits: cutlass.Constexpr[int] = 1,
-        use_int64_kv_strides: cutlass.Constexpr[bool] = False,
+        use_exact_kv_layout: cutlass.Constexpr[bool] = False,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -124,7 +124,7 @@ class BlockSparseAttnForwardSm100Blk64:
         self.is_split_kv = num_splits > 1
         self.allow_empty_block_nums = allow_empty_block_nums
         self.has_block_sizes = has_block_sizes
-        self.use_int64_kv_strides = use_int64_kv_strides
+        self.use_exact_kv_layout = use_exact_kv_layout
         self.qhead_per_kvhead = qhead_per_kvhead
         self.pack_gqa = pack_gqa
         if pack_gqa:
@@ -298,13 +298,11 @@ class BlockSparseAttnForwardSm100Blk64:
         num_splits = Int32(self.num_splits)
         mO = cute.make_tensor(mO.iterator, cute.select(mO.layout, mode=O_layout_transpose))
         mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose)) if const_expr(mLSE is not None) else None
-        # The fast rank-6 view matches the sparse-block layout. CuTe DSL
-        # cannot lower an Int64 basis in that rank-6 TMA view, so layouts with
-        # large active strides use a rank-5 Int64 view and divide it into
-        # sparse blocks in the device kernel instead.
+        # The normal layout maps physical 64-token KV blocks directly. Keep the
+        # exact rank-5 layout only for strides outside the TMA coordinate range.
         k_dim_half = self.head_dim_padded // 2
         v_dim_part = self.head_dim_v_padded // 2
-        if const_expr(self.use_int64_kv_strides):
+        if const_expr(self.use_exact_kv_layout):
             k_stride_s = Int64(mK_seq.layout.stride[0])
             k_stride_d = Int64(mK_seq.layout.stride[1])
             k_stride_h = Int64(mK_seq.layout.stride[2])
@@ -1391,7 +1389,7 @@ class BlockSparseAttnForwardSm100Blk64:
                 load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(tma_atom_Q, 0, cute.make_layout(1), tSgQ, sQ)
 
             head_idx_kv = head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
-            if const_expr(self.use_int64_kv_strides):
+            if const_expr(self.use_exact_kv_layout):
                 mK_cur = mK[None, None, None, head_idx_kv, batch_idx]
                 mV_cur = mV[None, None, None, head_idx_kv, batch_idx]
                 gK_tma = cute.zipped_divide(mK_cur, (self.sparse_block_size, self.head_dim_padded // 2, 2))

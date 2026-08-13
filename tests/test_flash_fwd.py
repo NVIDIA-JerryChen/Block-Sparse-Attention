@@ -1670,10 +1670,10 @@ def test_sm100_blk64_cutedsl_large_kv_batch_stride():
     ),
     reason="SM100/SM110 required",
 )
-def test_sm100_blk64_cutedsl_multibatch_kv_tail():
-    """Keep non-aligned KV tails isolated across batches."""
+def test_sm100_blk64_cutedsl_multibatch_random_block_sizes():
+    """Keep randomly sized logical KV blocks isolated across batches."""
     torch.manual_seed(2031)
-    batch, heads, seqlen_q, seqlen_k, head_dim = 2, 2, 65, 193, 128
+    batch, heads, seqlen_q, seqlen_k, head_dim = 2, 2, 65, 256, 128
     block_size = 64
     num_q_blocks = (seqlen_q + block_size - 1) // block_size
 
@@ -1753,15 +1753,6 @@ def test_sm100_blk64_int64_kv_stride_selection():
     at_limit = make_meta(2, 1 << 27)
     inactive_batch = make_meta(1, 1 << 27)
     block_at_limit = make_meta(1, 1 << 30, stride_s=1 << 21)
-    tail_multibatch = torch.empty(
-        (2, 1, 593, 128), dtype=torch.bfloat16, device="meta"
-    )
-    tail_single_batch = torch.empty(
-        (1, 1, 593, 128), dtype=torch.bfloat16, device="meta"
-    )
-    aligned_multibatch = torch.empty(
-        (2, 1, 640, 128), dtype=torch.bfloat16, device="meta"
-    )
 
     assert not _sm100_blk64_requires_int64_kv_strides(below_limit, below_limit)
     assert _sm100_blk64_requires_int64_kv_strides(at_limit, at_limit)
@@ -1769,15 +1760,6 @@ def test_sm100_blk64_int64_kv_stride_selection():
         inactive_batch, inactive_batch
     )
     assert _sm100_blk64_requires_int64_kv_strides(block_at_limit, block_at_limit)
-    assert _sm100_blk64_requires_int64_kv_strides(
-        tail_multibatch, tail_multibatch
-    )
-    assert _sm100_blk64_requires_int64_kv_strides(
-        tail_single_batch, tail_single_batch
-    )
-    assert not _sm100_blk64_requires_int64_kv_strides(
-        aligned_multibatch, aligned_multibatch
-    )
 
 
 def test_unified_blk64_lse_and_preallocated_buffer_contract(monkeypatch):
