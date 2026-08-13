@@ -1663,6 +1663,83 @@ def test_sm100_blk64_cutedsl_large_kv_batch_stride():
     )
 
 
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] in (10, 11)
+    ),
+    reason="SM100/SM110 required",
+)
+def test_sm100_blk64_cutedsl_multibatch_kv_tail():
+    """Keep non-aligned KV tails isolated across batches."""
+    torch.manual_seed(2031)
+    batch, heads, seqlen_q, seqlen_k, head_dim = 2, 2, 65, 193, 128
+    block_size = 64
+    num_q_blocks = (seqlen_q + block_size - 1) // block_size
+
+    q = torch.randn(
+        (batch, heads, seqlen_q, head_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k = torch.randn(
+        (batch, heads, seqlen_k, head_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn_like(k)
+    q2k_block_index = torch.tensor(
+        [
+            [
+                [[0, 1, 3], [1, 2, 3]],
+                [[2, 0, 1], [3, 1, 0]],
+            ],
+            [
+                [[3, 2, 0], [0, 2, 1]],
+                [[1, 3, 2], [2, 1, 0]],
+            ],
+        ],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    assert q2k_block_index.shape == (batch, heads, num_q_blocks, 3)
+    block_sizes = torch.tensor(
+        [64, 17, 63, 1], device="cuda", dtype=torch.int32
+    )
+    empty_block_nums = torch.empty(0, device="cuda", dtype=torch.int32)
+
+    def run(q_arg, k_arg, v_arg, indices_arg):
+        return bsa_attn_fwd(
+            q_arg,
+            k_arg,
+            v_arg,
+            indices_arg,
+            3,
+            block_sizes,
+            q2k_block_nums=empty_block_nums,
+            return_lse=True,
+            sparse_block_size=block_size,
+            use_clc=False,
+            kv_splits=1,
+        )
+
+    out, lse = run(q, k, v, q2k_block_index)
+    reference = [
+        run(
+            q[batch_idx : batch_idx + 1],
+            k[batch_idx : batch_idx + 1],
+            v[batch_idx : batch_idx + 1],
+            q2k_block_index[batch_idx : batch_idx + 1],
+        )
+        for batch_idx in range(batch)
+    ]
+    ref_out = torch.cat([result[0] for result in reference], dim=0)
+    ref_lse = torch.cat([result[1] for result in reference], dim=0)
+
+    torch.testing.assert_close(out, ref_out, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(lse, ref_lse, rtol=2e-3, atol=2e-3)
+
+
 def test_sm100_blk64_int64_kv_stride_selection():
     def make_meta(batch, stride_b, stride_s=128):
         return torch.empty_strided(
@@ -1676,6 +1753,15 @@ def test_sm100_blk64_int64_kv_stride_selection():
     at_limit = make_meta(2, 1 << 27)
     inactive_batch = make_meta(1, 1 << 27)
     block_at_limit = make_meta(1, 1 << 30, stride_s=1 << 21)
+    tail_multibatch = torch.empty(
+        (2, 1, 593, 128), dtype=torch.bfloat16, device="meta"
+    )
+    tail_single_batch = torch.empty(
+        (1, 1, 593, 128), dtype=torch.bfloat16, device="meta"
+    )
+    aligned_multibatch = torch.empty(
+        (2, 1, 640, 128), dtype=torch.bfloat16, device="meta"
+    )
 
     assert not _sm100_blk64_requires_int64_kv_strides(below_limit, below_limit)
     assert _sm100_blk64_requires_int64_kv_strides(at_limit, at_limit)
@@ -1683,6 +1769,15 @@ def test_sm100_blk64_int64_kv_stride_selection():
         inactive_batch, inactive_batch
     )
     assert _sm100_blk64_requires_int64_kv_strides(block_at_limit, block_at_limit)
+    assert _sm100_blk64_requires_int64_kv_strides(
+        tail_multibatch, tail_multibatch
+    )
+    assert _sm100_blk64_requires_int64_kv_strides(
+        tail_single_batch, tail_single_batch
+    )
+    assert not _sm100_blk64_requires_int64_kv_strides(
+        aligned_multibatch, aligned_multibatch
+    )
 
 
 def test_unified_blk64_lse_and_preallocated_buffer_contract(monkeypatch):
