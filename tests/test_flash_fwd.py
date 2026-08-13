@@ -1884,6 +1884,33 @@ def test_sm100_blk64_auto_kv_splits_api(monkeypatch):
     torch.testing.assert_close(lse, ref_lse, rtol=5e-3, atol=3e-2)
 
 
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] in (10, 11)
+    ),
+    reason="SM100/SM110 required",
+)
+def test_sm100_blk64_large_q_auto_scheduler_policy():
+    """Large-Q auto mode avoids split traffic and uses persistent CLC."""
+    q_large = torch.empty(
+        (1, 40, 131072, 1), device="cuda", dtype=torch.int8
+    )
+    q_small = torch.empty((1, 4, 128, 1), device="cuda", dtype=torch.int8)
+    q2k_block_index = torch.empty(
+        (1, 1, 1, 2048), device="cuda", dtype=torch.int32
+    )
+
+    assert bsa_interface._sm100_blk64_auto_kv_splits(
+        q_large, q2k_block_index, 2048
+    ) == 1
+    assert bsa_interface._sm100_blk64_auto_kv_splits(
+        q_small, q2k_block_index, 2048
+    ) == 8
+    assert bsa_interface.choose_blk64_use_clc(q_large, 256)
+    assert bsa_interface.choose_blk64_use_clc(q_large, 2048)
+
+
 # ============== Kernel dispatch helper ==============
 
 def _call_kernel(q, k, v, q2k_block_index, block_sparse_num, block_sizes, blk_n,

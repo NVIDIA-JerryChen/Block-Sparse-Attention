@@ -651,6 +651,14 @@ def _sm100_blk64_auto_kv_splits(
     if kv_blocks <= 1:
         return 1
 
+    # Large-Q workloads already expose enough independent Q tiles to fill the
+    # GPU. Splitting KV adds FP32 partial output traffic and a combine launch
+    # without providing useful extra parallelism.
+    batch, heads, seqlen_q, _ = q.shape
+    total_q_tiles = batch * heads * _ceil_div_int(seqlen_q, 64)
+    if total_q_tiles >= 512:
+        return 1
+
     return _sm100_blk64_kv_splits_from_count(kv_blocks, max_kv_splits)
 
 
@@ -2013,14 +2021,14 @@ def choose_blk64_use_clc(
         batch, h, seqlen_q, _ = q.shape
 
     num_m_blocks = (seqlen_q + 63) // 64
-    large_long_topk = num_m_blocks >= 8192 and block_sparse_num >= 512
+    total_tiles = batch * h * num_m_blocks
+    large_long_topk = total_tiles >= 8192 and block_sparse_num >= 256
     if large_long_topk:
         return True
 
     if h == 1:
         return False
 
-    total_tiles = batch * h * num_m_blocks
     enough_tiles = num_m_blocks >= 128 and total_tiles >= 512
     light_tile = block_sparse_num <= (64 if h == 2 else 128)
     return enough_tiles and light_tile

@@ -2044,6 +2044,38 @@ class BlockSparseAttnForwardSm100Blk64:
         return tile_block_indices[idx]
 
     @cute.jit
+    def update_row_max_precomputed(
+        self,
+        softmax: SoftmaxSm100,
+        row_max_tile: Float32,
+        is_first: bool,
+    ) -> Tuple[Float32, Float32]:
+        """Update online-softmax state from an already reduced tile maximum."""
+        if const_expr(is_first):
+            row_max_new = row_max_tile
+            row_max_safe = (
+                row_max_new if row_max_new != -Float32.inf else Float32(0.0)
+            )
+            acc_scale = Float32(0.0)
+        else:
+            row_max_old = softmax.row_max[0]
+            row_max_new = cute.arch.fmax(row_max_tile, row_max_old)
+            row_max_safe = (
+                row_max_new if row_max_new != -Float32.inf else Float32(0.0)
+            )
+            acc_scale_log2 = (
+                row_max_old - row_max_safe
+            ) * softmax.scale_log2
+            acc_scale = cute.math.exp2(acc_scale_log2, fastmath=True)
+            if const_expr(softmax.rescale_threshold > 0.0):
+                if acc_scale_log2 >= -softmax.rescale_threshold:
+                    row_max_new = row_max_old
+                    row_max_safe = row_max_old
+                    acc_scale = Float32(1.0)
+        softmax.row_max[0] = row_max_new
+        return row_max_safe, acc_scale
+
+    @cute.jit
     def softmax_step(
         self,
         mma_si_consumer_phase: Int32,
@@ -2111,9 +2143,25 @@ class BlockSparseAttnForwardSm100Blk64:
                         q_log2_scale * sKScale[cache_idx]
                     )
 
+        use_ldred_rowmax = (
+            self.arch >= Arch.sm_103
+            and self.arch <= Arch.sm_103f
+            and not self.is_sage_fp8
+        )
         tSrS_t2r = cute.make_rmem_tensor((128,), Float32)
+        row_max_tile = -Float32.inf
         for c in cutlass.range_constexpr(4):
-            vals = bsa_fwd_helpers.tmem_load_32dp32b32x(tmem_s_addr + c * 32)
+            if const_expr(use_ldred_rowmax):
+                vals, row_max_chunk = (
+                    bsa_fwd_helpers.tmem_load_red_max_32dp32b32x(
+                        tmem_s_addr + c * 32
+                    )
+                )
+                row_max_tile = cute.arch.fmax(row_max_tile, row_max_chunk)
+            else:
+                vals = bsa_fwd_helpers.tmem_load_32dp32b32x(
+                    tmem_s_addr + c * 32
+                )
             for j in cutlass.range_constexpr(32):
                 tSrS_t2r[c * 32 + j] = vals[j]
 
@@ -2162,7 +2210,26 @@ class BlockSparseAttnForwardSm100Blk64:
                 scaled_group_max.load(), is_first
             )
         else:
-            row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
+            if const_expr(use_ldred_rowmax):
+                full_blocks = (
+                    block_size_lo == Int32(self.sparse_block_size)
+                ) & (block_size_hi == Int32(self.sparse_block_size))
+                row_max = Float32(0.0)
+                acc_scale = Float32(0.0)
+                if full_blocks:
+                    row_max, acc_scale = self.update_row_max_precomputed(
+                        softmax,
+                        row_max_tile,
+                        is_first,
+                    )
+                else:
+                    row_max, acc_scale = softmax.update_row_max(
+                        tSrS_t2r.load(), is_first
+                    )
+            else:
+                row_max, acc_scale = softmax.update_row_max(
+                    tSrS_t2r.load(), is_first
+                )
 
         if const_expr(not is_first):
             sScale[tidx + stage * self.stats_stride] = acc_scale
