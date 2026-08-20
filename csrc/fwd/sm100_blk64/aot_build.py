@@ -169,7 +169,7 @@ def compile_sm100_aot_variant(variant: Sm100AotVariant, target_arch: str):
         allow_empty_block_nums=variant.allow_empty_block_nums,
         has_block_sizes=variant.has_block_sizes,
         num_splits=variant.kv_splits,
-        use_int64_kv_strides=variant.use_int64_kv_strides,
+        use_exact_kv_layout=variant.use_int64_kv_strides,
     )
     return cute.compile(
         kernel,

@@ -2570,7 +2570,7 @@ def _bsa_attn_fwd_sm100_blk64(
             has_block_sizes=has_block_sizes,
             kv_splits=kv_splits_i,
             use_clc_scheduler=use_clc_scheduler,
-            use_int64_kv_strides=use_int64_kv_strides,
+            use_int64_kv_strides=use_exact_kv_layout,
         )
         aot_runtime_tensors = (
             q_bhsd,
