@@ -844,7 +844,7 @@ class BlockSparseAttnForwardSm100Blk128:
             tile_scheduler.advance_to_next_work(mbarrier_addr=mbarrier_addr)
             clc_producer_state.advance()
 
-            work_tile = tile_scheduler.consumer_advance()
+            work_tile = tile_scheduler.consumer_advance(sync_cta=False)
         clc_pipeline.producer_tail(clc_producer_state)
 
     @cute.jit
@@ -855,7 +855,7 @@ class BlockSparseAttnForwardSm100Blk128:
         """Runs on empty warps (and non-leader CTA scheduler warp) — consumes CLC responses."""
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            work_tile = tile_scheduler.consumer_advance()
+            work_tile = tile_scheduler.consumer_advance(sync_cta=False)
 
     @cute.jit
     def load(
@@ -982,7 +982,7 @@ class BlockSparseAttnForwardSm100Blk128:
                 kv_producer_state.advance()
 
             tile_scheduler.prefetch_next_work()
-            work_tile = tile_scheduler.consumer_advance()
+            work_tile = tile_scheduler.consumer_advance(sync_cta=False)
             # End of persistent scheduler loop
 
         pipeline_kv.producer_tail(kv_producer_state)
@@ -1142,10 +1142,6 @@ class BlockSparseAttnForwardSm100Blk128:
                         tOrVi = tOrV[None, None, None, Vi_index]
                         sV_cur = sV[None, None, None, Vi_index]
                         mma_kv_consumer_state.advance()
-                        # Wait K
-                        pipeline_kv.consumer_wait(mma_kv_consumer_state)
-                        Ki_index = mma_kv_consumer_state.index
-                        sK_cur = sK[None, None, None, Ki_index]
                         pipeline_s_p_o.producer_acquire_w_index_phase(stage, phase_cur)
                         gemm_Pi[stage](
                             tCrB=tOrVi,
@@ -1154,6 +1150,10 @@ class BlockSparseAttnForwardSm100Blk128:
                             mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(stage) if self.split_P_arrive > 0 else None,
                             mbar_phase=phase_cur,
                         )
+                        # Overlap the independent K wait with the issued PV MMA.
+                        pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                        Ki_index = mma_kv_consumer_state.index
+                        sK_cur = sK[None, None, None, Ki_index]
                         gemm_Si[stage](smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator))
                         pipeline_s_p_o.producer_commit_w_index(stage)
                         if const_expr(stage == 0):
@@ -1196,7 +1196,7 @@ class BlockSparseAttnForwardSm100Blk128:
                 phase_s1 ^= 1
 
             # Advance to next tile
-            work_tile = tile_scheduler.consumer_advance()
+            work_tile = tile_scheduler.consumer_advance(sync_cta=False)
         # End of persistent scheduler loop
 
         # We don't need pipeline_s_p_o.producer_tail() since there's no dangling mbarrier at the end
@@ -1356,7 +1356,7 @@ class BlockSparseAttnForwardSm100Blk128:
                 sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
             # Advance to next tile
-            work_tile = tile_scheduler.consumer_advance()
+            work_tile = tile_scheduler.consumer_advance(sync_cta=False)
         # End of persistent scheduler loop
 
         # This is equivalent to pipeline_sm_stats.producer_tail
@@ -1636,7 +1636,7 @@ class BlockSparseAttnForwardSm100Blk128:
                     gLSE[tidx] = lse
 
             # Advance to next tile
-            work_tile = tile_scheduler.consumer_advance()
+            work_tile = tile_scheduler.consumer_advance(sync_cta=False)
         # End of persistent scheduler loop
 
         # This is equivalent to pipeline_o_epi.consumer_tail() for the correction warps
@@ -1855,7 +1855,7 @@ class BlockSparseAttnForwardSm100Blk128:
             epi_consumer_phase ^= 1
 
             # Advance to next tile
-            work_tile = tile_scheduler.consumer_advance()
+            work_tile = tile_scheduler.consumer_advance(sync_cta=False)
 
     def load_Q(
         self,

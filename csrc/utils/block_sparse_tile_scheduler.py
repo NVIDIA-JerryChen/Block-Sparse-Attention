@@ -24,7 +24,9 @@ class TileSchedulerProtocol(Protocol):
     def initial_work_tile_info(self) -> "WorkTileInfo": ...
     def advance_to_next_work(self, *, mbarrier_addr=None) -> None: ...
     def prefetch_next_work(self) -> None: ...
-    def consumer_advance(self) -> "WorkTileInfo": ...
+    def consumer_advance(
+        self, sync_cta: cutlass.Constexpr[bool] = True
+    ) -> "WorkTileInfo": ...
 
 
 class BlockSparsePersistentTileScheduler:
@@ -231,10 +233,17 @@ class BlockSparsePersistentTileScheduler:
             assert mbarrier_addr is None
             self._tile_idx += cute.arch.grid_dim()[0]
 
-    def consumer_advance(self, *, loc=None, ip=None):
+    def consumer_advance(
+        self,
+        sync_cta: cutlass.Constexpr[bool] = True,
+        *,
+        loc=None,
+        ip=None,
+    ):
         if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
-            # All warps must converge before consuming the next CLC response.
-            cute.arch.sync_threads()
+            # Some schedules require explicit convergence before consuming a CLC response.
+            if const_expr(sync_cta):
+                cute.arch.sync_threads()
             self._clc_pipeline.consumer_wait(self._clc_consumer_state)
             work_tile = self.get_current_work()
             self._clc_pipeline.consumer_release(self._clc_consumer_state)
