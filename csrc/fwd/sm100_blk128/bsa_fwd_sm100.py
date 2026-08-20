@@ -844,7 +844,7 @@ class BlockSparseAttnForwardSm100Blk128:
             tile_scheduler.advance_to_next_work(mbarrier_addr=mbarrier_addr)
             clc_producer_state.advance()
 
-            work_tile = tile_scheduler.consumer_advance(sync_cta=False)
+            work_tile = tile_scheduler.consumer_advance()
         clc_pipeline.producer_tail(clc_producer_state)
 
     @cute.jit
@@ -855,7 +855,7 @@ class BlockSparseAttnForwardSm100Blk128:
         """Runs on empty warps (and non-leader CTA scheduler warp) — consumes CLC responses."""
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            work_tile = tile_scheduler.consumer_advance(sync_cta=False)
+            work_tile = tile_scheduler.consumer_advance()
 
     @cute.jit
     def load(
@@ -982,7 +982,7 @@ class BlockSparseAttnForwardSm100Blk128:
                 kv_producer_state.advance()
 
             tile_scheduler.prefetch_next_work()
-            work_tile = tile_scheduler.consumer_advance(sync_cta=False)
+            work_tile = tile_scheduler.consumer_advance()
             # End of persistent scheduler loop
 
         pipeline_kv.producer_tail(kv_producer_state)
@@ -1196,7 +1196,7 @@ class BlockSparseAttnForwardSm100Blk128:
                 phase_s1 ^= 1
 
             # Advance to next tile
-            work_tile = tile_scheduler.consumer_advance(sync_cta=False)
+            work_tile = tile_scheduler.consumer_advance()
         # End of persistent scheduler loop
 
         # We don't need pipeline_s_p_o.producer_tail() since there's no dangling mbarrier at the end
@@ -1356,7 +1356,7 @@ class BlockSparseAttnForwardSm100Blk128:
                 sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
             # Advance to next tile
-            work_tile = tile_scheduler.consumer_advance(sync_cta=False)
+            work_tile = tile_scheduler.consumer_advance()
         # End of persistent scheduler loop
 
         # This is equivalent to pipeline_sm_stats.producer_tail
@@ -1636,7 +1636,7 @@ class BlockSparseAttnForwardSm100Blk128:
                     gLSE[tidx] = lse
 
             # Advance to next tile
-            work_tile = tile_scheduler.consumer_advance(sync_cta=False)
+            work_tile = tile_scheduler.consumer_advance()
         # End of persistent scheduler loop
 
         # This is equivalent to pipeline_o_epi.consumer_tail() for the correction warps
@@ -1855,7 +1855,7 @@ class BlockSparseAttnForwardSm100Blk128:
             epi_consumer_phase ^= 1
 
             # Advance to next tile
-            work_tile = tile_scheduler.consumer_advance(sync_cta=False)
+            work_tile = tile_scheduler.consumer_advance()
 
     def load_Q(
         self,

@@ -741,6 +741,7 @@ class BlockSparseAttnForwardSm100Blk64:
             mbar_O_full: cute.struct.MemRange[Int64, self.s_stage * 2]
             mbar_softmax_stats: cute.struct.MemRange[Int64, self.s_stage * 2]
             mbar_O_epi: cute.struct.MemRange[Int64, self.s_stage * 2]
+            mbar_load_epi: cute.struct.MemRange[Int64, 2]
             # Tmem holding buffer
             tmem_holding_buf: Int32
             # Per warp-pair reduction barriers for correction exchange.
@@ -887,10 +888,12 @@ class BlockSparseAttnForwardSm100Blk64:
         ThreadCooperativeGroup = partial(pipeline.CooperativeGroup, pipeline.Agent.Thread)
         mma_warp = ThreadCooperativeGroup(len([self.mma_warp_id]))
         tma_warp = ThreadCooperativeGroup(1)
+        load_warps = ThreadCooperativeGroup(len(self.load_warp_ids))
         softmax_warps = ThreadCooperativeGroup(len(self.softmax0_warp_ids))
         softmax_threads = ThreadCooperativeGroup(cute.arch.WARP_SIZE * len(self.softmax0_warp_ids))
         correction_threads = ThreadCooperativeGroup(cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         softmax_correction_threads = ThreadCooperativeGroup(cute.arch.WARP_SIZE * len(self.softmax0_warp_ids + self.correction_warp_ids))
+        epilogue_warps = ThreadCooperativeGroup(len(self.epilogue_warp_ids))
         epilogue_threads = ThreadCooperativeGroup(cute.arch.WARP_SIZE * len(self.epilogue_warp_ids))
         pipeline_q = pipeline_custom.PipelineTmaUmma.create(
             barrier_storage=storage.mbar_load_Q.data_ptr(),
@@ -951,6 +954,16 @@ class BlockSparseAttnForwardSm100Blk64:
             consumer_group=epilogue_threads,
             defer_sync=True,
         )
+        pipeline_load_epi = None
+        if const_expr(self.is_persistent):
+            # Protect aliased KV/O storage across persistent work tiles.
+            pipeline_load_epi = pipeline_custom.PipelineAsync.create(
+                barrier_storage=storage.mbar_load_epi.data_ptr(),
+                num_stages=1,
+                producer_group=epilogue_warps,
+                consumer_group=load_warps,
+                defer_sync=True,
+            )
 
         if warp_idx == self.empty_warp_ids[0]:
             with cute.arch.elect_one():
@@ -1104,6 +1117,7 @@ class BlockSparseAttnForwardSm100Blk64:
                 tma_atom_V,
                 pipeline_q,
                 pipeline_kv,
+                pipeline_load_epi,
                 tile_scheduler,
                 mBlockIndex,
                 block_sparse_num,
@@ -1163,6 +1177,7 @@ class BlockSparseAttnForwardSm100Blk64:
                 gmem_tiled_copy_O,
                 tma_atom_O,
                 pipeline_o_epi,
+                pipeline_load_epi,
                 SeqlenInfoCls,
                 tile_scheduler,
                 num_q_heads,
@@ -1349,6 +1364,7 @@ class BlockSparseAttnForwardSm100Blk64:
         tma_atom_V: cute.CopyAtom,
         pipeline_q: pipeline.PipelineAsync,
         pipeline_kv: pipeline.PipelineAsync,
+        pipeline_load_epi: Optional[pipeline.PipelineAsync],
         tile_scheduler: TileSchedulerProtocol,
         mBlockIndex: cute.Tensor,
         block_sparse_num: Int32,
@@ -1360,6 +1376,11 @@ class BlockSparseAttnForwardSm100Blk64:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         q_producer_phase = Int32(1)
         kv_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.kv_stage)
+        load_epi_consumer_state = (
+            pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
+            if const_expr(pipeline_load_epi is not None)
+            else None
+        )
         tiler_gQ = ((self.mma_tiler_qk[0] * self.q_stage), self.head_dim_padded)
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -1501,6 +1522,11 @@ class BlockSparseAttnForwardSm100Blk64:
 
             tile_scheduler.prefetch_next_work()
             work_tile = tile_scheduler.consumer_advance()
+            if const_expr(pipeline_load_epi is not None):
+                pipeline_load_epi.consumer_wait(load_epi_consumer_state)
+                with cute.arch.elect_one():
+                    pipeline_load_epi.consumer_release(load_epi_consumer_state)
+                load_epi_consumer_state.advance()
             # End of persistent scheduler loop
 
         pipeline_kv.producer_tail(kv_producer_state)
@@ -2811,11 +2837,17 @@ class BlockSparseAttnForwardSm100Blk64:
         gmem_tiled_copy_O: cute.TiledCopy,
         tma_atom_O: Optional[cute.CopyAtom],
         pipeline_o_epi: pipeline.PipelineAsync,
+        pipeline_load_epi: Optional[pipeline.PipelineAsync],
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
         num_heads: Int32,
     ):
         epi_consumer_phase = Int32(0)
+        load_epi_producer_state = (
+            pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+            if const_expr(pipeline_load_epi is not None)
+            else None
+        )
         tiler_gO = ((self.mma_tiler_pv[0] * self.q_stage), self.head_dim_v_padded)
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -2875,6 +2907,12 @@ class BlockSparseAttnForwardSm100Blk64:
                     pipeline_o_epi.consumer_release_w_index(stage)
 
             epi_consumer_phase ^= 1
+
+            if const_expr(pipeline_load_epi is not None):
+                pipeline_load_epi.producer_acquire(load_epi_producer_state)
+                with cute.arch.elect_one():
+                    pipeline_load_epi.producer_commit(load_epi_producer_state)
+                load_epi_producer_state.advance()
 
             # Advance to next tile
             work_tile = tile_scheduler.consumer_advance()
