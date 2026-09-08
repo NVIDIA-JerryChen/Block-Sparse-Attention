@@ -467,6 +467,10 @@ Q/KV tails. SM100/SM103 retain the B=1, H in {4, 8}, and physically 64-aligned
 v1 contract; their Sage FP8 path accepts rank-1 `block_sizes=[N]` to mask
 padding inside those physical KV blocks.
 
+For large, unsplit Sage FP8 workloads, SM103 uses the 16-value
+`tcgen05.ld.red.max` form for K-scale-aligned row maxima. Short or split-KV
+workloads retain the software reduction path selected by the measured policy.
+
 The native Sage mixed path uses the following quantization and physical-layout
 contract:
 

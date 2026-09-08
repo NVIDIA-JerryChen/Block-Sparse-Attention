@@ -63,9 +63,46 @@ def test_bsa_fp8_split_policy(heads, seqlen_q, topk, expected_splits):
     )
 
 
+@pytest.mark.parametrize(
+    "arch,batch,heads,seqlen_q,kv_splits,expected",
+    [
+        (100, 1, 4, 8192, 1, False),
+        (103, 1, 4, 8128, 1, False),
+        (103, 1, 4, 8192, 1, True),
+        (103, 1, 8, 4096, 1, True),
+        (103, 1, 4, 8192, 4, False),
+    ],
+)
+def test_sm103_sage_fp8_ldred_policy(
+    arch,
+    batch,
+    heads,
+    seqlen_q,
+    kv_splits,
+    expected,
+):
+    from bsa_attn_interface import _sm103_blk64_use_sage_fp8_ldred
+
+    assert (
+        _sm103_blk64_use_sage_fp8_ldred(
+            arch,
+            batch,
+            heads,
+            seqlen_q,
+            kv_splits,
+        )
+        is expected
+    )
+
+
 def _require_sm100_or_sm110() -> None:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 11):
         pytest.skip("FP8 blk64 BSA requires SM100/SM110")
+
+
+def _require_sm103() -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("Sage FP8 ld.red row-max requires SM103")
 
 
 def _require_sm120() -> None:
@@ -294,6 +331,76 @@ def test_bsa_fp8_blk64_block_sizes_sm100(heads, topk):
 
     assert out.dtype == torch.bfloat16
     assert out.shape == q.shape
+    torch.testing.assert_close(cached_out, out, rtol=0, atol=0)
+    diff = (out.float() - ref).abs()
+    assert diff.max().item() < 0.15
+    assert (diff.mean() / ref.abs().mean()).item() < 0.029
+
+
+def test_bsa_fp8_blk64_sm103_ldred_with_partial_block():
+    _require_sm103()
+    from bsa_fp8_blk64 import bsa_fp8_blk64_fwd, quantize_sage_bhsd
+
+    torch.manual_seed(1103)
+    heads, sq, sk, topk = 4, 8192, 256, 4
+    q = torch.randn((1, heads, sq, 128), device="cuda", dtype=torch.bfloat16) * 0.5
+    k = torch.randn((1, heads, sk, 128), device="cuda", dtype=torch.bfloat16) * 0.5
+    v = torch.randn_like(k)
+    q_fp8, k_fp8, v_fp8, q_sfs, k_sfs, v_sfs = quantize_sage_bhsd(q, k, v)
+    block_index = (
+        torch.arange(topk, device="cuda", dtype=torch.int32)
+        .view(1, 1, 1, topk)
+        .expand(1, heads, sq // 64, topk)
+        .contiguous()
+    )
+    block_sizes = torch.tensor(
+        [64, 64, 64, 40],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    scale = 1.0 / math.sqrt(128)
+
+    q_dequant = q_fp8.float() * q_sfs.unsqueeze(-1)
+    k_dequant = (
+        k_fp8.float()
+        * k_sfs.repeat_interleave(16, dim=-1).unsqueeze(-1)
+    )
+    v_dequant = v_fp8.float() * v_sfs.view(1, heads, 1, 128)
+    valid_tokens = torch.arange(232, device="cuda")
+    ref = torch.softmax(
+        torch.matmul(
+            q_dequant,
+            k_dequant.index_select(2, valid_tokens).transpose(-1, -2),
+        )
+        * scale,
+        dim=-1,
+    ) @ v_dequant.index_select(2, valid_tokens)
+
+    out = bsa_fp8_blk64_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_sfs,
+        k_sfs,
+        v_sfs,
+        block_index,
+        topk,
+        scale,
+        block_sizes=block_sizes,
+    )
+    cached_out = bsa_fp8_blk64_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_sfs,
+        k_sfs,
+        v_sfs,
+        block_index,
+        topk,
+        scale,
+        block_sizes=block_sizes,
+    )
+
     torch.testing.assert_close(cached_out, out, rtol=0, atol=0)
     diff = (out.float() - ref).abs()
     assert diff.max().item() < 0.15

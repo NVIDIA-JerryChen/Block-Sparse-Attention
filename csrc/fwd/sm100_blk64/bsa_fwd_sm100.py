@@ -67,6 +67,7 @@ class BlockSparseAttnForwardSm100Blk64:
         allow_empty_block_nums: cutlass.Constexpr[bool] = False,
         has_block_sizes: cutlass.Constexpr[bool] = True,
         num_splits: cutlass.Constexpr[int] = 1,
+        use_sage_ldred_rowmax: cutlass.Constexpr[bool] = False,
         use_exact_kv_layout: cutlass.Constexpr[bool] = False,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
@@ -124,12 +125,16 @@ class BlockSparseAttnForwardSm100Blk64:
         self.is_split_kv = num_splits > 1
         self.allow_empty_block_nums = allow_empty_block_nums
         self.has_block_sizes = has_block_sizes
+        self.use_sage_ldred_rowmax = use_sage_ldred_rowmax
         self.use_exact_kv_layout = use_exact_kv_layout
         self.qhead_per_kvhead = qhead_per_kvhead
         self.pack_gqa = pack_gqa
         if pack_gqa:
             assert m_block_size % self.qhead_per_kvhead == 0, "For PackGQA, m_block_size must be divisible by qhead_per_kvhead"
         is_sm103 = self.arch >= Arch.sm_103 and self.arch <= Arch.sm_103f
+        assert not self.use_sage_ldred_rowmax or (
+            is_sm103 and not self.is_split_kv
+        ), "Sage ld.red row-max requires an unsplit SM103 kernel"
         self.enable_ex2_emu = self.head_dim_padded <= 128 and not is_sm103
 
         self.softmax0_warp_ids = (0, 1, 2, 3)
@@ -2172,22 +2177,43 @@ class BlockSparseAttnForwardSm100Blk64:
             and self.arch <= Arch.sm_103f
             and not self.is_sage_fp8
         )
+        use_sage_ldred_rowmax = (
+            self.arch >= Arch.sm_103
+            and self.arch <= Arch.sm_103f
+            and self.is_sage_fp8
+            and self.use_sage_ldred_rowmax
+        )
         tSrS_t2r = cute.make_rmem_tensor((128,), Float32)
         row_max_tile = -Float32.inf
-        for c in cutlass.range_constexpr(4):
-            if const_expr(use_ldred_rowmax):
-                vals, row_max_chunk = (
-                    bsa_fwd_helpers.tmem_load_red_max_32dp32b32x(
-                        tmem_s_addr + c * 32
+        if const_expr(use_sage_ldred_rowmax):
+            sage_group_max = cute.make_rmem_tensor((8,), Float32)
+            # Sage K scales cover 16 tokens, so reduce exactly one scale group
+            # per instruction.  A 32-value reduction would mix two groups that
+            # generally have different scales and would therefore be invalid.
+            for c in cutlass.range_constexpr(8):
+                vals, group_max = (
+                    bsa_fwd_helpers.tmem_load_red_max_32dp32b16x(
+                        tmem_s_addr + c * 16
                     )
                 )
-                row_max_tile = cute.arch.fmax(row_max_tile, row_max_chunk)
-            else:
-                vals = bsa_fwd_helpers.tmem_load_32dp32b32x(
-                    tmem_s_addr + c * 32
-                )
-            for j in cutlass.range_constexpr(32):
-                tSrS_t2r[c * 32 + j] = vals[j]
+                sage_group_max[c] = group_max
+                for j in cutlass.range_constexpr(16):
+                    tSrS_t2r[c * 16 + j] = vals[j]
+        else:
+            for c in cutlass.range_constexpr(4):
+                if const_expr(use_ldred_rowmax):
+                    vals, row_max_chunk = (
+                        bsa_fwd_helpers.tmem_load_red_max_32dp32b32x(
+                            tmem_s_addr + c * 32
+                        )
+                    )
+                    row_max_tile = cute.arch.fmax(row_max_tile, row_max_chunk)
+                else:
+                    vals = bsa_fwd_helpers.tmem_load_32dp32b32x(
+                        tmem_s_addr + c * 32
+                    )
+                for j in cutlass.range_constexpr(32):
+                    tSrS_t2r[c * 32 + j] = vals[j]
 
         tSrS_blocks = cute.logical_divide(tSrS_t2r, cute.make_layout(self.sparse_block_size))
         bsa_fwd_helpers.apply_block_size_mask_64(tSrS_blocks[None, 0], block_size_lo)
@@ -2202,13 +2228,32 @@ class BlockSparseAttnForwardSm100Blk64:
             scaled_group_max = cute.make_rmem_tensor((8,), Float32)
             tSrS_groups = cute.logical_divide(tSrS_t2r, cute.make_layout(16))
             if const_expr(not self.is_split_kv):
-                for scale_idx in cutlass.range_constexpr(8):
-                    group_max = softmax._compute_row_max(
-                        tSrS_groups[None, scale_idx].load()
-                    )
-                    scaled_group_max[scale_idx] = (
-                        group_max * qk_scales[scale_idx]
-                    )
+                if const_expr(use_sage_ldred_rowmax):
+                    full_blocks = (
+                        block_size_lo == Int32(self.sparse_block_size)
+                    ) & (block_size_hi == Int32(self.sparse_block_size))
+                    if full_blocks:
+                        for scale_idx in cutlass.range_constexpr(8):
+                            scaled_group_max[scale_idx] = (
+                                sage_group_max[scale_idx]
+                                * qk_scales[scale_idx]
+                            )
+                    else:
+                        for scale_idx in cutlass.range_constexpr(8):
+                            group_max = softmax._compute_row_max(
+                                tSrS_groups[None, scale_idx].load()
+                            )
+                            scaled_group_max[scale_idx] = (
+                                group_max * qk_scales[scale_idx]
+                            )
+                else:
+                    for scale_idx in cutlass.range_constexpr(8):
+                        group_max = softmax._compute_row_max(
+                            tSrS_groups[None, scale_idx].load()
+                        )
+                        scaled_group_max[scale_idx] = (
+                            group_max * qk_scales[scale_idx]
+                        )
             else:
                 qk_scales = cute.make_rmem_tensor((8,), Float32)
                 q_log2_scale = q_scale * score_scale_log2
