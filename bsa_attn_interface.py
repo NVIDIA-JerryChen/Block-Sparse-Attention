@@ -758,39 +758,6 @@ def _bsa_fp8_blk64_fast_layout(*tensors: torch.Tensor) -> bool:
     return all(tensor.is_contiguous() for tensor in tensors)
 
 
-def _pad_sm100_sage_fp8_sequence(
-    tensor: torch.Tensor,
-    padded_seqlen: int,
-) -> torch.Tensor:
-    """Zero-pad one contiguous BHSD FP8 tensor without relying on FP8 pad ops."""
-    if tensor.shape[2] == padded_seqlen:
-        return tensor
-    padded = torch.empty(
-        (tensor.shape[0], tensor.shape[1], padded_seqlen, tensor.shape[3]),
-        dtype=tensor.dtype,
-        device=tensor.device,
-    )
-    padded.zero_()
-    padded[:, :, : tensor.shape[2]].copy_(tensor)
-    return padded
-
-
-def _pad_sm100_sage_fp8_scale(
-    scale: torch.Tensor,
-    padded_length: int,
-) -> torch.Tensor:
-    """Pad a [B,H,L] scale tensor; padded values are masked before use."""
-    if scale.shape[2] == padded_length:
-        return scale
-    padded = torch.ones(
-        (scale.shape[0], scale.shape[1], padded_length),
-        dtype=scale.dtype,
-        device=scale.device,
-    )
-    padded[:, :, : scale.shape[2]].copy_(scale)
-    return padded
-
-
 def _build_sm100_blk64_kv_split_offsets(
     q2k_block_nums: Optional[torch.Tensor],
     uniform_block_sparse_num: int,
@@ -2923,8 +2890,8 @@ def bsa_fp8_blk64_fwd(
     256 E4M3 scale for one native FP8 PV MMA. The result is BHSD BF16.
     SM100/SM103 and SM120 accept positive batch/head counts, Q/KV tails,
     per-Q-block ``q2k_block_nums``, and rank-1/2/3 ``block_sizes`` while
-    retaining D=128 and MHA. SM100/SM103 internally pad non-64-aligned FP8
-    storage before launching their native 64-token kernel.
+    retaining D=128 and MHA. Both backends handle non-64-aligned FP8 storage
+    directly in their native 64-token kernels.
     """
     assert q_fp8.dim() == 4 and k_fp8.dim() == 4 and v_fp8.dim() == 4
     batch, heads, seqlen_q, dim = q_fp8.shape
@@ -3020,36 +2987,8 @@ def bsa_fp8_blk64_fwd(
     else:
         block_sizes = None
 
-    # The SM100/SM103 tensor-core kernel consumes physical 64-token tiles.
-    # Preserve the same public tail contract as SM120 by padding only at this
-    # backend boundary and masking the synthetic tokens from softmax.
-    padded_seqlen_q = _sm100_blk64_round_up_to_block(
-        "seqlen_q", logical_seqlen_q
-    )
-    padded_seqlen_k = _sm100_blk64_round_up_to_block(
-        "seqlen_k", logical_seqlen_k
-    )
-    if logical_seqlen_k != padded_seqlen_k:
-        tail_size = logical_seqlen_k - (num_kv_blocks - 1) * 64
-        if block_sizes is None:
-            block_sizes = torch.full(
-                (num_kv_blocks,),
-                64,
-                dtype=torch.int32,
-                device=q_fp8.device,
-            )
-            block_sizes[-1] = tail_size
-            has_block_sizes = True
-            block_sizes_mode = 1
-        else:
-            block_sizes = block_sizes.clone()
-            block_sizes[..., -1].clamp_(max=tail_size)
-
-    q_fp8 = _pad_sm100_sage_fp8_sequence(q_fp8, padded_seqlen_q)
-    k_fp8 = _pad_sm100_sage_fp8_sequence(k_fp8, padded_seqlen_k)
-    v_fp8 = _pad_sm100_sage_fp8_sequence(v_fp8, padded_seqlen_k)
-    q_scale = _pad_sm100_sage_fp8_scale(q_scale, padded_seqlen_q)
-    k_scale = _pad_sm100_sage_fp8_scale(k_scale, padded_seqlen_k // 16)
+    # The SM100 kernel sees the true K/V extent and masks its physical tail.
+    # User-provided block sizes are also clamped to that extent in-kernel.
 
     policy_topk = (
         q2k_block_index.shape[-1] if has_block_nums else topk_num
@@ -3104,8 +3043,6 @@ def bsa_fp8_blk64_fwd(
             softmax_scale,
             kv_splits,
         )
-        if logical_seqlen_q != padded_seqlen_q:
-            out = out[:, :, :logical_seqlen_q].contiguous()
         return out
 
     q_scale = q_scale.contiguous()
@@ -3129,8 +3066,6 @@ def bsa_fp8_blk64_fwd(
         k_scale=k_scale,
         v_scale=v_scale,
     )
-    if logical_seqlen_q != padded_seqlen_q:
-        out = out[:, :, :logical_seqlen_q].contiguous()
     return out
 
 

@@ -348,6 +348,76 @@ def test_bsa_fp8_blk64_dynamic_shape_sm100(batch, heads, sq, sk, topk):
     assert (diff.mean() / ref.abs().mean()).item() < 0.029
 
 
+def test_bsa_fp8_blk64_sm100_passes_tail_storage_directly(monkeypatch):
+    _require_sm100_or_sm110()
+    import bsa_attn_interface as interface
+
+    batch, heads, sq, sk, topk = 2, 3, 65, 70, 2
+    q_fp8 = torch.empty(
+        (batch, heads, sq, 128),
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    k_fp8 = torch.empty(
+        (batch, heads, sk, 128),
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    v_fp8 = torch.empty_like(k_fp8)
+    q_scale = torch.ones((batch, heads, sq), device="cuda")
+    k_scale = torch.ones((batch, heads, (sk + 15) // 16), device="cuda")
+    v_scale = torch.ones((heads, 128), device="cuda")
+    block_index = torch.zeros(
+        (batch, heads, (sq + 63) // 64, topk),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    block_index[..., 1] = 1
+    captured = {}
+
+    def fake_sm100_forward(q, k, v, indices, block_sizes, **kwargs):
+        captured.update(
+            q=q,
+            k=k,
+            v=v,
+            q_scale=kwargs["q_scale"],
+            k_scale=kwargs["k_scale"],
+            block_sizes=block_sizes,
+        )
+        out = torch.empty(
+            (batch, heads, sq, 128), dtype=torch.bfloat16, device="cuda"
+        )
+        lse = torch.empty(
+            (batch, heads, sq), dtype=torch.float32, device="cuda"
+        )
+        return out, lse
+
+    monkeypatch.setattr(interface, "_bsa_fp8_blk64_fast_cache", {})
+    monkeypatch.setattr(
+        interface, "_bsa_attn_fwd_sm100_blk64", fake_sm100_forward
+    )
+    out = interface.bsa_fp8_blk64_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_scale,
+        k_scale,
+        v_scale,
+        block_index,
+        topk,
+    )
+
+    assert captured["q"].data_ptr() == q_fp8.data_ptr()
+    assert captured["k"].data_ptr() == k_fp8.data_ptr()
+    assert captured["v"].data_ptr() == v_fp8.data_ptr()
+    assert captured["q"].shape[2] == sq
+    assert captured["k"].shape[2] == sk
+    assert captured["q_scale"].shape[-1] == sq
+    assert captured["k_scale"].shape[-1] == (sk + 15) // 16
+    assert captured["block_sizes"] is None
+    assert out.shape == (batch, heads, sq, 128)
+
+
 @pytest.mark.parametrize("heads", [1, 5])
 @pytest.mark.parametrize("kv_splits", [1, 4, 8, 16])
 def test_bsa_fp8_blk64_dynamic_heads_all_splits_sm100(heads, kv_splits):

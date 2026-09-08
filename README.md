@@ -469,15 +469,16 @@ intentionally different:
 | Sage FP8 feature | SM100/SM103 | SM120 |
 |---|---|---|
 | Batch and MHA head counts | Any positive `B` and `H` | Any positive `B` and `H` |
-| Q/KV lengths | Arbitrary; non-64 tails are padded and masked at the backend boundary | Arbitrary; tails are handled natively |
+| Q/KV lengths | Arbitrary; tails are handled natively | Arbitrary; tails are handled natively |
 | Per-Q-block counts | `q2k_block_nums=[B,H,Q_blocks]`, including empty rows | Same shape; values must be at least 1 |
 | Per-block valid tokens | `block_sizes=[N]`, `[B,N]`, or `[B,H,N]` | Same three forms |
 | Head dimension / attention | `D=128`, MHA | `D=128`, MHA |
 | KV split | Supported, explicit or automatic | Not supported |
 | Kernel delivery | JIT only | AOT or JIT |
 
-The SM100/SM103 tail fallback allocates padded Q/K/V storage and trims the
-output. Already 64-aligned inputs keep the existing zero-copy fast path.
+SM100/SM103 and SM120 keep the true Q/K/V sequence extents in their TMA
+descriptors. The final 64-token tile is zero-filled out of bounds and masked,
+so tail inputs do not require padded Q/K/V allocations or output trimming.
 
 For large, unsplit Sage FP8 workloads, SM103 uses the 16-value
 `tcgen05.ld.red.max` form for K-scale-aligned row maxima. Short or split-KV
