@@ -1,5 +1,24 @@
 # SM100 blk64 Sage FP8 最终验证结果
 
+## 2026-09-08：与 SM120 对齐动态输入能力
+
+SM100 和 SM103 的 Sage FP8 接口已解除原先 `B=1`、`H in {4,8}`、Q/KV
+长度必须是 64 倍数、uniform top-k 和 rank-1 `block_sizes` 的限制。现在支持：
+
+- 任意正数 batch 和 MHA head 数；
+- 非 64 对齐的 Q/KV 长度（SM100/SM103 在后端边界补齐并屏蔽，SM120 原生处理）；
+- `[B,H,Q_blocks]` 的 `q2k_block_nums`，SM100/SM103 仍支持空行；
+- `[N]`、`[B,N]`、`[B,H,N]` 三种 `block_sizes`。
+
+真机定向验证覆盖 B200/SM100 和 B300/SM103，包括 `B=2`、`H=1/3/5`、
+Q/KV 尾块、三种 block-size 作用域、可变/空 top-k，以及 H=1/5 下
+1/4/8/16 路 split。完整 FP8/量化回归在 B200 上为 67 passed、14 skipped，
+在 B300 上为 68 passed、13 skipped；AOT dispatch 和动态 compile-key 回归为
+30 passed、2 skipped。SM100/SM103 仍是 FP8 JIT-only；SM120 的 FP8 支持 AOT。
+
+以下早期性能结果中的 `B=1`、`H=4/8` 是当时的基准输入范围，不再是当前
+接口限制。
+
 ## 结论
 
 当前实现支持固定长度、前向、BHSD 布局的 Sage FP8 block-sparse

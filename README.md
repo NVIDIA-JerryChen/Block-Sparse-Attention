@@ -462,10 +462,22 @@ contracts are identical for AOT and JIT. On SM120, pass optional
 `q2k_block_nums=[B, H, Q_blocks]` and `block_sizes=[N]`, `[B, N]`, or
 `[B, H, N]` keyword arguments to select the corresponding sparse metadata
 variant. When `q2k_block_nums` is present, the scalar `topk_num` is ignored.
-Both SM120 quantized paths accept any positive batch/head counts and non-aligned
-Q/KV tails. SM100/SM103 retain the B=1, H in {4, 8}, and physically 64-aligned
-v1 contract; their Sage FP8 path accepts rank-1 `block_sizes=[N]` to mask
-padding inside those physical KV blocks.
+
+The all-FP8 feature contracts are now aligned except where the hardware path is
+intentionally different:
+
+| Sage FP8 feature | SM100/SM103 | SM120 |
+|---|---|---|
+| Batch and MHA head counts | Any positive `B` and `H` | Any positive `B` and `H` |
+| Q/KV lengths | Arbitrary; non-64 tails are padded and masked at the backend boundary | Arbitrary; tails are handled natively |
+| Per-Q-block counts | `q2k_block_nums=[B,H,Q_blocks]`, including empty rows | Same shape; values must be at least 1 |
+| Per-block valid tokens | `block_sizes=[N]`, `[B,N]`, or `[B,H,N]` | Same three forms |
+| Head dimension / attention | `D=128`, MHA | `D=128`, MHA |
+| KV split | Supported, explicit or automatic | Not supported |
+| Kernel delivery | JIT only | AOT or JIT |
+
+The SM100/SM103 tail fallback allocates padded Q/K/V storage and trims the
+output. Already 64-aligned inputs keep the existing zero-copy fast path.
 
 For large, unsplit Sage FP8 workloads, SM103 uses the 16-value
 `tcgen05.ld.red.max` form for K-scale-aligned row maxima. Short or split-KV

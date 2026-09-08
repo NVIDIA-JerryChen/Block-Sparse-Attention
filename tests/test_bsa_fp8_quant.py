@@ -13,42 +13,47 @@ def test_quantize_sage_bhsd_rejects_cpu_inputs():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_quantize_sage_bhsd_sequence_alignment_contract():
+def test_quantize_sage_bhsd_supports_sequence_tails():
     from bsa_fp8_quant import quantize_sage_bhsd
 
     q = torch.empty((1, 4, 65, 128), device="cuda", dtype=torch.bfloat16)
     k = torch.empty((1, 4, 64, 128), device="cuda", dtype=torch.bfloat16)
     v = torch.empty_like(k)
-    if torch.cuda.get_device_capability()[0] == 12:
-        actual = quantize_sage_bhsd(q, k, v)
-        assert actual[0].shape == q.shape
-        assert actual[1].shape == k.shape
-        assert actual[2].shape == v.shape
-    else:
-        with pytest.raises(ValueError, match="multiples of 64"):
-            quantize_sage_bhsd(q, k, v)
+    actual = quantize_sage_bhsd(q, k, v)
+    assert actual[0].shape == q.shape
+    assert actual[1].shape == k.shape
+    assert actual[2].shape == v.shape
 
 
+@pytest.mark.parametrize(
+    "batch,heads,seqlen_q,seqlen_k",
+    [(1, 1, 65, 79), (1, 5, 33, 70), (2, 3, 96, 127)],
+)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_quantize_sage_bhsd_preserves_sm100_v1_contract(monkeypatch):
+def test_quantize_sage_bhsd_dynamic_contract(
+    batch,
+    heads,
+    seqlen_q,
+    seqlen_k,
+):
     from bsa_fp8_quant import quantize_sage_bhsd
 
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_capability",
-        lambda device=None: (10, 0),
+    q = torch.randn(
+        (batch, heads, seqlen_q, 128), device="cuda", dtype=torch.bfloat16
     )
-    q = torch.empty((1, 2, 64, 128), device="cuda", dtype=torch.bfloat16)
-    k = torch.empty_like(q)
-    v = torch.empty_like(k)
-    with pytest.raises(ValueError, match=r"H in \{4, 8\}"):
-        quantize_sage_bhsd(q, k, v)
+    k = torch.randn(
+        (batch, heads, seqlen_k, 128), device="cuda", dtype=torch.bfloat16
+    )
+    v = torch.randn_like(k)
+    actual = quantize_sage_bhsd(q, k, v)
 
-    q = torch.empty((1, 4, 65, 128), device="cuda", dtype=torch.bfloat16)
-    k = torch.empty((1, 4, 64, 128), device="cuda", dtype=torch.bfloat16)
-    v = torch.empty_like(k)
-    with pytest.raises(ValueError, match="multiples of 64"):
-        quantize_sage_bhsd(q, k, v)
+    assert actual[0].shape == q.shape
+    assert actual[1].shape == k.shape
+    assert actual[2].shape == v.shape
+    assert actual[3].shape == (batch, heads, seqlen_q)
+    assert actual[4].shape == (batch, heads, (seqlen_k + 15) // 16)
+    assert actual[5].shape == (heads, 128)
+    assert all(tensor.is_contiguous() for tensor in actual)
 
 
 @pytest.mark.parametrize("heads", [4, 8])

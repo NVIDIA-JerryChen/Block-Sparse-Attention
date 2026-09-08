@@ -168,15 +168,10 @@ def quantize_sage_bhsd(
         raise ValueError("Sage FP8 quantization requires positive batch and head counts")
     if head_dim != 128:
         raise ValueError("Sage FP8 quantization requires D=128")
-    is_sm120 = torch.cuda.get_device_capability(q_bhsd.device)[0] == 12
-    if not is_sm120 and (batch != 1 or heads not in (4, 8)):
-        raise ValueError("Sage FP8 v1 requires B=1, H in {4, 8}, and D=128")
     if k_bhsd.shape[:2] != (batch, heads) or k_bhsd.shape[-1] != head_dim:
         raise ValueError("K must match Q batch, heads, and head dimension")
     if v_bhsd.shape != k_bhsd.shape:
         raise ValueError("V must have the same shape as K")
-    if not is_sm120 and (seqlen_q % 64 or k_bhsd.shape[2] % 64):
-        raise ValueError("Q and K/V sequence lengths must be multiples of 64")
 
     q_bshd = q_bhsd.transpose(1, 2)
     q_fp8_bshd = torch.empty_like(q_bshd, dtype=torch.float8_e4m3fn)

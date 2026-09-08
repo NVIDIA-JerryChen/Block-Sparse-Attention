@@ -168,6 +168,7 @@ def compile_sm100_aot_variant(variant: Sm100AotVariant, target_arch: str):
         use_clc_scheduler=variant.use_clc_scheduler,
         allow_empty_block_nums=variant.allow_empty_block_nums,
         has_block_sizes=variant.has_block_sizes,
+        block_sizes_mode=1 if variant.has_block_sizes else 0,
         num_splits=variant.kv_splits,
         use_exact_kv_layout=variant.use_int64_kv_strides,
     )

@@ -66,6 +66,7 @@ class BlockSparseAttnForwardSm100Blk64:
         use_clc_scheduler: cutlass.Constexpr[bool] = False,
         allow_empty_block_nums: cutlass.Constexpr[bool] = False,
         has_block_sizes: cutlass.Constexpr[bool] = True,
+        block_sizes_mode: cutlass.Constexpr[int] = 1,
         num_splits: cutlass.Constexpr[int] = 1,
         use_sage_ldred_rowmax: cutlass.Constexpr[bool] = False,
         use_exact_kv_layout: cutlass.Constexpr[bool] = False,
@@ -125,6 +126,7 @@ class BlockSparseAttnForwardSm100Blk64:
         self.is_split_kv = num_splits > 1
         self.allow_empty_block_nums = allow_empty_block_nums
         self.has_block_sizes = has_block_sizes
+        self.block_sizes_mode = block_sizes_mode
         self.use_sage_ldred_rowmax = use_sage_ldred_rowmax
         self.use_exact_kv_layout = use_exact_kv_layout
         self.qhead_per_kvhead = qhead_per_kvhead
@@ -221,7 +223,7 @@ class BlockSparseAttnForwardSm100Blk64:
         mVScale: Optional[cute.Tensor],  # Sage FP8: (h, dv)
         softmax_scale: Float32,
         mBlockIndex: cute.Tensor,  # (batch, heads, num_q_blocks, max_kv_blocks), int32
-        mBlockSizes: Optional[cute.Tensor],  # (num_kv_blocks,), int32 or None
+        mBlockSizes: Optional[cute.Tensor],  # [N], [B,N], or [B,H,N] int32
         block_sparse_num: Int32,  # runtime scalar, even, >= 2
         mBlockNums: Optional[cute.Tensor],  # (batch, heads, num_q_blocks), int32 or None
         mSplitOffsets: Optional[cute.Tensor],  # (batch, heads, num_q_blocks, num_splits + 1), int32 or None
@@ -1987,7 +1989,8 @@ class BlockSparseAttnForwardSm100Blk64:
                 warp_col = warp_idx // 2
 
                 first_bs_lo, first_bs_hi, first_nb_lo, first_nb_hi = self.get_softmax_block_info(
-                    Int32(0), stage, warp_col, block_iter_count, raw_block_count, n_block, mBlockSizes
+                    Int32(0), stage, warp_col, block_iter_count, raw_block_count,
+                    n_block, mBlockSizes, batch_idx, head_idx
                 )
                 mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
                     mma_si_consumer_phase,
@@ -2005,7 +2008,8 @@ class BlockSparseAttnForwardSm100Blk64:
                 )
                 for n_tile in cutlass.range(wg_count - 1, unroll=1):
                     bs_lo, bs_hi, nb_lo, nb_hi = self.get_softmax_block_info(
-                        n_tile + 1, stage, warp_col, block_iter_count, raw_block_count, n_block, mBlockSizes
+                        n_tile + 1, stage, warp_col, block_iter_count,
+                        raw_block_count, n_block, mBlockSizes, batch_idx, head_idx
                     )
                     mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
                         mma_si_consumer_phase,
@@ -2046,13 +2050,27 @@ class BlockSparseAttnForwardSm100Blk64:
         raw_block_count: Int32,
         n_block: Callable,
         mBlockSizes: Optional[cute.Tensor],
+        batch_idx: Int32,
+        head_idx: Int32,
     ) -> Tuple[Int32, Int32, Int32, Int32]:
         kv_block = block_iter_count - 1 - (self.s_stage * kv_iter + Int32(stage))
         logical_lo = kv_block * self.sparse_blocks_per_kv + warp_col
         logical_hi = logical_lo + 2
         if const_expr(self.has_block_sizes):
-            bs_lo = Int32(0) if logical_lo >= raw_block_count else mBlockSizes[n_block(logical_lo)]
-            bs_hi = Int32(0) if logical_hi >= raw_block_count else mBlockSizes[n_block(logical_hi)]
+            bs_lo = (
+                Int32(0)
+                if logical_lo >= raw_block_count
+                else self.get_sparse_block_size(
+                    mBlockSizes, batch_idx, head_idx, n_block(logical_lo)
+                )
+            )
+            bs_hi = (
+                Int32(0)
+                if logical_hi >= raw_block_count
+                else self.get_sparse_block_size(
+                    mBlockSizes, batch_idx, head_idx, n_block(logical_hi)
+                )
+            )
         else:
             bs_lo = Int32(0) if logical_lo >= raw_block_count else Int32(self.sparse_block_size)
             bs_hi = Int32(0) if logical_hi >= raw_block_count else Int32(self.sparse_block_size)
@@ -2061,6 +2079,21 @@ class BlockSparseAttnForwardSm100Blk64:
         nb_lo = n_block(cutlass.min(logical_lo, cutlass.max(raw_block_count - 1, Int32(0))))
         nb_hi = n_block(cutlass.min(logical_hi, cutlass.max(raw_block_count - 1, Int32(0))))
         return bs_lo, bs_hi, nb_lo, nb_hi
+
+    @cute.jit
+    def get_sparse_block_size(
+        self,
+        mBlockSizes: cute.Tensor,
+        batch_idx: Int32,
+        head_idx: Int32,
+        n_block_idx: Int32,
+    ) -> Int32:
+        """Load a block size from the public rank-1/2/3 metadata forms."""
+        if const_expr(self.block_sizes_mode == 1):
+            return mBlockSizes[n_block_idx]
+        if const_expr(self.block_sizes_mode == 2):
+            return mBlockSizes[batch_idx, n_block_idx]
+        return mBlockSizes[batch_idx, head_idx, n_block_idx]
 
     @cute.jit
     def get_tile_n_block_idx(

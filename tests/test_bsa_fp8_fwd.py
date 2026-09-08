@@ -63,6 +63,13 @@ def test_bsa_fp8_split_policy(heads, seqlen_q, topk, expected_splits):
     )
 
 
+def test_bsa_fp8_split_policy_counts_batch_tiles():
+    from bsa_attn_interface import _sm100_blk64_auto_fp8_kv_splits
+
+    assert _sm100_blk64_auto_fp8_kv_splits(188, 4, 4096, batch=1) == 16
+    assert _sm100_blk64_auto_fp8_kv_splits(188, 4, 4096, batch=2) == 1
+
+
 @pytest.mark.parametrize(
     "arch,batch,heads,seqlen_q,kv_splits,expected",
     [
@@ -163,6 +170,11 @@ def _dequantized_sparse_reference(
                     if block_nums is not None
                     else block_index.shape[-1]
                 )
+                q_begin = q_block * 64
+                q_end = min(q_begin + 64, sq)
+                if count == 0:
+                    out[batch_idx, head_idx, q_begin:q_end].zero_()
+                    continue
                 token_ids = []
                 for physical_idx in block_index[
                     batch_idx, head_idx, q_block, :count
@@ -188,11 +200,11 @@ def _dequantized_sparse_reference(
                     dtype=torch.long,
                     device=q.device,
                 )
-                q_tile = q[batch_idx, head_idx, q_block * 64 : (q_block + 1) * 64].float()
+                q_tile = q[batch_idx, head_idx, q_begin:q_end].float()
                 k_tile = k[batch_idx, head_idx].index_select(0, kv_tokens).float()
                 v_tile = v[batch_idx, head_idx].index_select(0, kv_tokens).float()
                 probs = torch.softmax(q_tile @ k_tile.transpose(0, 1) * softmax_scale, dim=-1)
-                out[batch_idx, head_idx, q_block * 64 : (q_block + 1) * 64] = probs @ v_tile
+                out[batch_idx, head_idx, q_begin:q_end] = probs @ v_tile
     return out
 
 
@@ -264,6 +276,128 @@ def test_bsa_fp8_blk64_forward(heads, sq, sk, topk, flatten_v_scale):
     # The accepted Sage FP8 contract allows up to 2.9% relative mean error;
     # the broader 28-case validation currently tops out at about 2.82%.
     assert (diff.mean() / ref.abs().mean()).item() < 0.029
+
+
+@pytest.mark.parametrize(
+    "batch,heads,sq,sk,topk",
+    [
+        (1, 1, 65, 127, 1),
+        (1, 2, 65, 128, 2),
+        (1, 5, 96, 209, 3),
+        (1, 7, 64, 128, 2),
+        (2, 3, 65, 127, 2),
+    ],
+)
+def test_bsa_fp8_blk64_dynamic_shape_sm100(batch, heads, sq, sk, topk):
+    _require_sm100_or_sm110()
+    from bsa_fp8_blk64 import bsa_fp8_blk64_fwd, quantize_sage_bhsd
+
+    torch.manual_seed(1050 + 100 * batch + 10 * heads + topk)
+    q = torch.randn(
+        (batch, heads, sq, 128), device="cuda", dtype=torch.bfloat16
+    ) * 0.5
+    k = torch.randn(
+        (batch, heads, sk, 128), device="cuda", dtype=torch.bfloat16
+    ) * 0.5
+    v = torch.randn_like(k) * 0.5
+    q_fp8, k_fp8, v_fp8, q_sfs, k_sfs, v_sfs = quantize_sage_bhsd(
+        q, k, v
+    )
+    block_index = _make_block_index(heads, sq, sk, topk, batch)
+    scale = 1.0 / math.sqrt(128)
+
+    ref = _dequantized_sparse_reference(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_sfs,
+        k_sfs,
+        v_sfs,
+        block_index,
+        scale,
+    )
+    out = bsa_fp8_blk64_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_sfs,
+        k_sfs,
+        v_sfs,
+        block_index,
+        topk,
+        scale,
+    )
+    cached_out = bsa_fp8_blk64_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_sfs,
+        k_sfs,
+        v_sfs,
+        block_index,
+        topk,
+        scale,
+    )
+
+    assert out.dtype == torch.bfloat16
+    assert out.shape == q.shape
+    assert out.is_contiguous()
+    torch.testing.assert_close(cached_out, out, rtol=0, atol=0)
+    diff = (out.float() - ref).abs()
+    assert diff.max().item() < 0.15
+    assert (diff.mean() / ref.abs().mean()).item() < 0.029
+
+
+@pytest.mark.parametrize("heads", [1, 5])
+@pytest.mark.parametrize("kv_splits", [1, 4, 8, 16])
+def test_bsa_fp8_blk64_dynamic_heads_all_splits_sm100(heads, kv_splits):
+    _require_sm100_or_sm110()
+    from bsa_attn_interface import _bsa_attn_fwd_sm100_blk64
+    from bsa_fp8_quant import quantize_sage_bhsd
+
+    torch.manual_seed(1070 + 10 * heads + kv_splits)
+    sq, sk, topk = 64, 2048, 32
+    q = torch.randn(
+        (1, heads, sq, 128), device="cuda", dtype=torch.bfloat16
+    ) * 0.5
+    k = torch.randn(
+        (1, heads, sk, 128), device="cuda", dtype=torch.bfloat16
+    ) * 0.5
+    v = torch.randn_like(k) * 0.5
+    q_fp8, k_fp8, v_fp8, q_sfs, k_sfs, v_sfs = quantize_sage_bhsd(
+        q, k, v
+    )
+    block_index = _make_block_index(heads, sq, sk, topk)
+    scale = 1.0 / math.sqrt(128)
+    ref = _dequantized_sparse_reference(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_sfs,
+        k_sfs,
+        v_sfs,
+        block_index,
+        scale,
+    )
+
+    out, _ = _bsa_attn_fwd_sm100_blk64(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        block_index,
+        None,
+        softmax_scale=scale,
+        block_sparse_num=topk,
+        use_clc=False,
+        kv_splits=kv_splits,
+        q_scale=q_sfs,
+        k_scale=k_sfs,
+        v_scale=v_sfs,
+    )
+
+    diff = (out.float() - ref).abs()
+    assert diff.max().item() < 0.15
+    assert (diff.mean() / ref.abs().mean()).item() < 0.035
 
 
 @pytest.mark.parametrize(
@@ -405,6 +539,137 @@ def test_bsa_fp8_blk64_sm103_ldred_with_partial_block():
     diff = (out.float() - ref).abs()
     assert diff.max().item() < 0.15
     assert (diff.mean() / ref.abs().mean()).item() < 0.029
+
+
+@pytest.mark.parametrize("block_sizes_mode", [0, 1, 2, 3])
+def test_bsa_fp8_blk64_variable_metadata_sm100(block_sizes_mode):
+    _require_sm100_or_sm110()
+    from bsa_fp8_blk64 import bsa_fp8_blk64_fwd, quantize_sage_bhsd
+
+    batch, heads, sq, sk, capacity = 2, 3, 128, 320, 4
+    torch.manual_seed(1150 + block_sizes_mode)
+    q = torch.randn(
+        (batch, heads, sq, 128), device="cuda", dtype=torch.bfloat16
+    ) * 0.5
+    k = torch.randn(
+        (batch, heads, sk, 128), device="cuda", dtype=torch.bfloat16
+    ) * 0.5
+    v = torch.randn_like(k) * 0.5
+    q_fp8, k_fp8, v_fp8, q_sfs, k_sfs, v_sfs = quantize_sage_bhsd(
+        q, k, v
+    )
+    block_index = _make_block_index(heads, sq, sk, capacity, batch)
+    num_q_blocks = sq // 64
+    num_kv_blocks = sk // 64
+    batch_ids = torch.arange(
+        batch, dtype=torch.int32, device="cuda"
+    ).view(batch, 1, 1)
+    head_ids = torch.arange(
+        heads, dtype=torch.int32, device="cuda"
+    ).view(1, heads, 1)
+    q_block_ids = torch.arange(
+        num_q_blocks, dtype=torch.int32, device="cuda"
+    ).view(1, 1, num_q_blocks)
+    block_nums = (batch_ids + head_ids + q_block_ids) % (capacity + 1)
+
+    block_ids = torch.arange(
+        num_kv_blocks, dtype=torch.int32, device="cuda"
+    )
+    if block_sizes_mode == 0:
+        block_sizes = None
+    elif block_sizes_mode == 1:
+        block_sizes = 64 - block_ids % 9
+    elif block_sizes_mode == 2:
+        block_sizes = 64 - (batch_ids[:, 0] + block_ids.view(1, -1)) % 9
+    else:
+        block_sizes = 64 - (
+            batch_ids + head_ids + block_ids.view(1, 1, -1)
+        ) % 9
+    scale = 1.0 / math.sqrt(128)
+
+    ref = _dequantized_sparse_reference(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_sfs,
+        k_sfs,
+        v_sfs,
+        block_index,
+        scale,
+        block_nums,
+        block_sizes,
+    )
+    out = bsa_fp8_blk64_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_sfs,
+        k_sfs,
+        v_sfs,
+        block_index,
+        0,
+        scale,
+        block_sizes=block_sizes,
+        q2k_block_nums=block_nums,
+    )
+
+    assert out.dtype == torch.bfloat16
+    assert out.shape == q.shape
+    diff = (out.float() - ref).abs()
+    assert diff.max().item() < 0.15
+    assert (diff.mean() / ref.abs().mean()).item() < 0.029
+
+
+def test_bsa_fp8_blk64_variable_metadata_split_sm100():
+    _require_sm100_or_sm110()
+    from bsa_fp8_blk64 import bsa_fp8_blk64_fwd, quantize_sage_bhsd
+
+    batch, heads, sq, sk, capacity = 1, 2, 128, 8192, 128
+    torch.manual_seed(1170)
+    q = torch.randn(
+        (batch, heads, sq, 128), device="cuda", dtype=torch.bfloat16
+    ) * 0.5
+    k = torch.randn(
+        (batch, heads, sk, 128), device="cuda", dtype=torch.bfloat16
+    ) * 0.5
+    v = torch.randn_like(k) * 0.5
+    q_fp8, k_fp8, v_fp8, q_sfs, k_sfs, v_sfs = quantize_sage_bhsd(
+        q, k, v
+    )
+    block_index = _make_block_index(heads, sq, sk, capacity, batch)
+    block_nums = torch.tensor(
+        [[[0, 17], [64, 127]]], device="cuda", dtype=torch.int32
+    )
+    scale = 1.0 / math.sqrt(128)
+
+    ref = _dequantized_sparse_reference(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_sfs,
+        k_sfs,
+        v_sfs,
+        block_index,
+        scale,
+        block_nums,
+    )
+    out = bsa_fp8_blk64_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_sfs,
+        k_sfs,
+        v_sfs,
+        block_index,
+        0,
+        scale,
+        q2k_block_nums=block_nums,
+    )
+
+    assert torch.count_nonzero(out[0, 0, :64]) == 0
+    diff = (out.float() - ref).abs()
+    assert diff.max().item() < 0.15
+    assert (diff.mean() / ref.abs().mean()).item() < 0.035
 
 
 @pytest.mark.parametrize(
