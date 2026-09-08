@@ -713,11 +713,16 @@ _bsa_fp8_blk64_fast_cache = {}
 _bsa_fp8_blk64_combine_fast_cache = {}
 
 
-def _bsa_fp8_blk64_fast_key(q: torch.Tensor, kv_splits: int) -> tuple:
+def _bsa_fp8_blk64_fast_key(
+    q: torch.Tensor,
+    kv_splits: int,
+    has_block_sizes: bool = False,
+) -> tuple:
     return (
         _get_device_arch(q.device),
         q.device.index,
         int(kv_splits),
+        bool(has_block_sizes),
         fa_logging.get_fa_log_level(),
     )
 
@@ -2298,7 +2303,6 @@ def _bsa_attn_fwd_sm100_blk64(
         assert k_scale.dtype == torch.float32
         assert v_scale.dtype == torch.float32
         assert q2k_block_nums is None, "FP8 v1 requires a uniform top-k"
-        assert block_sizes is None, "FP8 v1 requires full 64-token KV blocks"
     else:
         assert k_scale is None and v_scale is None, "Q/K/V scales must be provided together"
         assert q.dtype == k.dtype == v.dtype == torch.bfloat16, (
@@ -2677,9 +2681,14 @@ def _bsa_attn_fwd_sm100_blk64(
                 k_scale,
                 v_scale,
                 q2k_block_index,
+                *([block_sizes] if has_block_sizes else []),
             ):
                 _bsa_fp8_blk64_fast_cache[
-                    _bsa_fp8_blk64_fast_key(q_bhsd, kv_splits_i)
+                    _bsa_fp8_blk64_fast_key(
+                        q_bhsd,
+                        kv_splits_i,
+                        has_block_sizes,
+                    )
                 ] = compiled_fn
             if compiled_fn is not None:
                 compiled_fn(
@@ -2738,6 +2747,7 @@ def _bsa_fp8_blk64_launch_cached(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
     q2k_block_index: torch.Tensor,
+    block_sizes: Optional[torch.Tensor],
     topk_num: int,
     softmax_scale: float,
     kv_splits: int,
@@ -2778,7 +2788,7 @@ def _bsa_fp8_blk64_launch_cached(
         v_scale,
         softmax_scale,
         q2k_block_index,
-        None,
+        block_sizes,
         topk_num,
         None,
         None,
@@ -2829,7 +2839,8 @@ def bsa_fp8_blk64_fwd(
     SM100/SM110 use the fixed B=1, H in {4, 8}, D=128 contract with sequence
     lengths aligned to the logical 64-token sparse block. SM120 accepts dynamic
     positive batch/head counts and Q/KV tails, while retaining D=128 and MHA.
-    SM120 also supports per-Q-block ``q2k_block_nums`` and rank-1/2/3
+    SM100/SM110 support rank-1 ``block_sizes`` for physically padded KV
+    blocks. SM120 also supports per-Q-block ``q2k_block_nums`` and rank-1/2/3
     ``block_sizes``.
     """
     assert q_fp8.dim() == 4 and k_fp8.dim() == 4 and v_fp8.dim() == 4
@@ -2907,15 +2918,24 @@ def bsa_fp8_blk64_fwd(
     assert q2k_block_nums is None or q2k_block_nums.numel() == 0, (
         "FP8 q2k_block_nums is currently supported only on SM120"
     )
-    assert block_sizes is None or block_sizes.numel() == 0, (
-        "FP8 block_sizes is currently supported only on SM120"
-    )
+    has_block_sizes = block_sizes is not None and block_sizes.numel() > 0
+    if has_block_sizes:
+        assert block_sizes.dtype == torch.int32
+        assert block_sizes.device == q_fp8.device
+        assert block_sizes.shape == (k_fp8.shape[2] // 64,)
+        block_sizes = block_sizes.contiguous()
+    else:
+        block_sizes = None
     kv_splits = _sm100_blk64_auto_fp8_kv_splits(
         topk_num,
         heads,
         seqlen_q,
     )
-    fast_key = _bsa_fp8_blk64_fast_key(q_fp8, kv_splits)
+    fast_key = _bsa_fp8_blk64_fast_key(
+        q_fp8,
+        kv_splits,
+        has_block_sizes,
+    )
     compiled_fn = _bsa_fp8_blk64_fast_cache.get(fast_key)
     if (
         compiled_fn is not None
@@ -2928,6 +2948,7 @@ def bsa_fp8_blk64_fwd(
             k_scale,
             v_scale,
             q2k_block_index,
+            *([block_sizes] if has_block_sizes else []),
         )
     ):
         return _bsa_fp8_blk64_launch_cached(
@@ -2939,6 +2960,7 @@ def bsa_fp8_blk64_fwd(
             k_scale,
             v_scale,
             q2k_block_index,
+            block_sizes,
             topk_num,
             softmax_scale,
             kv_splits,
@@ -2953,7 +2975,7 @@ def bsa_fp8_blk64_fwd(
         k_fp8,
         v_fp8,
         q2k_block_index,
-        None,
+        block_sizes,
         q2k_block_nums=None,
         softmax_scale=softmax_scale,
         layout="bhsd",

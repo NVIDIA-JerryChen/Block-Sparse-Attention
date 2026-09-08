@@ -230,6 +230,77 @@ def test_bsa_fp8_blk64_forward(heads, sq, sk, topk, flatten_v_scale):
 
 
 @pytest.mark.parametrize(
+    "heads,topk",
+    [
+        (4, 4),
+        (4, 128),
+    ],
+)
+def test_bsa_fp8_blk64_block_sizes_sm100(heads, topk):
+    _require_sm100_or_sm110()
+    from bsa_fp8_blk64 import bsa_fp8_blk64_fwd, quantize_sage_bhsd
+
+    torch.manual_seed(1100 + topk)
+    sq = 64
+    sk = topk * 64
+    q = torch.randn((1, heads, sq, 128), device="cuda", dtype=torch.bfloat16) * 0.5
+    k = torch.randn((1, heads, sk, 128), device="cuda", dtype=torch.bfloat16) * 0.5
+    v = torch.randn_like(k)
+    q_fp8, k_fp8, v_fp8, q_sfs, k_sfs, v_sfs = quantize_sage_bhsd(q, k, v)
+    block_index = _make_block_index(heads, sq, sk, topk)
+    block_sizes = torch.full((topk,), 64, device="cuda", dtype=torch.int32)
+    block_sizes[-1] = 40
+    if topk > 4:
+        block_sizes[1] = 1
+        block_sizes[16] = 17
+        block_sizes[63] = 63
+    scale = 1.0 / math.sqrt(128)
+
+    ref = _dequantized_sparse_reference(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_sfs,
+        k_sfs,
+        v_sfs,
+        block_index,
+        scale,
+        block_sizes=block_sizes,
+    )
+    out = bsa_fp8_blk64_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_sfs,
+        k_sfs,
+        v_sfs,
+        block_index,
+        topk,
+        scale,
+        block_sizes=block_sizes,
+    )
+    cached_out = bsa_fp8_blk64_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_sfs,
+        k_sfs,
+        v_sfs,
+        block_index,
+        topk,
+        scale,
+        block_sizes=block_sizes,
+    )
+
+    assert out.dtype == torch.bfloat16
+    assert out.shape == q.shape
+    torch.testing.assert_close(cached_out, out, rtol=0, atol=0)
+    diff = (out.float() - ref).abs()
+    assert diff.max().item() < 0.15
+    assert (diff.mean() / ref.abs().mean()).item() < 0.029
+
+
+@pytest.mark.parametrize(
     "batch,heads,sq,sk,topk,flatten_v_scale",
     [
         (1, 2, 96, 209, 3, True),

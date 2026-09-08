@@ -463,8 +463,9 @@ contracts are identical for AOT and JIT. On SM120, pass optional
 `[B, H, N]` keyword arguments to select the corresponding sparse metadata
 variant. When `q2k_block_nums` is present, the scalar `topk_num` is ignored.
 Both SM120 quantized paths accept any positive batch/head counts and non-aligned
-Q/KV tails. SM100/SM103 retain the B=1, H in {4, 8}, and 64-aligned v1
-contract.
+Q/KV tails. SM100/SM103 retain the B=1, H in {4, 8}, and physically 64-aligned
+v1 contract; their Sage FP8 path accepts rank-1 `block_sizes=[N]` to mask
+padding inside those physical KV blocks.
 
 The native Sage mixed path uses the following quantization and physical-layout
 contract:
