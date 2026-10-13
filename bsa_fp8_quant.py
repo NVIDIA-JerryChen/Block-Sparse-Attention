@@ -1,145 +1,122 @@
 """Sage FP8 quantization that keeps tensors in contiguous BHSD storage."""
 
+import os
+
 import torch
 import triton
 import triton.language as tl
 
 
 @triton.jit
-def _quantize_q_bhsd_kernel(
-    q_ptr,
-    q8_ptr,
-    scale_ptr,
-    q_stride_b,
-    q_stride_s,
-    q_stride_h,
-    q8_stride_b,
-    q8_stride_s,
-    q8_stride_h,
-    scale_stride_b,
-    scale_stride_h,
-    seq_len,
-    HEAD_DIM: tl.constexpr,
-    ROWS_PER_PROGRAM: tl.constexpr,
+def _kv_partial_stats(
+    mK, mV, mKSum, mVMax,
+    SEQ: tl.constexpr, HEADS: tl.constexpr, SPLITS: tl.constexpr,
+    ROWS: tl.constexpr, COLS: tl.constexpr, FINAL_STATS: tl.constexpr = False,
 ):
-    seq_block_idx = tl.program_id(0)
-    head_idx = tl.program_id(1)
-    batch_idx = tl.program_id(2)
-    seq_idx = seq_block_idx * ROWS_PER_PROGRAM + tl.arange(0, ROWS_PER_PROGRAM)
-    dim_idx = tl.arange(0, HEAD_DIM)
-    valid = seq_idx < seq_len
-    q = tl.load(
-        q_ptr
-        + batch_idx * q_stride_b
-        + seq_idx[:, None] * q_stride_s
-        + head_idx * q_stride_h
-        + dim_idx[None, :],
-        mask=valid[:, None],
-        other=0.0,
-    )
-    scale = tl.maximum(
-        tl.max(tl.abs(q.to(tl.float32)), axis=1),
-        1e-3,
-    ) / 448.0
-
-    # Match flashinfer-vx's C++ Q recipe exactly: scale is stored as FP32,
-    # while reciprocal and multiply are rounded through the input dtype.
-    scale_input = scale.to(q_ptr.dtype.element_ty)
-    reciprocal_input = (1.0 / scale_input).to(q_ptr.dtype.element_ty)
-    q_scaled = (q * reciprocal_input[:, None]).to(q_ptr.dtype.element_ty)
-    tl.store(
-        q8_ptr
-        + batch_idx * q8_stride_b
-        + seq_idx[:, None] * q8_stride_s
-        + head_idx * q8_stride_h
-        + dim_idx[None, :],
-        q_scaled.to(q8_ptr.dtype.element_ty),
-        mask=valid[:, None],
-    )
-    tl.store(
-        scale_ptr + batch_idx * scale_stride_b + head_idx * scale_stride_h + seq_idx,
-        scale,
-        mask=valid,
-    )
+    split = tl.program_id(0)
+    cols = tl.program_id(1) * COLS + tl.arange(0, COLS)
+    bh = tl.program_id(2)
+    rows = tl.arange(0, ROWS)
+    # Every split owns at least one tile. Initialize from that tile directly;
+    # short reductions need neither zero accumulators nor a runtime loop.
+    seq = split * ROWS + rows
+    offset = (bh.to(tl.int64) * SEQ + seq[:, None]) * 128 + cols[None, :]
+    tKSum = tl.load(mK + offset, seq[:, None] < SEQ, 0).to(tl.float32)
+    tVMax = tl.abs(tl.load(mV + offset, seq[:, None] < SEQ, 0).to(tl.float32))
+    if tl.cdiv(SEQ, ROWS) > SPLITS:
+        for tile in range(split + SPLITS, tl.cdiv(SEQ, ROWS), SPLITS):
+            seq = tile * ROWS + rows
+            offset = (bh.to(tl.int64) * SEQ + seq[:, None]) * 128 + cols[None, :]
+            tK = tl.load(mK + offset, seq[:, None] < SEQ, 0).to(tl.float32)
+            tV = tl.load(mV + offset, seq[:, None] < SEQ, 0).to(tl.float32)
+            tKSum += tK
+            tVMax = tl.maximum(tVMax, tl.abs(tV))
+    offset = (bh * SPLITS + split) * 128 + cols
+    tKStat = tl.sum(tKSum, axis=0)
+    tVStat = tl.max(tVMax, axis=0)
+    if FINAL_STATS:
+        tKStat = tKStat / SEQ
+        tVStat = tl.maximum(tVStat, 1e-3) / 448.0
+    tl.store(mKSum + offset, tKStat)
+    tl.store(mVMax + offset, tVStat)
 
 
 @triton.jit
-def _quantize_k_bhsd_kernel(
-    k_ptr,
-    k8_ptr,
-    scale_ptr,
-    mean_ptr,
-    k_stride_b,
-    k_stride_s,
-    k_stride_h,
-    k8_stride_b,
-    k8_stride_s,
-    k8_stride_h,
-    scale_stride_b,
-    scale_stride_h,
-    mean_stride_b,
-    mean_stride_h,
-    seq_len,
-    HEAD_DIM: tl.constexpr,
-    SEQ_BLOCK: tl.constexpr,
+def _kv_finish_stats(
+    mKSum, mVMax, mKMean, mVScale,
+    SEQ: tl.constexpr, BATCH: tl.constexpr, HEADS: tl.constexpr,
+    SPLITS: tl.constexpr, BLOCK_BATCH: tl.constexpr, BLOCK_SPLITS: tl.constexpr,
+    COLS: tl.constexpr,
 ):
-    seq_block_idx = tl.program_id(0)
-    head_idx = tl.program_id(1)
-    batch_idx = tl.program_id(2)
-    seq_idx = seq_block_idx * SEQ_BLOCK + tl.arange(0, SEQ_BLOCK)
-    dim_idx = tl.arange(0, HEAD_DIM)
-    valid = seq_idx < seq_len
-    k = tl.load(
-        k_ptr
-        + batch_idx * k_stride_b
-        + seq_idx[:, None] * k_stride_s
-        + head_idx * k_stride_h
-        + dim_idx[None, :],
-        mask=valid[:, None],
-        other=0.0,
+    head = tl.program_id(0)
+    cols = tl.program_id(1) * COLS + tl.arange(0, COLS)
+    batch = tl.arange(0, BLOCK_BATCH)
+    split = tl.arange(0, BLOCK_SPLITS)
+    offset = (
+        ((batch[:, None, None] * HEADS + head) * SPLITS + split[None, :, None]) * 128
+        + cols[None, None, :]
     )
-    k_mean = tl.load(
-        mean_ptr
-        + batch_idx * mean_stride_b
-        + head_idx * mean_stride_h
-        + dim_idx[None, :]
-    )
-    k_centered = k - k_mean
-    scale = tl.maximum(tl.max(tl.abs(k_centered)), 1e-3) / 448.0
-    tl.store(
-        k8_ptr
-        + batch_idx * k8_stride_b
-        + seq_idx[:, None] * k8_stride_s
-        + head_idx * k8_stride_h
-        + dim_idx[None, :],
-        (k_centered / scale).to(k8_ptr.dtype.element_ty),
-        mask=valid[:, None],
-    )
-    tl.store(
-        scale_ptr
-        + batch_idx * scale_stride_b
-        + head_idx * scale_stride_h
-        + seq_block_idx,
-        scale,
-    )
+    valid = (batch[:, None, None] < BATCH) & (split[None, :, None] < SPLITS)
+    tKSum = tl.load(mKSum + offset, valid, 0)
+    tVMax = tl.load(mVMax + offset, valid, 0)
+    tKMean = tl.sum(tKSum, axis=1) / SEQ
+    tVScale = tl.maximum(tl.max(tl.max(tVMax, axis=1), axis=0), 1e-3) / 448.0
+    tl.store(mKMean + (batch[:, None] * HEADS + head) * 128 + cols[None, :],
+             tKMean, batch[:, None] < BATCH)
+    tl.store(mVScale + head * 128 + cols, tVScale)
 
 
-@torch.compile(mode="max-autotune-no-cudagraphs")
-def _k_mean(k_bshd: torch.Tensor) -> torch.Tensor:
-    return k_bshd.to(torch.float32).mean(dim=1)
+@triton.jit
+def _quantize_qkv(
+    mQ, mK, mV, mQ8, mK8, mV8, mQScale, mKScale, mVScale, mKMean,
+    SQ: tl.constexpr, SK: tl.constexpr, HEADS: tl.constexpr, ROWS: tl.constexpr,
+):
+    tile = tl.program_id(0)
+    bh = tl.program_id(1)
+    seq = tile * ROWS + tl.arange(0, ROWS)
+    cols = tl.arange(0, 128)
+    if tile * ROWS < SQ:
+        offset = (bh.to(tl.int64) * SQ + seq[:, None]) * 128 + cols[None, :]
+        tQ = tl.load(mQ + offset, seq[:, None] < SQ, 0)
+        tScale = tl.maximum(tl.max(tl.abs(tQ.to(tl.float32)), axis=1), 1e-3) / 448.0
+        # Preserve the customer's BF16 rounding of Q scale, reciprocal and product.
+        tReciprocal = (1.0 / tScale.to(tl.bfloat16)).to(tl.bfloat16)
+        tQScaled = (tQ * tReciprocal[:, None]).to(tl.bfloat16)
+        tl.store(mQ8 + offset, tQScaled.to(mQ8.dtype.element_ty), seq[:, None] < SQ)
+        tl.store(mQScale + bh * SQ + seq, tScale, seq < SQ)
+    if tile * ROWS < SK:
+        offset = (bh.to(tl.int64) * SK + seq[:, None]) * 128 + cols[None, :]
+        tKMean = tl.load(mKMean + bh * 128 + cols)
+        tK = tl.load(mK + offset, seq[:, None] < SK, 0).to(tl.float32) - tKMean[None, :]
+        # Keep zero-padded tail lanes in the K scale reduction, as in the original recipe.
+        tKGroups = tl.reshape(tK, (ROWS // 16, 16 * 128))
+        tKScale = tl.maximum(tl.max(tl.abs(tKGroups), axis=1), 1e-3) / 448.0
+        tKScaled = tl.reshape(tKGroups / tKScale[:, None], (ROWS, 128))
+        tl.store(mK8 + offset, tKScaled.to(mK8.dtype.element_ty), seq[:, None] < SK)
+        group = tile * (ROWS // 16) + tl.arange(0, ROWS // 16)
+        tl.store(mKScale + bh * tl.cdiv(SK, 16) + group, tKScale, group < tl.cdiv(SK, 16))
+
+        tVScale = tl.load(mVScale + (bh % HEADS) * 128 + cols)
+        tV = tl.load(mV + offset, seq[:, None] < SK, 0)
+        # The original compiled V recipe keeps reciprocal and multiply in FP32.
+        tVReciprocal = 1.0 / tVScale
+        tVScaled = tV.to(tl.float32) * tVReciprocal[None, :]
+        tl.store(mV8 + offset, tVScaled.to(mV8.dtype.element_ty), seq[:, None] < SK)
 
 
-@torch.compile(mode="max-autotune-no-cudagraphs")
-def _v_scale(v_bhsd: torch.Tensor) -> torch.Tensor:
-    v_max = v_bhsd.abs().float().amax(dim=(0, 2))
-    return torch.maximum(v_max, torch.full_like(v_max, 1e-3)) / 448.0
+_native_quant_enabled = os.environ.get("BSA_FP8_NATIVE_QUANT", "1") != "0"
+_native_quant_plans = {}
+_triton_runtime = getattr(getattr(triton, "knobs", None), "runtime", None)
+_triton_hook_chain = getattr(getattr(triton, "knobs", None), "HookChain", ())
 
 
-@torch.compile
-def _quantize_v(v_bhsd: torch.Tensor, v_scale: torch.Tensor) -> torch.Tensor:
-    return (v_bhsd * v_scale.reciprocal().to(v_bhsd.dtype)[None, :, None, :]).to(
-        torch.float8_e4m3fn
-    )
+def _native_hooks_clear():
+    if _triton_runtime is None:
+        return False
+    enter = _triton_runtime.launch_enter_hook
+    leave = _triton_runtime.launch_exit_hook
+    return ((enter is None or (type(enter) is _triton_hook_chain and not enter.calls))
+            and (leave is None or (type(leave) is _triton_hook_chain and not leave.calls)))
 
 
 def quantize_sage_bhsd(
@@ -149,11 +126,29 @@ def quantize_sage_bhsd(
 ):
     """Quantize BF16 BHSD Q/K/V for :func:`bsa_fp8_blk64_fwd`.
 
-    The scale contract matches the flashinfer-vx Sage recipe used by the
-    customer benchmark: Q per token, smoothed K per 16 tokens, and V per
-    channel. Q/K kernels consume BSHD views but preserve the backing BHSD
-    strides, avoiding all six physical BHSD-to-BSHD transpose copies.
+    Q scales are per token, smoothed K scales per 16 tokens, and V scales
+    per head/channel across batch and sequence. Reductions and conversion
+    use three Triton kernels without layout copies or torch.compile. A single
+    batch with one statistics tile needs only two launches, since no partial
+    results or cross-batch maxima remain to combine. When a host C++ compiler
+    is available, warmed calls allocate and launch through one native host
+    function; the GPU kernels and rounding stay unchanged. Set
+    ``BSA_FP8_NATIVE_QUANT=0`` before import to use the regular Triton launcher.
     """
+    key = None
+    if (_native_quant_enabled and _native_hooks_clear()
+            and all(type(t) is torch.Tensor for t in (q_bhsd, k_bhsd, v_bhsd))):
+        # Triton specializes input pointers by 16-byte alignment. Include that
+        # property, not addresses or tensor values, in the host plan identity.
+        aligned = tuple(t.data_ptr() % 16 == 0 for t in (q_bhsd, k_bhsd, v_bhsd))
+        key = (q_bhsd.device, q_bhsd.shape, k_bhsd.shape, aligned)
+        plan = _native_quant_plans.get(key)
+        if plan is not None:
+            return plan[0](q_bhsd, k_bhsd, v_bhsd)
+    return _quantize_sage_bhsd_triton(q_bhsd, k_bhsd, v_bhsd, _plan_key=key)
+
+
+def _quantize_sage_bhsd_triton(q_bhsd, k_bhsd, v_bhsd, *, _plan_key=None):
     tensors = (q_bhsd, k_bhsd, v_bhsd)
     if any(tensor.ndim != 4 for tensor in tensors):
         raise ValueError("Q, K, and V must be rank-4 BHSD tensors")
@@ -172,68 +167,54 @@ def quantize_sage_bhsd(
         raise ValueError("K must match Q batch, heads, and head dimension")
     if v_bhsd.shape != k_bhsd.shape:
         raise ValueError("V must have the same shape as K")
-
-    q_bshd = q_bhsd.transpose(1, 2)
-    q_fp8_bshd = torch.empty_like(q_bshd, dtype=torch.float8_e4m3fn)
-    q_scale = torch.empty(
-        (batch, heads, seqlen_q),
-        device=q_bhsd.device,
-        dtype=torch.float32,
-    )
-    q_rows_per_program = 16
-    _quantize_q_bhsd_kernel[(triton.cdiv(seqlen_q, q_rows_per_program), heads, batch)](
-        q_bshd,
-        q_fp8_bshd,
-        q_scale,
-        q_bshd.stride(0),
-        q_bshd.stride(1),
-        q_bshd.stride(2),
-        q_fp8_bshd.stride(0),
-        q_fp8_bshd.stride(1),
-        q_fp8_bshd.stride(2),
-        q_scale.stride(0),
-        q_scale.stride(1),
-        seqlen_q,
-        HEAD_DIM=head_dim,
-        ROWS_PER_PROGRAM=q_rows_per_program,
-        num_warps=4,
-    )
-    q_fp8 = q_fp8_bshd.transpose(1, 2)
-
     seqlen_k = k_bhsd.shape[2]
-    k_bshd = k_bhsd.transpose(1, 2)
-    k_fp8_bshd = torch.empty_like(k_bshd, dtype=torch.float8_e4m3fn)
-    k_scale = torch.empty(
-        (batch, heads, triton.cdiv(seqlen_k, 16)),
-        device=k_bhsd.device,
-        dtype=torch.float32,
-    )
-    k_mean = _k_mean(k_bshd)
-    _quantize_k_bhsd_kernel[(triton.cdiv(seqlen_k, 16), heads, batch)](
-        k_bshd,
-        k_fp8_bshd,
-        k_scale,
-        k_mean,
-        k_bshd.stride(0),
-        k_bshd.stride(1),
-        k_bshd.stride(2),
-        k_fp8_bshd.stride(0),
-        k_fp8_bshd.stride(1),
-        k_fp8_bshd.stride(2),
-        k_scale.stride(0),
-        k_scale.stride(1),
-        k_mean.stride(0),
-        k_mean.stride(1),
-        seqlen_k,
-        HEAD_DIM=head_dim,
-        SEQ_BLOCK=16,
-    )
-    k_fp8 = k_fp8_bshd.transpose(1, 2)
+    if seqlen_q < 1 or seqlen_k < 1:
+        raise ValueError("Sage FP8 quantization requires positive sequence lengths")
+    if k_bhsd.device != q_bhsd.device or v_bhsd.device != q_bhsd.device:
+        raise ValueError("Q, K, and V must be on the same CUDA device")
 
-    v_scale = _v_scale(v_bhsd)
-    v_fp8 = _quantize_v(v_bhsd, v_scale)
-    if not (q_fp8.is_contiguous() and k_fp8.is_contiguous() and v_fp8.is_contiguous()):
-        raise RuntimeError("quantized Q, K, and V must remain BHSD-contiguous")
+    device = q_bhsd.device
+    q_fp8, k_fp8, v_fp8 = (torch.empty_like(x, dtype=torch.float8_e4m3fn) for x in tensors)
+    q_scale = torch.empty((batch, heads, seqlen_q), device=device, dtype=torch.float32)
+    k_scale = torch.empty((batch, heads, triton.cdiv(seqlen_k, 16)), device=device, dtype=torch.float32)
+    v_scale = torch.empty((heads, 128), device=device, dtype=torch.float32)
+    k_mean = torch.empty((batch, heads, 128), device=device, dtype=torch.float32)
+    splits = min(triton.cdiv(seqlen_k, 128), 128)
+    with torch.cuda.device(device):
+        kernel_finish = None
+        if batch == 1 and splits == 1:
+            kernel_stats = _kv_partial_stats[(1, 4, heads)](
+                k_bhsd, v_bhsd, k_mean, v_scale,
+                seqlen_k, heads, 1, 128, 32, FINAL_STATS=True, num_warps=4,
+            )
+        else:
+            partials = torch.empty((2, batch, heads, splits, 128), device=device, dtype=torch.float32)
+            k_sum, v_max = partials.unbind(0)
+            kernel_stats = _kv_partial_stats[(splits, 4, batch * heads)](
+                k_bhsd, v_bhsd, k_sum, v_max,
+                seqlen_k, heads, splits, 128, 32, num_warps=4,
+            )
+            cols = max(1, 32 // triton.next_power_of_2(batch))
+            kernel_finish = _kv_finish_stats[(heads, 128 // cols)](
+                k_sum, v_max, k_mean, v_scale, seqlen_k, batch, heads, splits,
+                triton.next_power_of_2(batch), triton.next_power_of_2(splits), cols, num_warps=4,
+            )
+        rows = 32
+        kernel_quant = _quantize_qkv[(triton.cdiv(max(seqlen_q, seqlen_k), rows), batch * heads)](
+            q_bhsd, k_bhsd, v_bhsd, q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, k_mean,
+            seqlen_q, seqlen_k, heads, rows, num_warps=4,
+        )
+    if _plan_key is not None and _plan_key not in _native_quant_plans:
+        from block_sparse_attention.csrc.fp8_quant_runtime import make_quant_plan
+
+        plan = make_quant_plan(
+            (kernel_stats, kernel_finish, kernel_quant),
+            (batch, heads, seqlen_q, seqlen_k), device.index,
+        )
+        # Bound retained kernel handles without retaining any user tensors.
+        if len(_native_quant_plans) >= 128:
+            del _native_quant_plans[next(iter(_native_quant_plans))]
+        _native_quant_plans[_plan_key] = plan
     return q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale
 
 

@@ -412,10 +412,196 @@ def test_bsa_fp8_blk64_sm100_passes_tail_storage_directly(monkeypatch):
     assert captured["v"].data_ptr() == v_fp8.data_ptr()
     assert captured["q"].shape[2] == sq
     assert captured["k"].shape[2] == sk
+    assert captured["q_scale"].data_ptr() == q_scale.data_ptr()
     assert captured["q_scale"].shape[-1] == sq
+    assert captured["k_scale"].data_ptr() == k_scale.data_ptr()
     assert captured["k_scale"].shape[-1] == (sk + 15) // 16
     assert captured["block_sizes"] is None
     assert out.shape == (batch, heads, sq, 128)
+
+
+def test_bsa_fp8_blk64_sm100_aligned_metadata_stays_zero_copy(monkeypatch):
+    _require_sm100_or_sm110()
+    import bsa_attn_interface as interface
+
+    q_fp8 = torch.empty(
+        (1, 2, 64, 128),
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    k_fp8 = torch.empty(
+        (1, 2, 128, 128),
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    v_fp8 = torch.empty_like(k_fp8)
+    q_scale = torch.ones((1, 2, 64), device="cuda")
+    k_scale = torch.ones((1, 2, 8), device="cuda")
+    v_scale = torch.ones((2, 128), device="cuda")
+    block_index = torch.zeros(
+        (1, 2, 1, 2),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    captured = {}
+
+    def fake_sm100_forward(q, k, v, indices, block_sizes, **kwargs):
+        captured.update(
+            q_scale=kwargs["q_scale"],
+            k_scale=kwargs["k_scale"],
+            block_sizes=block_sizes,
+        )
+        return (
+            torch.empty_like(q, dtype=torch.bfloat16),
+            torch.empty(q.shape[:3], dtype=torch.float32, device=q.device),
+        )
+
+    monkeypatch.setattr(interface, "_bsa_fp8_blk64_fast_cache", {})
+    monkeypatch.setattr(
+        interface, "_bsa_attn_fwd_sm100_blk64", fake_sm100_forward
+    )
+    interface.bsa_fp8_blk64_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_scale,
+        k_scale,
+        v_scale,
+        block_index,
+        2,
+    )
+
+    assert captured["q_scale"].data_ptr() == q_scale.data_ptr()
+    assert captured["k_scale"].data_ptr() == k_scale.data_ptr()
+    assert captured["block_sizes"] is None
+
+
+def test_bsa_fp8_blk64_sm100_split_keeps_tail_metadata_zero_copy(monkeypatch):
+    _require_sm100_or_sm110()
+    import bsa_attn_interface as interface
+
+    batch, heads, sq, sk = 1, 2, 65, 70
+    q_fp8 = torch.empty(
+        (batch, heads, sq, 128),
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    k_fp8 = torch.empty(
+        (batch, heads, sk, 128),
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    v_fp8 = torch.empty_like(k_fp8)
+    q_scale = torch.ones((batch, heads, sq), device="cuda")
+    k_scale = torch.arange(
+        batch * heads * ((sk + 15) // 16),
+        dtype=torch.float32,
+        device="cuda",
+    ).reshape(batch, heads, -1)
+    v_scale = torch.ones((heads, 128), device="cuda")
+    block_index = torch.zeros(
+        (batch, heads, (sq + 63) // 64, 2),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    captured = {}
+
+    def fake_sm100_forward(q, k, v, indices, block_sizes, **kwargs):
+        captured.update(
+            q_scale=kwargs["q_scale"],
+            k_scale=kwargs["k_scale"],
+            block_sizes=block_sizes,
+            kv_splits=kwargs["kv_splits"],
+        )
+        return (
+            torch.empty_like(q, dtype=torch.bfloat16),
+            torch.empty(q.shape[:3], dtype=torch.float32, device=q.device),
+        )
+
+    monkeypatch.setattr(
+        interface,
+        "_sm100_blk64_auto_fp8_kv_splits",
+        lambda *args, **kwargs: 4,
+    )
+    monkeypatch.setattr(interface, "_bsa_fp8_blk64_fast_cache", {})
+    monkeypatch.setattr(
+        interface, "_bsa_attn_fwd_sm100_blk64", fake_sm100_forward
+    )
+    interface.bsa_fp8_blk64_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_scale,
+        k_scale,
+        v_scale,
+        block_index,
+        2,
+    )
+
+    assert captured["kv_splits"] == 4
+    assert captured["q_scale"].data_ptr() == q_scale.data_ptr()
+    assert captured["q_scale"].shape == (batch, heads, sq)
+    assert captured["k_scale"].data_ptr() == k_scale.data_ptr()
+    assert captured["k_scale"].shape == (batch, heads, (sk + 15) // 16)
+    assert captured["block_sizes"] is None
+
+
+def test_bsa_fp8_blk64_sm100_leaves_tail_block_sizes_for_kernel(monkeypatch):
+    _require_sm100_or_sm110()
+    import bsa_attn_interface as interface
+
+    q_fp8 = torch.empty(
+        (1, 2, 64, 128),
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    k_fp8 = torch.empty(
+        (1, 2, 70, 128),
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    v_fp8 = torch.empty_like(k_fp8)
+    q_scale = torch.ones((1, 2, 64), device="cuda")
+    k_scale = torch.ones((1, 2, 5), device="cuda")
+    v_scale = torch.ones((2, 128), device="cuda")
+    block_index = torch.zeros(
+        (1, 2, 1, 2),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    block_sizes = torch.tensor(
+        [[[64, 64], [64, 3]]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    captured = {}
+
+    def fake_sm100_forward(q, k, v, indices, sizes, **kwargs):
+        captured["block_sizes"] = sizes
+        return (
+            torch.empty_like(q, dtype=torch.bfloat16),
+            torch.empty(q.shape[:3], dtype=torch.float32, device=q.device),
+        )
+
+    monkeypatch.setattr(interface, "_bsa_fp8_blk64_fast_cache", {})
+    monkeypatch.setattr(
+        interface, "_bsa_attn_fwd_sm100_blk64", fake_sm100_forward
+    )
+    interface.bsa_fp8_blk64_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_scale,
+        k_scale,
+        v_scale,
+        block_index,
+        2,
+        block_sizes=block_sizes,
+    )
+
+    assert captured["block_sizes"].data_ptr() == block_sizes.data_ptr()
+    assert captured["block_sizes"].tolist() == [[[64, 64], [64, 3]]]
+    assert block_sizes.tolist() == [[[64, 64], [64, 3]]]
 
 
 @pytest.mark.parametrize("heads", [1, 5])

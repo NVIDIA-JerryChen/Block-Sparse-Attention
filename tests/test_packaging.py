@@ -13,6 +13,26 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _isolated_environment(install_dir: Path | None = None) -> dict:
+    """Keep external dependencies without exposing a source checkout."""
+    env = os.environ.copy()
+    paths = [str(install_dir)] if install_dir is not None else []
+    for value in env.get("PYTHONPATH", "").split(os.pathsep):
+        if not value:
+            continue
+        path = Path(value).resolve()
+        if (path == REPO_ROOT or REPO_ROOT in path.parents
+                or (path / "bsa_attn_interface.py").is_file()
+                or (path / "block_sparse_attention" / "__init__.py").is_file()):
+            continue
+        paths.append(str(path))
+    if paths:
+        env["PYTHONPATH"] = os.pathsep.join(paths)
+    else:
+        env.pop("PYTHONPATH", None)
+    return env
+
+
 def _run(command: list[str], **kwargs) -> subprocess.CompletedProcess:
     completed = subprocess.run(
         command,
@@ -152,6 +172,7 @@ def test_wheel_contains_single_import_package(built_wheel: Path) -> None:
         "block_sparse_attention/csrc/fwd/sm90_blk64/aot_utils.py",
         "block_sparse_attention/csrc/fwd/sm120_blk64/quant_aot_runtime.py",
         "block_sparse_attention/csrc/fwd/sm100_blk64/bsa_fwd_sm100.py",
+        "block_sparse_attention/csrc/fp8_quant_runtime.py",
         "block_sparse_attention/utils/cache_utils.py",
     } <= names
     assert "bsa_attn_interface.py" not in names
@@ -188,6 +209,7 @@ def test_sdist_contains_mapped_sources(built_sdist: Path) -> None:
         "csrc/fwd/sm90_blk64/aot_utils.py",
         "csrc/fwd/sm120_blk64/quant_aot_runtime.py",
         "csrc/fwd/sm100_blk64/bsa_fwd_sm100.py",
+        "csrc/fp8_quant_runtime.py",
         "setup.py",
         "utils/cache_utils.py",
     } <= names
@@ -290,8 +312,7 @@ assert (
     == sm90_aot_fingerprint
 )
 """
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(install_dir)
+    env = _isolated_environment(install_dir)
     env["BSA_TEST_INSTALL_DIR"] = str(install_dir)
     _run(
         [sys.executable, "-c", smoke_test],
@@ -393,10 +414,9 @@ assert source_dir / "csrc" in Path(sm90_aot_utils.__file__).resolve().parents
 assert source_dir / "csrc" in Path(sm120_aot_utils.__file__).resolve().parents
 assert source_dir / "utils" in Path(cache_utils.__file__).resolve().parents
 """
-    env = os.environ.copy()
+    env = _isolated_environment()
     env["BSA_TEST_INSTALL_DIR"] = str(install_dir)
     env["BSA_TEST_SOURCE_DIR"] = str(packaging_source)
-    env.pop("PYTHONPATH", None)
     _run(
         [sys.executable, "-c", smoke_test],
         cwd=outside_repo,

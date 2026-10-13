@@ -27,6 +27,7 @@ _SM100_AOT_TARGET_BY_DEVICE_ARCH = {
     100: "sm_100a",
     103: "sm_103a",
 }
+_SM100_AOT_CACHE_GENERATION = 0
 
 
 class Sm100AotArtifactError(RuntimeError):
@@ -67,22 +68,50 @@ def resolve_sm100_aot_artifact_dir(
     return get_sm100_aot_artifact_dir(root, target_arch)
 
 
+def get_sm100_aot_manifest_token(device_arch: int) -> Optional[tuple]:
+    """Return an identity token for fast dispatch to the current manifest."""
+    target_arch = sm100_aot_target_arch(device_arch)
+    manifest_path = (
+        resolve_sm100_aot_artifact_dir(target_arch) / SM100_AOT_MANIFEST
+    )
+    try:
+        stat = manifest_path.stat()
+    except OSError:
+        return None
+    return (
+        str(manifest_path),
+        stat.st_mtime_ns,
+        stat.st_size,
+        stat.st_ino,
+        _SM100_AOT_CACHE_GENERATION,
+    )
+
+
 def is_sm100_aot_layout_supported(
     variant: Sm100AotVariant,
     tensors: Iterable[Optional[torch.Tensor]],
 ) -> bool:
     tensors = tuple(tensors)
-    if len(tensors) != 9:
+    if len(tensors) != 12:
         return False
+    input_dtype = torch.float8_e4m3fn if variant.is_fp8 else torch.bfloat16
     output_dtype = torch.float32 if variant.kv_splits > 1 else torch.bfloat16
     expected_specs = (
-        (True, 4, torch.bfloat16, 16),
-        (True, 4, torch.bfloat16, 16),
-        (True, 4, torch.bfloat16, 16),
+        (True, 4, input_dtype, 16),
+        (True, 4, input_dtype, 16),
+        (True, 4, input_dtype, 16),
         (True, 4, output_dtype, 16),
         (True, 3, torch.float32, 4),
+        (variant.is_fp8, 3, torch.float32, 4),
+        (variant.is_fp8, 3, torch.float32, 4),
+        (variant.is_fp8, 2, torch.float32, 4),
         (True, 4, torch.int32, 16),
-        (variant.has_block_sizes, 1, torch.int32, 16),
+        (
+            variant.has_block_sizes,
+            variant.block_sizes_mode,
+            torch.int32,
+            16,
+        ),
         (variant.has_block_nums, 3, torch.int32, 16),
         (
             variant.kv_splits > 1
@@ -227,6 +256,8 @@ def _bind_kernel_cached(
 
 
 def clear_sm100_aot_runtime_cache() -> None:
+    global _SM100_AOT_CACHE_GENERATION
+    _SM100_AOT_CACHE_GENERATION += 1
     _load_manifest_cached.cache_clear()
     _load_kernel_cached.cache_clear()
     _bind_kernel_cached.cache_clear()
@@ -302,7 +333,8 @@ def get_sm100_aot_kernel(
         if required:
             raise Sm100AotArtifactError(
                 "SM100 AOT-only mode requires the compiled tensor ranks and "
-                "dtypes on one CUDA device, matching optional tensors, "
+                "dtypes (including FP8 scales) on one CUDA device, matching "
+                "optional tensors, "
                 "non-broadcast layouts, aligned pointers, and unit trailing "
                 "strides"
             )

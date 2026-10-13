@@ -1,29 +1,80 @@
 # SM100 blk64 Sage FP8 最终验证结果
 
+## 2026-09-09：SM100/SM103 Sage FP8 AOT
+
+SM100 和 SM103 的 Sage FP8 forward 现已接入现有 CuTe native AOT artifact
+bundle。AOT 覆盖固定或逐 Q block 的 top-k、三种 `block_sizes` 作用域、
+split-KV producer/combine，以及 SM103 的软件和 16-token `ld.red` row-max
+两种路径。未命中 artifact 时仍可回退 JIT；`BSA_SM100_AOT_ONLY=1` 会严格
+禁止运行时调用 `cute.compile()`。
+
+最终代码已在 B200 和 B300 上真实导出并加载 AOT `.so`，分别覆盖动态
+top-k/三维 `block_sizes`、split-KV producer/combine 和 SM103 `ld.red`。
+三条 AOT-only 精度用例均通过，并在测试中显式禁止了 `cute.compile()`。
+
+最终回归在 B200 上为 123 passed、24 skipped，在 B300 上为 124 passed、
+23 skipped，均为 0 failed。最终源码重新生成的普通 FP8、split-KV、SM103
+`ld.red` 和原有 BF16 AOT 均通过 AOT-only 真机精度测试。
+
+### 尾块性能回退和修复
+
+早期实现把 KV 尾块长度的动态计算放进 SM100 的 softmax 热循环。SM100 有
+8 个 softmax warp，同一份判断会被重复执行并放大编译器控制流；B200 常用
+unsplit 用例因此从约 2.42 ms 退化到约 3.78 ms。两版内核都是 128 个寄存器
+且没有 spill，但 cubin 从 132264 bytes 增至 193536 bytes，反汇编从约 5218
+行增至 6378 行，确认问题是热循环代码膨胀而不是寄存器压力。
+
+最终实现不在 host 生成或修改 `block_sizes`，也不补齐 Q/K scale。一个
+SM100 FP8 kernel 根据运行时 K 长度做统一判断：64 对齐时直接执行原 hot
+loop；确有尾块时，同一 kernel 内计算最后一个物理块的有效长度、收紧用户
+提供的 block size 并完成 score masking。split-KV 的尾部 K-scale 也在同一
+判断下安全索引。
+
+性能回归使用 `origin/master` (`8a9e8d7`) 作为基线，在同一张 B200/B300
+上测试下方 12 组客户规模。每组预热 10 次、计时 21 次取中位数，前后版本
+交换顺序跑两轮，再取几何平均：
+
+- B200 最终 JIT 相对 master 快 0.871%，12 项范围为 -2.482% 到 +0.096%；
+- B300 最终 JIT 相对 master 快 2.883%，12 项范围为 -4.334% 到 -0.623%；
+- B200 原先约 2.42 ms 到 3.78 ms 的回退已消失，最终为 2.388 ms，
+  同场 master 为 2.416 ms；
+- 输出抽样汇总相对 master 的最大绝对差为 `2.0981e-05`，完整精度门槛
+  全部通过。
+
+AOT 的主要价值是免去首次编译：当前源码的首个 unsplit 调用在 B200/B300
+上需要约 34.78/37.03 秒 JIT，预编译后首次加载并执行为约 0.053/0.072 秒。
+同一 kernel 同时包含 aligned 和 tail 的内部实现，因此 JIT 编译时间高于
+master 的约 11.35/12.20 秒；这是一次性的编译开销，不是上述稳态执行时间。
+B200 上 AOT native ABI 的 12 项稳态几何平均比同一最终 JIT 慢 1.153%，
+主要来自调用开销。B300 bring-up 板在连续 AOT 轮次中触发了明显温度/时钟
+波动，因此不把其 AOT 稳态数字用于性能结论。
+
 ## 2026-09-08：与 SM120 对齐动态输入能力
 
 SM100 和 SM103 的 Sage FP8 接口已解除原先 `B=1`、`H in {4,8}`、Q/KV
 长度必须是 64 倍数、uniform top-k 和 rank-1 `block_sizes` 的限制。现在支持：
 
 - 任意正数 batch 和 MHA head 数；
-- 非 64 对齐的 Q/KV 长度（SM100/SM103 在后端边界补齐并屏蔽，SM120 原生处理）；
+- 非 64 对齐的 Q/KV 长度（Q/K/V 和 scale 均保持真实长度；SM100/SM103
+  kernel 根据运行时长度直接判断并屏蔽尾块）；
 - `[B,H,Q_blocks]` 的 `q2k_block_nums`，SM100/SM103 仍支持空行；
 - `[N]`、`[B,N]`、`[B,H,N]` 三种 `block_sizes`。
 
 真机定向验证覆盖 B200/SM100 和 B300/SM103，包括 `B=2`、`H=1/3/5`、
 Q/KV 尾块、三种 block-size 作用域、可变/空 top-k，以及 H=1/5 下
-1/4/8/16 路 split。完整 FP8/量化回归在 B200 上为 67 passed、14 skipped，
-在 B300 上为 68 passed、13 skipped；AOT dispatch 和动态 compile-key 回归为
-30 passed、2 skipped。SM100/SM103 仍是 FP8 JIT-only；SM120 的 FP8 支持 AOT。
+1/4/8/16 路 split。完整 FP8/量化回归在 B200 上为 68 passed、14 skipped，
+在 B300 上为 69 passed、13 skipped；AOT、动态 compile-key 和 packaging
+定向回归为 49 passed、9 skipped。SM100/SM103 和 SM120 的 FP8 均支持 AOT
+或 JIT。
 
 以下早期性能结果中的 `B=1`、`H=4/8` 是当时的基准输入范围，不再是当前
 接口限制。
 
-## 结论
+## 早期固定形状性能基准
 
-当前实现支持固定长度、前向、BHSD 布局的 Sage FP8 block-sparse
-attention：`B=1`、`H=4/8`、`D=128`、`64x64` 稀疏块、uniform top-k，
-输出为 BF16。
+以下性能数据使用前向、BHSD 布局的 Sage FP8 block-sparse attention：
+`B=1`、`H=4/8`、`D=128`、`64x64` 稀疏块、uniform top-k，输出为
+BF16。这些是基准输入，不是当前接口限制。
 
 在 B300/SM103 上，客户 PDF 的 12 组输入规模全部通过精度门槛。FP8 和
 BF16 使用相同的自动 split 后，两轮正式测试的 FP8/BF16 延迟几何平均为

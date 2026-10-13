@@ -262,6 +262,36 @@ def shr_u32(x: Uint32, shift: Uint32) -> Uint32:
 
 
 @cute.jit
+def select_i32_if_equal(
+    lhs: Int32,
+    rhs: Int32,
+    if_equal: Int32,
+    otherwise: Int32,
+) -> Int32:
+    """Return one of two i32 values without creating DSL control flow."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Int32(lhs).ir_value(),
+                Int32(rhs).ir_value(),
+                Int32(if_equal).ir_value(),
+                Int32(otherwise).ir_value(),
+            ],
+            "{\n\t"
+            ".reg .pred p;\n\t"
+            "setp.eq.s32 p, $1, $2;\n\t"
+            "selp.b32 $0, $3, $4, p;\n\t"
+            "}",
+            "=r,r,r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
 def mask_f32x32_by_u32_branch(acc_s: cute.Tensor, mask: Uint32, base: cutlass.Constexpr[int]) -> Tuple[Float32, ...]:
     mask_ops = "\n\t".join(f"and.b32 tmp, $64, {hex(1 << i)};\n\t" "setp.eq.u32 p, tmp, 0;\n\t" f"@p mov.f32 ${i}, neg_inf;" for i in range(32))
     zero_ops = "\n\t".join(f"mov.f32 ${i}, neg_inf;" for i in range(32))

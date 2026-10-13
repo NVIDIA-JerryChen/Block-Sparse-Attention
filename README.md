@@ -6,7 +6,7 @@
 
 | | SM120 blk64 (CuTe DSL / AOT + JIT) | SM100/SM103 blk128 (CuTe DSL / JIT) | SM90 blk64 (CuTe DSL / AOT + JIT) | SM100/SM103 blk64 (CuTe DSL / AOT + JIT) |
 |---|---|---|---|---|
-| Dtype | bf16, fp16, Sage FP8, Sage INT8/FP8 | bf16, fp16 | bf16, fp16 | bf16 (AOT or JIT), Sage FP8 (JIT only where supported) |
+| Dtype | bf16, fp16, Sage FP8, Sage INT8/FP8 | bf16, fp16 | bf16, fp16 | bf16 and Sage FP8 (AOT or JIT) |
 | Head dim | 128 only | 64, 96, 128 | 64, 96, 128 | 128 only |
 | Attention | MHA, GQA, MQA (FP8: MHA) | MHA, GQA, MQA | MHA, GQA, MQA | MHA only |
 | pack_gqa | No | Yes | No | No |
@@ -156,29 +156,40 @@ For an editable development install with tests, use `pip install -e '.[test]'`.
 
 ### SM100/SM103 CuTe DSL AOT
 
-SM100 and SM103 blk64 BF16 forward can be compiled offline and loaded through
-the CuTe native ABI, following the same artifact-bundle model as SM90 and
-SM120. The public `bsa_attn_fwd` API first resolves the matching AOT producer
-and, for split-KV, its AOT combine kernel. Sage/FP8 remains JIT-only and is
-rejected in SM100 AOT-only mode.
+SM100 and SM103 blk64 BF16 and Sage FP8 forward can be compiled offline and
+loaded through the CuTe native ABI, following the same artifact-bundle model
+as SM90 and SM120. The public `bsa_attn_fwd` and `bsa_fp8_blk64_fwd` APIs first
+resolve the matching AOT producer and, for split-KV, its AOT combine kernel.
+Repeated uniform-topK FP8 calls cache the validated native producer/combine
+pair and invalidate that fast entry when the manifest identity changes.
 
 #### Supported configurations
 
 - Targets: `sm_100a` (compute capability 10.0) and `sm_103a` (10.3)
-- Dtype: BF16 input/output; split producers use FP32 partial output
+- Dtype: BF16 or Sage E4M3 FP8 input; FP8 output is BF16 and split producers
+  use FP32 partial output
 - Head dimensions: QK=128 and value=128
 - Attention: MHA
 - Fixed `block_sparse_num` or runtime `q2k_block_nums`
-- `block_sizes`: absent or rank-1 int32
-- Static or CLC scheduling
-- 32-bit or 64-bit K/V stride lowering
-- Exact split count from 1 through 256; the default matrix builds 1, 2, 4, and 8
+- `block_sizes`: BF16 AOT supports absent or rank-1 int32; FP8 AOT supports
+  absent, `[N]`, `[B,N]`, or `[B,H,N]`
+- BF16 AOT supports static or CLC scheduling and 32-bit or 64-bit K/V stride
+  lowering; the public FP8 path uses its static scheduler and native sequence
+  layout
+- Exact split count from 1 through 256; the default BF16 matrix builds 1, 2, 4,
+  and 8, while the FP8 matrix builds the automatically selected 1, 4, 8, and 16
+- SM103 FP8 bundles contain both software and 16-token `ld.red` row-max variants
 - Build and deployment use the same locally installed CuTe DSL version
 - Matching build/runtime CUDA runtime version when both sides can detect it
 
-The default matrix contains 72 forward variants and three deduplicated combine
-variants per target. Batch/head counts, sequence lengths, sparse-index capacity,
-active topK, and non-leading strides remain runtime dynamic.
+The default matrix contains 104 forward variants for SM100 and 112 for SM103,
+plus five deduplicated combine variants per target. Batch/head counts, sequence
+lengths, sparse-index capacity, active topK, and non-leading strides remain
+runtime dynamic. SM100/SM103 keep Q/K/V at their true extents. When K/V has a
+physical tail, the same FP8 kernel derives its valid length from the runtime K
+extent and masks it internally; the public API neither synthesizes
+`block_sizes` nor pads scale metadata. A uniform in-kernel check keeps aligned
+calls on the original hot loop without selecting a different artifact.
 
 #### Build artifacts
 
@@ -207,7 +218,7 @@ runtime combination used in AOT-only mode must be present:
 
 ```bash
 make aot-sm100 \
-  SM100_AOT_ARGS='--kv-splits 1,2 --block-nums both --allow-empty-block-nums both --block-sizes both --use-clc both --int64-kv-strides both'
+  SM100_AOT_ARGS='--dtypes fp8 --block-nums both --fp8-kv-splits 1,4,8,16 --fp8-block-sizes-modes 0,1,2,3 --fp8-ldred auto'
 
 # List one target's variants without compiling.
 python -m csrc.fwd.sm100_blk64.aot_build \
@@ -241,6 +252,15 @@ BSA_SM100_AOT_ONLY=1 \
 BSA_TEST_SM100_AOT_RUNTIME=1 \
 python -m pytest tests/test_sm100_aot.py -q
 ```
+
+### Sage FP8 quantization
+
+The shared quantizer uses two or three Triton launches. With a compatible
+runtime and host C++ compiler, warmed calls allocate and launch through one
+native host function. It caches launch plans, never input values or outputs.
+Unsupported runtimes use the regular Triton path; set `BSA_FP8_NATIVE_QUANT=0`
+before import to select it explicitly. Q/V rounding is preserved; the FP32 K
+reduction may move rare FP8 midpoint ties within the tested numerical limits.
 
 ### SM90 CuTe DSL AOT
 
@@ -474,7 +494,7 @@ intentionally different:
 | Per-block valid tokens | `block_sizes=[N]`, `[B,N]`, or `[B,H,N]` | Same three forms |
 | Head dimension / attention | `D=128`, MHA | `D=128`, MHA |
 | KV split | Supported, explicit or automatic | Not supported |
-| Kernel delivery | JIT only | AOT or JIT |
+| Kernel delivery | AOT or JIT | AOT or JIT |
 
 SM100/SM103 and SM120 keep the true Q/K/V sequence extents in their TMA
 descriptors. The final 64-token tile is zero-filled out of bounds and masked,
@@ -845,7 +865,7 @@ SM100/SM103 selects the blk64 or blk128 default from `sparse_block_size`. Pass
 make wheel                      # Build the unified CuTe DSL wheel
 make setup                      # Reinstall wheel after dependencies are provisioned
 make aot-sm90                   # Build the default 140 main + 6 combine SM90 matrix
-make aot-sm100                  # Build SM100/SM103 BF16 AOT artifacts
+make aot-sm100                  # Build SM100/SM103 BF16/FP8 AOT artifacts
 make aot-sm120                  # Build the default SM120 native-ABI AOT matrix
 make tt                         # Quick correctness test (default: blk128)
 make tt BLK=64                  # Quick test blk64 only

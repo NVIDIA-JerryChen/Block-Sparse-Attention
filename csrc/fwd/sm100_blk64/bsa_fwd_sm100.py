@@ -8,7 +8,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
 
 import math
-from typing import Type, Tuple, Callable, Optional
+from typing import Tuple, Callable, Optional
 from functools import partial
 
 import cuda.bindings.driver as cuda
@@ -713,8 +713,6 @@ class BlockSparseAttnForwardSm100Blk64:
         self.shared_storage = SharedStorage
 
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale)
-        fastdiv_mods = None
-
         # Launch the kernel synchronously
         self.kernel(
             mQ,
@@ -1153,13 +1151,29 @@ class BlockSparseAttnForwardSm100Blk64:
                 seqlen_k=mK.shape[0],
             )
 
+            # This is one runtime-uniform branch inside one compiled kernel.
+            # Keeping arbitrary tail sizes out of the aligned softmax body is
+            # important on SM100: otherwise its eight softmax warps all pay
+            # for the generic partial-block mask, even when K is aligned.
+            aligned_k_storage = (
+                mK.shape[0] % self.sparse_block_size == Int32(0)
+                if const_expr(self.is_sage_fp8)
+                else True
+            )
+
             # Keep stage constexpr so each softmax path has a fixed stage.
             # Runtime stage selection leaves TMEM offsets, barrier indices, and
             # stats strides as uniform arithmetic in the hot softmax loop.
             if warp_idx < self.softmax1_warp_ids[0]:
-                softmax_loop(stage=0)
+                if aligned_k_storage:
+                    softmax_loop(stage=0, mask_physical_tail=False)
+                else:
+                    softmax_loop(stage=0, mask_physical_tail=True)
             if warp_idx < self.correction_warp_ids[0] and warp_idx >= self.softmax1_warp_ids[0]:
-                softmax_loop(stage=1)
+                if aligned_k_storage:
+                    softmax_loop(stage=1, mask_physical_tail=False)
+                else:
+                    softmax_loop(stage=1, mask_physical_tail=True)
 
             tmem_alloc_barrier.arrive()
 
@@ -1311,8 +1325,6 @@ class BlockSparseAttnForwardSm100Blk64:
         mBlockNums: Optional[cute.Tensor],
         mSplitOffsets: Optional[cute.Tensor],
     ):
-        num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
-        tidx = cute.arch.thread_idx()[0] % num_load_threads
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         q_producer_phase = Int32(1)
         kv_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.kv_stage)
@@ -1784,11 +1796,9 @@ class BlockSparseAttnForwardSm100Blk64:
             key_block = n_block(
                 kv_block_idx * self.sparse_blocks_per_kv + logical_sub
             )
-            scale_idx = key_block * 4 + scale_group
-            scale_idx = (
-                scale_idx
-                if scale_idx < mKScale.shape[2]
-                else mKScale.shape[2] - 1
+            scale_idx = cutlass.min(
+                key_block * 4 + scale_group,
+                mKScale.shape[2] - 1,
             )
             sKScale[score_stage * 16 + tidx] = mKScale[
                 batch_idx,
@@ -1867,6 +1877,7 @@ class BlockSparseAttnForwardSm100Blk64:
         mBlockNums: Optional[cute.Tensor],
         mSplitOffsets: Optional[cute.Tensor],
         seqlen_k: Int32,
+        mask_physical_tail: bool,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -1884,6 +1895,22 @@ class BlockSparseAttnForwardSm100Blk64:
 
         mma_si_consumer_phase = Int32(0)
         sm_stats_producer_phase = Int32(1)
+
+        if const_expr(mask_physical_tail):
+            last_k_block = (seqlen_k - Int32(1)) // self.sparse_block_size
+            last_k_block_size = (
+                seqlen_k - last_k_block * self.sparse_block_size
+            )
+        else:
+            last_k_block = Int32(0)
+            last_k_block_size = Int32(self.sparse_block_size)
+        # Q-tail protection follows the same pattern: one uniform shape check
+        # avoids a per-row bounds predicate for the usual aligned case.
+        aligned_q_scale = (
+            mQScale.shape[2] % self.m_block_size == Int32(0)
+            if const_expr(self.is_sage_fp8)
+            else True
+        )
 
         tmem_s_addr = Int32(stage) * Int32(self.tmem_s_offset[1] - self.tmem_s_offset[0])
         tmem_p_addr = Int32(stage) * Int32(self.tmem_p_offset[1] - self.tmem_p_offset[0])
@@ -1937,13 +1964,20 @@ class BlockSparseAttnForwardSm100Blk64:
                 batch_idx=batch_idx,
                 head_idx=head_idx,
                 score_scale_log2=softmax_scale_log2,
+                mask_physical_tail=mask_physical_tail,
             )
 
+            q_scale = Float32(1.0)
             if const_expr(self.is_sage_fp8):
                 q_row = m_block * self.m_block_size + (warp_idx & 1) * cute.arch.WARP_SIZE + (tidx % cute.arch.WARP_SIZE)
-                q_scale = mQScale[batch_idx, head_idx, q_row] if q_row < mQScale.shape[2] else Float32(1.0)
-            else:
-                q_scale = Float32(1.0)
+                if aligned_q_scale:
+                    q_scale = mQScale[batch_idx, head_idx, q_row]
+                else:
+                    q_scale = (
+                        mQScale[batch_idx, head_idx, q_row]
+                        if q_row < mQScale.shape[2]
+                        else Float32(1.0)
+                    )
 
             # Always acquire pipeline_sm_stats to stay in sync with correction
             pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
@@ -1959,7 +1993,8 @@ class BlockSparseAttnForwardSm100Blk64:
 
                 first_bs_lo, first_bs_hi, first_nb_lo, first_nb_hi = self.get_softmax_block_info(
                     Int32(0), stage, warp_col, block_iter_count, raw_block_count,
-                    n_block, mBlockSizes, batch_idx, head_idx, seqlen_k
+                    n_block, mBlockSizes, batch_idx, head_idx,
+                    last_k_block, last_k_block_size, mask_physical_tail
                 )
                 mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
                     mma_si_consumer_phase,
@@ -1979,7 +2014,8 @@ class BlockSparseAttnForwardSm100Blk64:
                     bs_lo, bs_hi, nb_lo, nb_hi = self.get_softmax_block_info(
                         n_tile + 1, stage, warp_col, block_iter_count,
                         raw_block_count, n_block, mBlockSizes, batch_idx,
-                        head_idx, seqlen_k
+                        head_idx, last_k_block, last_k_block_size,
+                        mask_physical_tail
                     )
                     mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
                         mma_si_consumer_phase,
@@ -2022,7 +2058,9 @@ class BlockSparseAttnForwardSm100Blk64:
         mBlockSizes: Optional[cute.Tensor],
         batch_idx: Int32,
         head_idx: Int32,
-        seqlen_k: Int32,
+        last_k_block: Int32,
+        last_k_block_size: Int32,
+        mask_physical_tail: bool,
     ) -> Tuple[Int32, Int32, Int32, Int32]:
         kv_block = block_iter_count - 1 - (self.s_stage * kv_iter + Int32(stage))
         logical_lo = kv_block * self.sparse_blocks_per_kv + warp_col
@@ -2031,15 +2069,17 @@ class BlockSparseAttnForwardSm100Blk64:
         # out-of-range global-memory access is generated in the FP8 scale path.
         nb_lo = n_block(cutlass.min(logical_lo, cutlass.max(raw_block_count - 1, Int32(0))))
         nb_hi = n_block(cutlass.min(logical_hi, cutlass.max(raw_block_count - 1, Int32(0))))
-        if const_expr(self.is_sage_fp8):
-            # TMA zero-fills past the true K/V extent. Mask the matching score
-            # columns, without materializing block_sizes on the host.
-            native_bs_lo = cutlass.min(
-                cutlass.max(seqlen_k - nb_lo * self.sparse_block_size, Int32(0)),
+        if const_expr(self.is_sage_fp8 and mask_physical_tail):
+            native_bs_lo = bsa_fwd_helpers.select_i32_if_equal(
+                nb_lo,
+                last_k_block,
+                last_k_block_size,
                 Int32(self.sparse_block_size),
             )
-            native_bs_hi = cutlass.min(
-                cutlass.max(seqlen_k - nb_hi * self.sparse_block_size, Int32(0)),
+            native_bs_hi = bsa_fwd_helpers.select_i32_if_equal(
+                nb_hi,
+                last_k_block,
+                last_k_block_size,
                 Int32(self.sparse_block_size),
             )
             if const_expr(self.has_block_sizes):
@@ -2055,8 +2095,12 @@ class BlockSparseAttnForwardSm100Blk64:
                         mBlockSizes, batch_idx, head_idx, nb_hi
                     ),
                 )
-            bs_lo = Int32(0) if logical_lo >= raw_block_count else native_bs_lo
-            bs_hi = Int32(0) if logical_hi >= raw_block_count else native_bs_hi
+            bs_lo = (
+                Int32(0) if logical_lo >= raw_block_count else native_bs_lo
+            )
+            bs_hi = (
+                Int32(0) if logical_hi >= raw_block_count else native_bs_hi
+            )
         elif const_expr(self.has_block_sizes):
             bs_lo = (
                 Int32(0)
@@ -2156,6 +2200,7 @@ class BlockSparseAttnForwardSm100Blk64:
         batch_idx: Int32,
         head_idx: Int32,
         score_scale_log2: Float32,
+        mask_physical_tail: bool,
         tidx: Int32,
         tmem_s_addr: Int32,
         tmem_p_addr: Int32,
@@ -2295,12 +2340,15 @@ class BlockSparseAttnForwardSm100Blk64:
                     )
                     for key_scale_group in cutlass.range_constexpr(4):
                         scale_idx = block_idx * 4 + key_scale_group
-                        key_scale_idx = key_block * 4 + key_scale_group
-                        key_scale_idx = (
-                            key_scale_idx
-                            if key_scale_idx < mKScale.shape[2]
-                            else mKScale.shape[2] - 1
-                        )
+                        if const_expr(mask_physical_tail):
+                            key_scale_idx = cutlass.min(
+                                key_block * 4 + key_scale_group,
+                                mKScale.shape[2] - 1,
+                            )
+                        else:
+                            key_scale_idx = (
+                                key_block * 4 + key_scale_group
+                            )
                         qk_scale = q_log2_scale * mKScale[
                             batch_idx,
                             head_idx,
@@ -2903,7 +2951,7 @@ class BlockSparseAttnForwardSm100Blk64:
                     )
         else:
             # PackGQA retains the existing whole-fragment path. The supported
-            # Sage FP8 v1 contract does not use PackGQA.
+            # The Sage FP8 path does not use PackGQA.
             tOrO = cute.make_rmem_tensor_like(tOsO, self.o_dtype)
             cute.autovec_copy(tOsO, tOrO)
             pack_gqa.store_O(mO_cur, tOrO, gmem_tiled_copy_O, tidx, m_tile_idx, seqlen_q)

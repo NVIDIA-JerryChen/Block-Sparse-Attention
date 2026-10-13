@@ -6,7 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from block_sparse_attention import bsa_attn_fwd
+from block_sparse_attention import bsa_attn_fwd, bsa_fp8_blk64_fwd
+from block_sparse_attention.bsa_fp8_quant import quantize_sage_bhsd
 from block_sparse_attention.csrc.fwd.sm100_blk64 import aot_runtime
 from block_sparse_attention.csrc.fwd.sm100_blk64.aot_build import (
     build_sm100_aot_artifacts,
@@ -19,6 +20,7 @@ from block_sparse_attention.csrc.fwd.sm100_blk64.aot_runtime import (
     clear_sm100_aot_runtime_cache,
     get_sm100_aot_combine_kernel,
     get_sm100_aot_kernel,
+    get_sm100_aot_manifest_token,
     is_sm100_aot_layout_supported,
 )
 from block_sparse_attention.csrc.fwd.sm100_blk64.aot_utils import (
@@ -32,6 +34,7 @@ from block_sparse_attention.csrc.fwd.sm100_blk64.aot_utils import (
     get_host_cpu_arch,
     get_sm100_aot_combine_variant,
     iter_sm100_aot_combine_variants,
+    iter_sm100_fp8_aot_variants,
     iter_sm100_aot_variants,
     load_sm100_aot_manifest,
     sha256_file,
@@ -92,6 +95,8 @@ def _variant(**overrides) -> Sm100AotVariant:
         "kv_splits": 1,
         "use_clc_scheduler": False,
         "use_int64_kv_strides": False,
+        "block_sizes_mode": 0,
+        "use_sage_ldred_rowmax": False,
     }
     values.update(overrides)
     return Sm100AotVariant(**values)
@@ -148,11 +153,17 @@ def _make_runtime_tensors(
     *,
     device: str = "cuda:0",
 ):
+    input_dtype = torch.float8_e4m3fn if variant.is_fp8 else torch.bfloat16
     output_dtype = torch.float32 if variant.kv_splits > 1 else torch.bfloat16
+    block_sizes_shapes = {
+        1: (4,),
+        2: (1, 4),
+        3: (1, 2, 4),
+    }
     tensors = [
-        _LayoutTensor((1, 2, 64, 128), torch.bfloat16, device=device),
-        _LayoutTensor((1, 2, 256, 128), torch.bfloat16, device=device),
-        _LayoutTensor((1, 2, 256, 128), torch.bfloat16, device=device),
+        _LayoutTensor((1, 2, 64, 128), input_dtype, device=device),
+        _LayoutTensor((1, 2, 256, 128), input_dtype, device=device),
+        _LayoutTensor((1, 2, 256, 128), input_dtype, device=device),
         _LayoutTensor(
             (1, variant.kv_splits * 2, 64, 128),
             output_dtype,
@@ -163,9 +174,28 @@ def _make_runtime_tensors(
             torch.float32,
             device=device,
         ),
+        (
+            _LayoutTensor((1, 2, 64), torch.float32, device=device)
+            if variant.is_fp8
+            else None
+        ),
+        (
+            _LayoutTensor((1, 2, 16), torch.float32, device=device)
+            if variant.is_fp8
+            else None
+        ),
+        (
+            _LayoutTensor((2, 128), torch.float32, device=device)
+            if variant.is_fp8
+            else None
+        ),
         _LayoutTensor((1, 2, 1, 4), torch.int32, device=device),
         (
-            _LayoutTensor((4,), torch.int32, device=device)
+            _LayoutTensor(
+                block_sizes_shapes[variant.block_sizes_mode],
+                torch.int32,
+                device=device,
+            )
             if variant.has_block_sizes
             else None
         ),
@@ -188,7 +218,7 @@ def _make_runtime_tensors(
     return tuple(tensors)
 
 
-def test_sm100_aot_default_matrix_is_deterministic_and_bf16_only(capsys):
+def test_sm100_aot_default_matrix_is_deterministic_and_includes_fp8(capsys):
     variants = iter_sm100_aot_variants(
         (False, True),
         (False, True),
@@ -213,6 +243,22 @@ def test_sm100_aot_default_matrix_is_deterministic_and_bf16_only(capsys):
         SM100_AOT_COMBINE_NUM_THREADS
     }
 
+    fp8_variants = iter_sm100_fp8_aot_variants(
+        (False, True),
+        (0, 1, 2, 3),
+        (1, 4, 8, 16),
+    )
+    assert len(fp8_variants) == 32
+    assert {variant.dtype for variant in fp8_variants} == {"fp8"}
+    assert {variant.block_sizes_mode for variant in fp8_variants} == {
+        0,
+        1,
+        2,
+        3,
+    }
+    assert all(not variant.use_clc_scheduler for variant in fp8_variants)
+    assert all(not variant.use_int64_kv_strides for variant in fp8_variants)
+
     assert (
         aot_build_main(
             [
@@ -225,8 +271,25 @@ def test_sm100_aot_default_matrix_is_deterministic_and_bf16_only(capsys):
     )
     output = capsys.readouterr().out
     assert "Target: sm_100a" in output
-    assert "Main variants: 72" in output
-    assert "Combine variants: 3" in output
+    assert "Main variants: 104" in output
+    assert "Dtype variants: bf16=72, fp8=32" in output
+    assert "Combine variants: 5" in output
+
+    assert (
+        aot_build_main(
+            [
+                "--target-arch",
+                "sm_103a",
+                "--dtypes",
+                "fp8",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert "Main variants: 40" in output
+    assert "Dtype variants: fp8=40" in output
 
 
 def test_sm100_aot_variant_round_trip_and_validation():
@@ -234,6 +297,7 @@ def test_sm100_aot_variant_round_trip_and_validation():
         has_block_nums=True,
         allow_empty_block_nums=True,
         has_block_sizes=True,
+        block_sizes_mode=1,
         use_clc_scheduler=True,
         use_int64_kv_strides=True,
     )
@@ -251,8 +315,31 @@ def test_sm100_aot_variant_round_trip_and_validation():
     combine = get_sm100_aot_combine_variant(split_variant)
     assert Sm100AotCombineVariant.from_dict(combine.to_dict()) == combine
 
-    with pytest.raises(ValueError, match="BF16"):
-        _variant(dtype="fp8")
+    fp8_variant = _variant(
+        dtype="fp8",
+        has_block_sizes=True,
+        block_sizes_mode=3,
+        use_sage_ldred_rowmax=True,
+    )
+    assert Sm100AotVariant.from_dict(fp8_variant.to_dict()) == fp8_variant
+    assert fp8_variant.name == (
+        "bsa_sm100_blk64_fp8_bn0_empty0_bs3_split1_clc0_i640_"
+        "ldred1_dyn"
+    )
+
+    with pytest.raises(ValueError, match="Unsupported"):
+        _variant(dtype="fp16")
+    with pytest.raises(ValueError, match="block_sizes_mode"):
+        _variant(has_block_sizes=True, block_sizes_mode=0)
+    with pytest.raises(ValueError, match="FP8"):
+        _variant(use_sage_ldred_rowmax=True)
+    with pytest.raises(ValueError, match="unsplit"):
+        _variant(
+            dtype="fp8",
+            kv_splits=2,
+            allow_empty_block_nums=True,
+            use_sage_ldred_rowmax=True,
+        )
     with pytest.raises(ValueError, match="kv_splits"):
         _variant(kv_splits=0)
     with pytest.raises(ValueError, match="empty buckets"):
@@ -389,17 +476,37 @@ def test_sm100_aot_manifest_loader_and_cache(
     clear_sm100_aot_runtime_cache()
 
 
+def test_sm100_aot_manifest_token_changes_when_cache_is_cleared(
+    tmp_path: Path,
+    monkeypatch,
+):
+    artifact_dir = tmp_path / get_host_cpu_arch() / "sm_100a"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "manifest.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv(SM100_AOT_DIR_ENV, str(tmp_path))
+
+    token_before = get_sm100_aot_manifest_token(100)
+    clear_sm100_aot_runtime_cache()
+    token_after = get_sm100_aot_manifest_token(100)
+
+    assert token_before is not None
+    assert token_after is not None
+    assert token_before[:-1] == token_after[:-1]
+    assert token_before[-1] != token_after[-1]
+
+
 def test_sm100_aot_layout_checks_optional_presence_and_strides():
     variant = _variant(
         has_block_nums=True,
         has_block_sizes=True,
+        block_sizes_mode=2,
         kv_splits=2,
         allow_empty_block_nums=True,
     )
     tensors = list(_make_runtime_tensors(variant))
     assert is_sm100_aot_layout_supported(variant, tensors)
 
-    tensors[6] = None
+    tensors[9] = None
     assert not is_sm100_aot_layout_supported(variant, tensors)
     tensors = list(_make_runtime_tensors(variant))
     tensors[0] = _LayoutTensor(
@@ -414,7 +521,7 @@ def test_sm100_aot_layout_checks_optional_presence_and_strides():
     assert not is_sm100_aot_layout_supported(variant, tensors)
 
     tensors = list(_make_runtime_tensors(variant))
-    tensors[5] = _LayoutTensor((1, 2, 4), torch.int32)
+    tensors[8] = _LayoutTensor((1, 2, 4), torch.int32)
     assert not is_sm100_aot_layout_supported(variant, tensors)
 
     tensors = list(_make_runtime_tensors(variant))
@@ -424,6 +531,12 @@ def test_sm100_aot_layout_checks_optional_presence_and_strides():
         device="cpu",
     )
     assert not is_sm100_aot_layout_supported(variant, tensors)
+
+    fp8_variant = _variant(dtype="fp8")
+    tensors = list(_make_runtime_tensors(fp8_variant))
+    assert is_sm100_aot_layout_supported(fp8_variant, tensors)
+    tensors[5] = None
+    assert not is_sm100_aot_layout_supported(fp8_variant, tensors)
 
 
 def test_sm100_aot_only_rejects_missing_or_corrupt_artifact(
@@ -502,8 +615,9 @@ def test_sm100_aot_manifest_cache_observes_atomic_replacement(
     os.getenv("BSA_TEST_SM100_AOT_BUILD") != "1",
     reason="Set BSA_TEST_SM100_AOT_BUILD=1 in the target DSL environment",
 )
-def test_build_sm100_aot_artifacts(tmp_path: Path):
-    variant = _variant()
+@pytest.mark.parametrize("dtype", ("bf16", "fp8"))
+def test_build_sm100_aot_artifacts(tmp_path: Path, dtype: str):
+    variant = _variant(dtype=dtype)
     target_arch = os.getenv("CUTE_DSL_ARCH", "sm_100a")
     manifest_path = build_sm100_aot_artifacts(
         tmp_path,
@@ -570,3 +684,291 @@ def test_sm100_aot_only_public_api_matches_reference(monkeypatch, kv_splits):
     ref_lse = torch.logsumexp(scores, dim=-1)
     torch.testing.assert_close(out.float(), ref_out, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(lse, ref_lse, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.skipif(
+    not _RUNTIME_TEST_ENABLED or not _IS_SM100_OR_SM103,
+    reason="Set BSA_TEST_SM100_AOT_RUNTIME=1 and run on SM100 or SM103",
+)
+@pytest.mark.parametrize("seqlen_q,seqlen_k", ((65, 127), (128, 128)))
+def test_sm100_aot_only_fp8_public_api_matches_reference(
+    monkeypatch,
+    seqlen_q: int,
+    seqlen_k: int,
+):
+    artifact_root = os.getenv(SM100_AOT_DIR_ENV)
+    assert artifact_root, f"{SM100_AOT_DIR_ENV} must be set"
+    monkeypatch.setenv(SM100_AOT_ONLY_ENV, "1")
+
+    import block_sparse_attention.bsa_attn_interface as interface
+
+    def fail_compile(*args, **kwargs):
+        raise AssertionError("cute.compile must not run during FP8 AOT validation")
+
+    monkeypatch.setattr(interface.cute, "compile", fail_compile)
+    torch.manual_seed(20260909)
+    batch, heads = 1, 2
+    q = torch.randn(
+        (batch, heads, seqlen_q, 128),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k = torch.randn(
+        (batch, heads, seqlen_k, 128),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn_like(k)
+    q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale = quantize_sage_bhsd(
+        q,
+        k,
+        v,
+    )
+    indices = torch.tensor(
+        [[[[0, 1], [1, 0]], [[1, 0], [0, 1]]]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    block_nums = torch.tensor(
+        [[[2, 1], [1, 2]]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    block_sizes = torch.tensor(
+        [[[64, 64], [64, 47]]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    softmax_scale = 128**-0.5
+    out = bsa_fp8_blk64_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_scale,
+        k_scale,
+        v_scale,
+        indices,
+        0,
+        softmax_scale,
+        block_sizes=block_sizes,
+        q2k_block_nums=block_nums,
+    )
+    torch.cuda.synchronize()
+
+    q_dequant = q_fp8.float() * q_scale.unsqueeze(-1)
+    k_dequant = k_fp8.float() * k_scale.repeat_interleave(
+        16,
+        dim=-1,
+    )[..., :seqlen_k].unsqueeze(-1)
+    v_dequant = v_fp8.float() * v_scale.view(1, heads, 1, 128)
+    reference = torch.empty_like(out, dtype=torch.float32)
+    for head_idx in range(heads):
+        for q_block_idx in range(2):
+            count = int(block_nums[0, head_idx, q_block_idx])
+            token_ids = []
+            for block_idx in indices[
+                0,
+                head_idx,
+                q_block_idx,
+                :count,
+            ].tolist():
+                valid_tokens = min(
+                    int(block_sizes[0, head_idx, block_idx]),
+                    seqlen_k - block_idx * 64,
+                )
+                token_ids.extend(
+                    range(block_idx * 64, block_idx * 64 + valid_tokens)
+                )
+            selected = torch.tensor(token_ids, device="cuda")
+            q_start = q_block_idx * 64
+            q_stop = min(q_start + 64, seqlen_q)
+            q_tile = q_dequant[0, head_idx, q_start:q_stop]
+            k_tile = k_dequant[0, head_idx].index_select(0, selected)
+            v_tile = v_dequant[0, head_idx].index_select(0, selected)
+            scores = q_tile @ k_tile.transpose(0, 1) * softmax_scale
+            reference[0, head_idx, q_start:q_stop] = (
+                torch.softmax(scores, dim=-1) @ v_tile
+            )
+
+    diff = (out.float() - reference).abs()
+    assert diff.max().item() < 0.15
+    assert (diff.mean() / reference.abs().mean()).item() < 0.035
+
+
+@pytest.mark.skipif(
+    not _RUNTIME_TEST_ENABLED or not _IS_SM100_OR_SM103,
+    reason="Set BSA_TEST_SM100_AOT_RUNTIME=1 and run on SM100 or SM103",
+)
+def test_sm100_aot_only_fp8_split_matches_reference(monkeypatch):
+    artifact_root = os.getenv(SM100_AOT_DIR_ENV)
+    assert artifact_root, f"{SM100_AOT_DIR_ENV} must be set"
+    monkeypatch.setenv(SM100_AOT_ONLY_ENV, "1")
+
+    import block_sparse_attention.bsa_attn_interface as interface
+
+    def fail_compile(*args, **kwargs):
+        raise AssertionError("cute.compile must not run during FP8 AOT validation")
+
+    monkeypatch.setattr(interface.cute, "compile", fail_compile)
+    # Keep this ABI test independent of unrelated jobs consuming most of a
+    # shared test GPU. The case itself needs less than one MiB of workspace.
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda _device=None: (2 << 30, 8 << 30),
+    )
+    torch.manual_seed(20260910)
+    seqlen_q, seqlen_k = 65, 70
+    q = torch.randn(
+        (1, 2, seqlen_q, 128),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k = torch.randn(
+        (1, 2, seqlen_k, 128),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn_like(k)
+    q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale = quantize_sage_bhsd(
+        q,
+        k,
+        v,
+    )
+    indices = torch.tensor(
+        [[[[0, 1], [1, 0]], [[1, 0], [0, 1]]]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    softmax_scale = 128**-0.5
+    out, _ = interface._bsa_attn_fwd_sm100_blk64(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        indices,
+        None,
+        block_sparse_num=2,
+        softmax_scale=softmax_scale,
+        use_clc=False,
+        kv_splits=4,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    torch.cuda.synchronize()
+
+    q_dequant = q_fp8.float() * q_scale.unsqueeze(-1)
+    k_dequant = k_fp8.float() * k_scale.repeat_interleave(
+        16,
+        dim=-1,
+    )[..., :seqlen_k].unsqueeze(-1)
+    v_dequant = v_fp8.float() * v_scale.view(1, 2, 1, 128)
+    reference = torch.empty_like(out, dtype=torch.float32)
+    for head_idx in range(2):
+        for q_block_idx in range(2):
+            token_ids = []
+            for block_idx in indices[0, head_idx, q_block_idx].tolist():
+                block_stop = min((block_idx + 1) * 64, seqlen_k)
+                token_ids.extend(range(block_idx * 64, block_stop))
+            selected = torch.tensor(token_ids, device="cuda")
+            q_start = q_block_idx * 64
+            q_stop = min(q_start + 64, seqlen_q)
+            scores = (
+                q_dequant[0, head_idx, q_start:q_stop]
+                @ k_dequant[0, head_idx]
+                .index_select(0, selected)
+                .transpose(0, 1)
+                * softmax_scale
+            )
+            reference[0, head_idx, q_start:q_stop] = (
+                torch.softmax(scores, dim=-1)
+                @ v_dequant[0, head_idx].index_select(0, selected)
+            )
+
+    diff = (out.float() - reference).abs()
+    assert diff.max().item() < 0.15
+    assert (diff.mean() / reference.abs().mean()).item() < 0.035
+
+
+@pytest.mark.skipif(
+    not _RUNTIME_TEST_ENABLED or _DEVICE_ARCH != 103,
+    reason="Set BSA_TEST_SM100_AOT_RUNTIME=1 and run on SM103",
+)
+def test_sm103_aot_only_fp8_ldred_matches_reference(monkeypatch):
+    artifact_root = os.getenv(SM100_AOT_DIR_ENV)
+    assert artifact_root, f"{SM100_AOT_DIR_ENV} must be set"
+    monkeypatch.setenv(SM100_AOT_ONLY_ENV, "1")
+
+    import block_sparse_attention.bsa_attn_interface as interface
+
+    def fail_compile(*args, **kwargs):
+        raise AssertionError("cute.compile must not run during FP8 AOT validation")
+
+    monkeypatch.setattr(interface.cute, "compile", fail_compile)
+    torch.manual_seed(20260911)
+    seqlen_q = 512 * 64
+    q = torch.randn(
+        (1, 1, seqlen_q, 128),
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.5
+    k = torch.randn(
+        (1, 1, 127, 128),
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.5
+    v = torch.randn_like(k) * 0.5
+    q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale = quantize_sage_bhsd(
+        q,
+        k,
+        v,
+    )
+    indices = (
+        torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+        .view(1, 1, 1, 2)
+        .expand(1, 1, 512, 2)
+        .contiguous()
+    )
+    softmax_scale = 128**-0.5
+    out = bsa_fp8_blk64_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_scale,
+        k_scale,
+        v_scale,
+        indices,
+        2,
+        softmax_scale,
+    )
+    torch.cuda.synchronize()
+
+    def fail_lookup(*args, **kwargs):
+        raise AssertionError("a warmed FP8 AOT call must use the fast cache")
+
+    monkeypatch.setattr(interface, "get_sm100_aot_kernel", fail_lookup)
+    cached_out = bsa_fp8_blk64_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_scale,
+        k_scale,
+        v_scale,
+        indices,
+        2,
+        softmax_scale,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(cached_out, out, rtol=0.0, atol=0.0)
+
+    q_dequant = q_fp8.float() * q_scale.unsqueeze(-1)
+    k_dequant = k_fp8.float() * k_scale.repeat_interleave(
+        16,
+        dim=-1,
+    )[..., : k_fp8.shape[2]].unsqueeze(-1)
+    v_dequant = v_fp8.float() * v_scale.view(1, 1, 1, 128)
+    scores = q_dequant @ k_dequant.transpose(-1, -2) * softmax_scale
+    reference = torch.softmax(scores, dim=-1) @ v_dequant
+    diff = (out.float() - reference).abs()
+    assert diff.max().item() < 0.15
+    assert (diff.mean() / reference.abs().mean()).item() < 0.035
