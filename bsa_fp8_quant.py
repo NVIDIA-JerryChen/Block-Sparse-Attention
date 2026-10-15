@@ -124,7 +124,7 @@ def quantize_sage_bhsd(
     k_bhsd: torch.Tensor,
     v_bhsd: torch.Tensor,
 ):
-    """Quantize BF16 BHSD Q/K/V for :func:`bsa_fp8_blk64_fwd`.
+    """Quantize BF16 BHSD Q/K/V for :func:`bsa_fp8_fwd` (blk64 or blk128).
 
     Q scales are per token, smoothed K scales per 16 tokens, and V scales
     per head/channel across batch and sequence. Reductions and conversion

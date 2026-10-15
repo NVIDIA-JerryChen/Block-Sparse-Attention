@@ -4,16 +4,16 @@
 
 **Forward backends:**
 
-| | SM120 blk64 (CuTe DSL / AOT + JIT) | SM100/SM103 blk128 (CuTe DSL / JIT) | SM90 blk64 (CuTe DSL / AOT + JIT) | SM100/SM103 blk64 (CuTe DSL / AOT + JIT) |
+| | SM120 blk64 (CuTe DSL / AOT + JIT) | SM100/SM103 blk128 (CuTe DSL / FP8 AOT + JIT) | SM90 blk64 (CuTe DSL / AOT + JIT) | SM100/SM103 blk64 (CuTe DSL / AOT + JIT) |
 |---|---|---|---|---|
-| Dtype | bf16, fp16, Sage FP8, Sage INT8/FP8 | bf16, fp16 | bf16, fp16 | bf16 and Sage FP8 (AOT or JIT) |
-| Head dim | 128 only | 64, 96, 128 | 64, 96, 128 | 128 only |
-| Attention | MHA, GQA, MQA (FP8: MHA) | MHA, GQA, MQA | MHA, GQA, MQA | MHA only |
-| pack_gqa | No | Yes | No | No |
+| Dtype | bf16, fp16, Sage FP8, Sage INT8/FP8 | bf16, fp16, Sage FP8 | bf16, fp16 | bf16 and Sage FP8 (AOT or JIT) |
+| Head dim | 128 only | 64, 96, 128 (FP8: 128) | 64, 96, 128 | 128 only |
+| Attention | MHA, GQA, MQA (FP8: MHA) | MHA, GQA, MQA (FP8: MHA) | MHA, GQA, MQA | MHA only |
+| pack_gqa | No | Yes (BF16/FP16) | No | No |
 | Persistent scheduling | Static | Static + CLC dynamic | Static | Static + CLC dynamic |
 | Variable block counts (`q2k_block_nums`) | Yes (>= 1) | Yes (>= 0) | Yes (>= 0) | Yes (>= 0) |
-| KV split (`kv_splits`) | No | No | Explicit / auto | Explicit / auto |
-| LSE output | Yes | Yes | Yes | Yes |
+| KV split (`kv_splits`) | No | Explicit (FP8 only) | Explicit / auto | Explicit / auto |
+| LSE output | Yes | Yes (BF16/FP16) | Yes | Yes |
 
 **Backward backends:**
 
@@ -28,7 +28,8 @@
 
 Split-KV is supported by the SM90/SM100/SM103 blk64 forward paths. SM120 deliberately
 keeps `kv_splits=1`; explicit split counts are rejected so no FP32 partial
-workspace is allocated. The blk128 and backward paths do not support split-KV.
+workspace is allocated. FP8 blk128 supports explicit split-KV with a default of
+one; BF16/FP16 blk128 and the backward paths do not support split-KV.
 
 ## Directory Structure
 
@@ -49,8 +50,13 @@ BSA/
 ├── Makefile                       # Build & test automation
 │
 ├── csrc/fwd/
-│   ├── sm100_blk128/                 # blk128 — CuTe DSL / JIT compiled
-│   │   └── bsa_fwd_sm100.py          # Single-file Blackwell forward kernel
+│   ├── sm100_blk128/                 # blk128 — JIT and native FP8 AOT
+│   │   ├── bsa_fwd_sm100.py          # BF16/FP16 forward kernel
+│   │   ├── bsa_fwd_sm100_fp8.py      # FP8 transfer, scale and epilogue helpers
+│   │   ├── bsa_fwd_sm100_fp8_fused_pv.py # FP8 forward producer
+│   │   ├── aot_build.py              # FP8 producer/combine offline builder
+│   │   ├── aot_runtime.py            # Native loader and validation
+│   │   └── aot_utils.py              # FP8 variant and manifest metadata
 │   ├── sm90_blk64/                   # blk64 — SM90 CuTe DSL / AOT + JIT
 │   │   ├── bsa_fwd_sm90.py           # Hopper forward producer
 │   │   ├── aot_build.py              # Producer/combine offline builder
@@ -129,7 +135,8 @@ make setup
 ```
 
 The unified wheel and source distribution expose `bsa_attn_fwd`,
-`bsa_attn_bwd`, `bsa_fp8_blk64_fwd`, `bsa_sage_blk64_fwd`, and both Sage FP8
+`bsa_attn_bwd`, `bsa_fp8_fwd`, `bsa_fp8_blk64_fwd`, `bsa_fp8_blk128_fwd`,
+`bsa_sage_blk64_fwd`, and both Sage FP8
 and INT8/FP8 quantization helpers as public APIs.
 They contain all supported forward and backward CuTe DSL kernels, the Sage FP8
 quantization path, and shared Python utilities. They do not contain generated
@@ -253,7 +260,35 @@ BSA_TEST_SM100_AOT_RUNTIME=1 \
 python -m pytest tests/test_sm100_aot.py -q
 ```
 
-### Sage FP8 quantization
+### SM100/SM103 Sage FP8 blk128
+
+`bsa_fp8_blk128_fwd` follows the argument order and scale convention of
+`bsa_fp8_blk64_fwd`. Quantization takes contiguous BF16 BHSD tensors with
+`D=128` and MHA heads; attention returns one BF16 BHSD tensor.
+
+```python
+from block_sparse_attention import bsa_fp8_blk128_fwd, quantize_sage_bhsd
+
+q8, k8, v8, qs, ks, vs = quantize_sage_bhsd(q, k, v)
+out = bsa_fp8_blk128_fwd(
+    q8, k8, v8, qs, ks, vs, q2k_block_index, topk_num,
+    block_sizes=block_sizes,        # optional valid-token counts
+    q2k_block_nums=q2k_block_nums,  # optional per-row counts, including zero
+)
+```
+
+The generic `bsa_fp8_fwd` accepts the same arguments plus
+`sparse_block_size=64` (default) or `128`. Sparse maps must use the selected
+block size: blk128 has `ceil(Sq / 128)` query blocks and 128-token KV blocks.
+Changing the dispatch option does not convert a blk64 map. Scales remain Q
+per token, centered K per 16 tokens, and V per head/channel across batch and
+sequence for both block sizes.
+
+Blk128 supports positive dynamic B/H/S, physical sequence tails, odd or empty
+per-row counts, rank-1/2/3 `block_sizes`, and valid input/metadata views.
+Optional `kv_splits=1..256` uses FP32 partials and a native combine. The default
+is one; splitting has not improved the covered workloads. FP8 blk128 has no
+public LSE output or backward path, and is available only on SM100/SM103.
 
 The shared quantizer uses two or three Triton launches. With a compatible
 runtime and host C++ compiler, warmed calls allocate and launch through one
@@ -261,6 +296,22 @@ native host function. It caches launch plans, never input values or outputs.
 Unsupported runtimes use the regular Triton path; set `BSA_FP8_NATIVE_QUANT=0`
 before import to select it explicitly. Q/V rounding is preserved; the FP32 K
 reduction may move rare FP8 midpoint ties within the tested numerical limits.
+
+Build native blk128 producers and split combines for both targets:
+
+```bash
+make aot-fp8-blk128 FP8_BLK128_AOT_DIR=/shared/bsa-fp8-blk128-aot
+export BSA_FP8_BLK128_AOT_DIR=/shared/bsa-fp8-blk128-aot
+export BSA_FP8_BLK128_AOT_ONLY=1
+```
+
+Strict attention calls never invoke `cute.compile`, including with a populated
+JIT cache. The global `BSA_SM100_AOT_ONLY=1` also makes blk128 strict; blk64 and
+blk128 use their respective artifact directories. Quantization remains a
+separate Triton path. Artifacts must match the source, target, host, DSL and
+CUDA versions. See [the blk128 contract and validation](design/fp8/blk128.md)
+for variant selection, validation commands and measured performance limits.
+B200 long-sequence speed remains under optimization.
 
 ### SM90 CuTe DSL AOT
 
@@ -483,8 +534,7 @@ contracts are identical for AOT and JIT. On SM120, pass optional
 `[B, H, N]` keyword arguments to select the corresponding sparse metadata
 variant. When `q2k_block_nums` is present, the scalar `topk_num` is ignored.
 
-The all-FP8 feature contracts are now aligned except where the hardware path is
-intentionally different:
+The following table compares the **blk64** all-FP8 feature contracts:
 
 | Sage FP8 feature | SM100/SM103 | SM120 |
 |---|---|---|

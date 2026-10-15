@@ -1,5 +1,7 @@
 include bsa_attn_interface.py
+include bsa_fp8.py
 include bsa_fp8_blk64.py
+include bsa_fp8_blk128.py
 include bsa_fp8_quant.py
 include bsa_sage_blk64.py
 include bsa_sage_quant.py

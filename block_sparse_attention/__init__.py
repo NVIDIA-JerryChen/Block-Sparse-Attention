@@ -21,6 +21,8 @@ __all__ = [
     "bsa_attn_bwd",
     "bsa_attn_fwd",
     "bsa_fp8_blk64_fwd",
+    "bsa_fp8_blk128_fwd",
+    "bsa_fp8_fwd",
     "bsa_sage_blk64_fwd",
     "quantize_sage_bhsd",
     "quantize_sage_kv_sm120",
@@ -40,8 +42,10 @@ def __getattr__(name: str):
     quantization = import_module(".bsa_fp8_quant", __name__)
     sage_quantization = import_module(".bsa_sage_quant", __name__)
     sage_attention = import_module(".bsa_sage_blk64", __name__)
+    import_module(".bsa_fp8", __name__)
     import_module(".bsa_fp8_blk64", __name__)
-    for api_name in ("bsa_attn_bwd", "bsa_attn_fwd", "bsa_fp8_blk64_fwd"):
+    import_module(".bsa_fp8_blk128", __name__)
+    for api_name in ("bsa_attn_bwd", "bsa_attn_fwd", "bsa_fp8_blk64_fwd", "bsa_fp8_blk128_fwd", "bsa_fp8_fwd"):
         globals()[api_name] = getattr(interface, api_name)
     globals()["quantize_sage_bhsd"] = quantization.quantize_sage_bhsd
     globals()["bsa_sage_blk64_fwd"] = sage_attention.bsa_sage_blk64_fwd
