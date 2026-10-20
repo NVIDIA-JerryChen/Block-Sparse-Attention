@@ -1,5 +1,71 @@
 # SM100 blk64 Sage FP8 最终验证结果
 
+## 2026-10-20：blk64 softmax 推迟等待统计量槽位
+
+起因是客户在 4×B200、Ulysses=4 的视频生成流程中观察到 FP8 慢于 BF16。
+按客户单卡形状 `B=1,H=14,S=39756,D=128`、blk64 top-k 160 单独复测，FP8 本身
+并不慢：B200 上 BF16 blk64 3.00 ms，FP8 含新鲜量化 2.69 ms；FP8 wrapper 每次
+调用的 host 入队约 30–60 µs，没有隐藏的 host 同步。客户端到端变慢需要结合其
+集成代码和 attention 内部算子拆分再查。
+
+### 改动
+
+原实现中 softmax 每个 step 末尾都等 correction 读走上一份 `acc_scale` 才进入
+下一步；NCU 采样里这两个等待点约占全部 warp 采样的 15%。现在改到下一步算完
+row max、真正要写 `sScale` 之前再等，最后一步之后的等待移到写最终 row sum/max
+之前，与 blk128 已有做法一致。每个 tile 的等待次数、先后顺序和 named barrier
+arrive 次数都不变；只改同步时机，不改数值。BF16 blk64 共用这段代码。
+
+### 性能
+
+同一进程内先编译预热，CUDA event 每轮 30–40 次取中位数；`f953680` 与新树交替
+运行两轮。时钟未锁定。
+
+| GPU | 路径 | 形状 `B,H,S,top-k` | `f953680` ms | 本次 ms | 变化 |
+|---|---|---|---:|---:|---:|
+| B200 | FP8 blk64 | 1,14,39756,160（客户） | 2.4365 | 2.3708 | -2.7% |
+| B200 | BF16 blk64 | 1,14,39756,160（客户） | 3.1391 | 3.0214 | -3.8% |
+| B300 | FP8 blk64 | 1,14,39756,160（客户） | 2.1504 | 2.0777 | -3.4% |
+| B300 | BF16 blk64 | 1,14,39756,160（客户） | 2.8606 | 2.8258 | -1.2%（两轮 -2.8%/+0.3%，噪声内） |
+| B200 | FP8 blk64 | 1,8,16384,64 | 0.2769 | 0.2701 | -2.5% |
+| B200 | FP8 blk64 | 1,24,8192,32 | 0.2605 | 0.2585 | -0.8% |
+| B200 | FP8 blk64 | 1,4,216832,342 | 7.8621 | 7.6554 | -2.6% |
+
+`B=2,H=6,S=4096,top-k=8` 单次调用约 45 µs，低于 CUDA event 的可靠分辨率；
+nsys 统计 604 次 kernel，B200 平均 36.90→36.34 µs（-1.5%）。
+
+### 正确性与稳定性验证（B200 与 B300 各一遍）
+
+- **逐位一致**：10 个形状（含客户形状、Q/KV 尾块、top-k=1/2/奇数、B>1）×
+  普通/大动态范围数据 × `block_sizes` 无/rank-1/rank-3 × top-k 固定/变长/含 0，
+  FP8 与 BF16（CLC 开关、split 1/2）共 857 个用例，新旧输出逐位一致；
+  每例重复 3–5 次结果一致，无 NaN/Inf。
+- **FP8 精度**：与 FP32 精确参考（反量化输入、相同稀疏索引）相比相对平均误差
+  ≤2.3%，满足 <2.9% 合同。
+- **compute-sanitizer**：racecheck、memcheck 新旧均 0 错误。synccheck 在
+  `q2k_block_nums` 变体上新旧都报 correction warp 的 "Divergent thread(s) in
+  block"（固定 top-k 变体干净），属于既有问题，与本改动无关。
+- **AOT**：重建精简 blk64 bundle（BF16 split 1/2、FP8 split 1/4、
+  `block_sizes` 0/1/3）后官方 AOT 测试 B200 34 passed、B300 35 passed，0 failed；
+  AOT-only 模式下 35 个用例与 JIT 输出逐位一致。
+- **测试套件**：FP8 相关 B200 257 passed、B300 258 passed；
+  `tests/test_flash_fwd.py -k sm100` 两卡均 186 passed；均 0 failed。
+
+### 验证中发现的既有问题（`f953680` 同样存在，本次未修改）
+
+1. BF16 blk64 在客户形状、大动态范围数据、`kv_splits=2`、无 `block_sizes`
+   的调用上，按特定调用历史可稳定卡死（GPU 100%、停在 synchronize），单独
+   调用不复现。
+2. BF16 blk64 在 KV 长度不是 64 的倍数且 B×H>1 时结果错误或出现 NaN
+   （即使传了 `block_sizes`）；对齐长度正常。FP8 路径不受影响。
+3. 上述 synccheck 报告。
+4. 曾试验的 blk128 配置组合（SM100 用 SM103 的缓冲开关，或 SM103 用 16 列
+   correction/epilogue tile）会算错；生产配置不受影响。
+
+源码指纹变化，现有 blk64 AOT bundle 需要重新构建；blk128 未改动。环境：
+`nvcr.io/nvidia/pytorch:26.05-py3`（Torch `2.12.0a0+5aff3928d8.nv26.05`、
+CUDA 13.2）、CUTLASS DSL 4.5.2、apache-tvm-ffi 0.1.14.post1。
+
 ## 2026-09-09：SM100/SM103 Sage FP8 AOT
 
 SM100 和 SM103 的 Sage FP8 forward 现已接入现有 CuTe native AOT artifact

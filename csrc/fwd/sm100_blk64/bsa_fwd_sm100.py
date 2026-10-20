@@ -2031,6 +2031,9 @@ class BlockSparseAttnForwardSm100Blk64:
                         sm_stats_bar_index=sm_stats_bar_index,
                     )
 
+                # The final statistics reuse the scale slot consumed after the last step.
+                pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
+                sm_stats_producer_phase ^= 1
                 sScale[tidx + stage * self.stats_stride] = softmax.row_sum[0]
                 if const_expr(mLSE is not None or self.q_stage == 1):
                     sScale[tidx + stage * self.stats_stride + self.s_stage * self.stats_stride] = softmax.row_max[0]
@@ -2385,6 +2388,13 @@ class BlockSparseAttnForwardSm100Blk64:
                 )
 
         if const_expr(not is_first):
+            # Wait for correction to consume the previous scale only now, after
+            # this step's score load and row-max reduction have overlapped it.
+            bsa_fwd_helpers.mbar_wait(
+                Int32(pipeline_sm_stats.sync_object_empty.get_barrier(stage).toint()),
+                sm_stats_producer_phase,
+            )
+            sm_stats_producer_phase ^= 1
             sScale[tidx + stage * self.stats_stride] = acc_scale
         # Notify correction wg that row_max is ready
         sm_stats_barrier.arrive_w_index(index=sm_stats_bar_index)
@@ -2495,11 +2505,7 @@ class BlockSparseAttnForwardSm100Blk64:
         sum2 = cute.arch.add_packed_f32x2(sum2, sum3)
         sum0 = cute.arch.add_packed_f32x2(sum0, sum2)
         softmax.row_sum[0] = sum0[0] + sum0[1]
-        bsa_fwd_helpers.mbar_wait(
-            Int32(pipeline_sm_stats.sync_object_empty.get_barrier(stage).toint()),
-            sm_stats_producer_phase,
-        )
-        return mma_si_consumer_phase ^ 1, sm_stats_producer_phase ^ 1
+        return mma_si_consumer_phase ^ 1, sm_stats_producer_phase
 
     @cute.jit
     def correction_loop(
