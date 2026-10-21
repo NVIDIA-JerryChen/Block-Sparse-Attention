@@ -13,6 +13,26 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _isolated_environment(install_dir: Path | None = None) -> dict:
+    """Keep external dependencies without exposing a source checkout."""
+    env = os.environ.copy()
+    paths = [str(install_dir)] if install_dir is not None else []
+    for value in env.get("PYTHONPATH", "").split(os.pathsep):
+        if not value:
+            continue
+        path = Path(value).resolve()
+        if (path == REPO_ROOT or REPO_ROOT in path.parents
+                or (path / "bsa_attn_interface.py").is_file()
+                or (path / "block_sparse_attention" / "__init__.py").is_file()):
+            continue
+        paths.append(str(path))
+    if paths:
+        env["PYTHONPATH"] = os.pathsep.join(paths)
+    else:
+        env.pop("PYTHONPATH", None)
+    return env
+
+
 def _run(command: list[str], **kwargs) -> subprocess.CompletedProcess:
     completed = subprocess.run(
         command,
@@ -43,7 +63,9 @@ def packaging_source(tmp_path_factory: pytest.TempPathFactory) -> Path:
         "MANIFEST.in",
         "README.md",
         "bsa_attn_interface.py",
+        "bsa_fp8.py",
         "bsa_fp8_blk64.py",
+        "bsa_fp8_blk128.py",
         "bsa_fp8_quant.py",
         "bsa_sage_blk64.py",
         "bsa_sage_quant.py",
@@ -120,7 +142,9 @@ def built_sdist(
 
 def test_source_tree_keeps_existing_layout() -> None:
     assert (REPO_ROOT / "bsa_attn_interface.py").is_file()
+    assert (REPO_ROOT / "bsa_fp8.py").is_file()
     assert (REPO_ROOT / "bsa_fp8_blk64.py").is_file()
+    assert (REPO_ROOT / "bsa_fp8_blk128.py").is_file()
     assert (REPO_ROOT / "bsa_fp8_quant.py").is_file()
     assert (REPO_ROOT / "bsa_sage_blk64.py").is_file()
     assert (REPO_ROOT / "bsa_sage_quant.py").is_file()
@@ -143,7 +167,9 @@ def test_wheel_contains_single_import_package(built_wheel: Path) -> None:
     assert {
         "block_sparse_attention/__init__.py",
         "block_sparse_attention/bsa_attn_interface.py",
+        "block_sparse_attention/bsa_fp8.py",
         "block_sparse_attention/bsa_fp8_blk64.py",
+        "block_sparse_attention/bsa_fp8_blk128.py",
         "block_sparse_attention/bsa_fp8_quant.py",
         "block_sparse_attention/bsa_sage_blk64.py",
         "block_sparse_attention/bsa_sage_quant.py",
@@ -152,6 +178,12 @@ def test_wheel_contains_single_import_package(built_wheel: Path) -> None:
         "block_sparse_attention/csrc/fwd/sm90_blk64/aot_utils.py",
         "block_sparse_attention/csrc/fwd/sm120_blk64/quant_aot_runtime.py",
         "block_sparse_attention/csrc/fwd/sm100_blk64/bsa_fwd_sm100.py",
+        "block_sparse_attention/csrc/fwd/sm100_blk128/bsa_fwd_sm100_fp8.py",
+        "block_sparse_attention/csrc/fwd/sm100_blk128/bsa_fwd_sm100_fp8_fused_pv.py",
+        "block_sparse_attention/csrc/fwd/sm100_blk128/aot_build.py",
+        "block_sparse_attention/csrc/fwd/sm100_blk128/aot_runtime.py",
+        "block_sparse_attention/csrc/fwd/sm100_blk128/aot_utils.py",
+        "block_sparse_attention/csrc/fp8_quant_runtime.py",
         "block_sparse_attention/utils/cache_utils.py",
     } <= names
     assert "bsa_attn_interface.py" not in names
@@ -179,7 +211,9 @@ def test_sdist_contains_mapped_sources(built_sdist: Path) -> None:
     assert {
         "block_sparse_attention/__init__.py",
         "bsa_attn_interface.py",
+        "bsa_fp8.py",
         "bsa_fp8_blk64.py",
+        "bsa_fp8_blk128.py",
         "bsa_fp8_quant.py",
         "bsa_sage_blk64.py",
         "bsa_sage_quant.py",
@@ -188,6 +222,12 @@ def test_sdist_contains_mapped_sources(built_sdist: Path) -> None:
         "csrc/fwd/sm90_blk64/aot_utils.py",
         "csrc/fwd/sm120_blk64/quant_aot_runtime.py",
         "csrc/fwd/sm100_blk64/bsa_fwd_sm100.py",
+        "csrc/fwd/sm100_blk128/bsa_fwd_sm100_fp8.py",
+        "csrc/fwd/sm100_blk128/bsa_fwd_sm100_fp8_fused_pv.py",
+        "csrc/fwd/sm100_blk128/aot_build.py",
+        "csrc/fwd/sm100_blk128/aot_runtime.py",
+        "csrc/fwd/sm100_blk128/aot_utils.py",
+        "csrc/fp8_quant_runtime.py",
         "setup.py",
         "utils/cache_utils.py",
     } <= names
@@ -224,6 +264,8 @@ from block_sparse_attention import (
     bsa_attn_bwd,
     bsa_attn_fwd,
     bsa_fp8_blk64_fwd,
+    bsa_fp8_blk128_fwd,
+    bsa_fp8_fwd,
     bsa_sage_blk64_fwd,
     quantize_sage_bhsd,
     quantize_sage_kv_sm120,
@@ -231,6 +273,8 @@ from block_sparse_attention import (
     quantize_sage_qkv_sm120,
     sage_sm120_kv_quant_workspace_size,
 )
+from block_sparse_attention.bsa_fp8 import bsa_fp8_fwd as module_bsa_fp8_fwd
+from block_sparse_attention.bsa_fp8_blk128 import bsa_fp8_blk128_fwd as module_bsa_fp8_blk128_fwd
 from block_sparse_attention.bsa_fp8_blk64 import (
     bsa_fp8_blk64_fwd as module_bsa_fp8_blk64_fwd,
 )
@@ -240,12 +284,17 @@ from block_sparse_attention.csrc.fwd.sm90_blk64.aot_utils import (
 from block_sparse_attention.csrc.fwd.sm120_blk64.aot_utils import (
     compute_sm120_aot_source_fingerprint,
 )
+from block_sparse_attention.csrc.fwd.sm100_blk128.aot_utils import (
+    source_fingerprint as fp8_blk128_fingerprint,
+)
 from block_sparse_attention.utils.cache_utils import _compute_source_fingerprint
 
 public_apis = {
     "bsa_attn_bwd": bsa_attn_bwd,
     "bsa_attn_fwd": bsa_attn_fwd,
     "bsa_fp8_blk64_fwd": bsa_fp8_blk64_fwd,
+    "bsa_fp8_blk128_fwd": bsa_fp8_blk128_fwd,
+    "bsa_fp8_fwd": bsa_fp8_fwd,
     "bsa_sage_blk64_fwd": bsa_sage_blk64_fwd,
     "quantize_sage_bhsd": quantize_sage_bhsd,
     "quantize_sage_kv_sm120": quantize_sage_kv_sm120,
@@ -257,10 +306,12 @@ assert set(block_sparse_attention.__all__) == set(public_apis)
 assert len(block_sparse_attention.__dir__()) == len(set(block_sparse_attention.__dir__()))
 for name, api in public_apis.items():
     assert callable(api)
-for name in ("bsa_attn_bwd", "bsa_attn_fwd", "bsa_fp8_blk64_fwd"):
+for name in ("bsa_attn_bwd", "bsa_attn_fwd", "bsa_fp8_blk64_fwd", "bsa_fp8_blk128_fwd", "bsa_fp8_fwd"):
     api = public_apis[name]
     assert api is getattr(interface, name)
 assert module_bsa_fp8_blk64_fwd is bsa_fp8_blk64_fwd
+assert module_bsa_fp8_blk128_fwd is bsa_fp8_blk128_fwd
+assert module_bsa_fp8_fwd is bsa_fp8_fwd
 for old_name in ("bsa_attn_fwd_blk64", "bsa_attn_fwd_blk64_cutedsl"):
     assert old_name not in block_sparse_attention.__all__
     assert not hasattr(block_sparse_attention, old_name)
@@ -279,6 +330,8 @@ for module_name in (
 install_dir = Path(os.environ["BSA_TEST_INSTALL_DIR"]).resolve()
 package_file = Path(block_sparse_attention.__file__).resolve()
 assert len(_compute_source_fingerprint()) == 64
+assert len(fp8_blk128_fingerprint()) == 64
+assert fp8_blk128_fingerprint(package_file.parent) == fp8_blk128_fingerprint()
 aot_fingerprint = compute_sm120_aot_source_fingerprint()
 assert len(aot_fingerprint) == 64
 assert compute_sm120_aot_source_fingerprint(package_file.parent) == aot_fingerprint
@@ -290,8 +343,7 @@ assert (
     == sm90_aot_fingerprint
 )
 """
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(install_dir)
+    env = _isolated_environment(install_dir)
     env["BSA_TEST_INSTALL_DIR"] = str(install_dir)
     _run(
         [sys.executable, "-c", smoke_test],
@@ -342,6 +394,8 @@ from block_sparse_attention import (
     bsa_attn_bwd,
     bsa_attn_fwd,
     bsa_fp8_blk64_fwd,
+    bsa_fp8_blk128_fwd,
+    bsa_fp8_fwd,
     bsa_sage_blk64_fwd,
     quantize_sage_bhsd,
     quantize_sage_kv_sm120,
@@ -349,6 +403,8 @@ from block_sparse_attention import (
     quantize_sage_qkv_sm120,
     sage_sm120_kv_quant_workspace_size,
 )
+from block_sparse_attention.bsa_fp8 import bsa_fp8_fwd as module_bsa_fp8_fwd
+from block_sparse_attention.bsa_fp8_blk128 import bsa_fp8_blk128_fwd as module_bsa_fp8_blk128_fwd
 from block_sparse_attention.bsa_fp8_blk64 import (
     bsa_fp8_blk64_fwd as module_bsa_fp8_blk64_fwd,
 )
@@ -360,6 +416,8 @@ for api in (
     bsa_attn_bwd,
     bsa_attn_fwd,
     bsa_fp8_blk64_fwd,
+    bsa_fp8_blk128_fwd,
+    bsa_fp8_fwd,
     bsa_sage_blk64_fwd,
     quantize_sage_bhsd,
     quantize_sage_kv_sm120,
@@ -369,10 +427,14 @@ for api in (
 ):
     assert callable(api)
 assert module_bsa_fp8_blk64_fwd is bsa_fp8_blk64_fwd
+assert module_bsa_fp8_blk128_fwd is bsa_fp8_blk128_fwd
+assert module_bsa_fp8_fwd is bsa_fp8_fwd
 assert set(block_sparse_attention.__all__) == {
     "bsa_attn_bwd",
     "bsa_attn_fwd",
+    "bsa_fp8_fwd",
     "bsa_fp8_blk64_fwd",
+    "bsa_fp8_blk128_fwd",
     "bsa_sage_blk64_fwd",
     "quantize_sage_bhsd",
     "quantize_sage_kv_sm120",
@@ -393,10 +455,9 @@ assert source_dir / "csrc" in Path(sm90_aot_utils.__file__).resolve().parents
 assert source_dir / "csrc" in Path(sm120_aot_utils.__file__).resolve().parents
 assert source_dir / "utils" in Path(cache_utils.__file__).resolve().parents
 """
-    env = os.environ.copy()
+    env = _isolated_environment()
     env["BSA_TEST_INSTALL_DIR"] = str(install_dir)
     env["BSA_TEST_SOURCE_DIR"] = str(packaging_source)
-    env.pop("PYTHONPATH", None)
     _run(
         [sys.executable, "-c", smoke_test],
         cwd=outside_repo,

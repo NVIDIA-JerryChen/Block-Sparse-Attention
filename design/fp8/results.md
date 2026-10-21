@@ -1,10 +1,444 @@
-# SM100 blk64 Sage FP8 最终验证结果
+# SM100/SM103 FP8 验证结果
 
-## 结论
+## 2026-10-21：两处同步修复的完整复测
 
-当前实现支持固定长度、前向、BHSD 布局的 Sage FP8 block-sparse
-attention：`B=1`、`H=4/8`、`D=128`、`64x64` 稀疏块、uniform top-k，
-输出为 BF16。
+复测内核固定为 `86e40ad`，修复前基线为 `c514e9a`。两处正向修复的专项检查
+通过，但扩大检查后确认 **BF16 反向 blk64 和 blk128 仍有原有的同步错误**。
+因此本次结果不能解释为整个项目已经没有 bug；本轮没有修改反向内核。
+性能方面，B200 的波动项复测通过；SM103 测试设备确认发生热降频，稳定性未通过。
+
+环境：PyTorch 26.05 / CUDA 13.2、CUTLASS DSL 4.5.2、apache-tvm-ffi
+0.1.14.post1、Compute Sanitizer 2026.1.1。SM100 使用 B200；SM103 使用
+GB110 bring-up board（运行时 capability=(10,3)），不能将其绝对耗时当作 B300 数据。
+
+### 正确性与预编译验证
+
+| 检查 | B200 / SM100 | GB110 / SM103 |
+|---|---|---|
+| 两处修复的数值回归 | 18 passed | 18 passed |
+| 同一组用例的 synccheck | 18 passed，0 errors | 18 passed，0 errors |
+| 同一组用例的 memcheck | 18 passed，0 errors | 18 passed，0 errors |
+| 尾块、多 batch/head、动态 metadata 的 memcheck | 37 passed，0 errors | 37 passed，0 errors |
+| 原始完整 pytest 回归 | 588 passed，2 failed，425 skipped | 589 passed，2 failed，424 skipped |
+| 修正旧兼容性测试后，相关测试重跑 | 11 passed | 11 passed |
+| 重新生成 blk64 AOT 后的测试 | 15 passed，3 skipped | 16 passed，2 skipped |
+| 重新生成 blk128 AOT 后的测试 | 46 passed | 46 passed |
+| blk128 AOT 专项 synccheck | 2 passed，0 errors | 2 passed，0 errors |
+
+完整回归的两个失败均来自 `tests/test_cutedsl_compat.py` 的旧预期：4.6.2 以后的
+bulk-copy election 策略，以及 DSL 对静态 dataclass 字段的省略方式。相同失败在
+`c514e9a` 上也存在；测试修正提交为 `5d11217`，没有改动内核。表中保留原始
+完整运行的失败数；修正后只重跑受影响的 11 项，并未将它们冒充为第二次全量运行。
+跳过项包括其他架构、当前不支持的 GQA/head dimension、双 GPU、可选量化依赖
+和未开启的构建集成检查；AOT 运行检查已在后续独立启用。
+
+旧版 blk64 首个用例触发 synccheck 后会破坏当前 CUDA context，因此另开进程检查
+旧版 FP8 blk128。B200 的旧 blk64 / blk128 分别报告 224 / 416 errors，SM103
+分别为 192 / 640 errors；对应修复版均为 0。错误条数受运行调度影响，不用于
+比较问题严重程度。AOT 均重新生成，blk128 覆盖 variable counts 开/关、四种
+block-sizes 形式与 split=1/2/4/8，共 32 个 producer 变体。
+
+### 扩大检查发现的反向旧问题
+
+两个反向用例分别在独立进程中运行，避免首个错误影响第二个用例。初次检查还
+遇到工具无法跟踪 PyTorch reference 的 cuBLAS `nvjet_` kernel；重新运行时只
+排除这些 reference kernel，BSA kernel 仍完整接受检查，且工具内部错误数为 0。
+
+| 独立 synccheck | B200：旧版 / 修复版 | SM103：旧版 / 修复版 |
+|---|---|---|
+| BF16 backward blk64 | 2528 / 3040 errors | 2976 / 1760 errors |
+| BF16 backward blk128 | 672 / 736 errors | 576 / 480 errors |
+
+报错均为 BSA 反向 kernel 内的 `Divergent thread(s) in block`，旧版与修复版
+均包含相同的 kernel 指令偏移（blk64 `+0xa110`，blk128 `+0xa2a0`）；
+SM103 的部分运行还报告其他同步点。
+两次正向修复没有改动 `csrc/bwd/`。普通梯度数值回归通过不能排除这些同步错误。
+
+```bash
+compute-sanitizer --tool synccheck --error-exitcode=86 \
+  --kernel-name-exclude kns=nvjet_ python -m pytest -v \
+  'tests/test_flash_bwd.py::test_flash_bwd_blk64_sparse[64-256-False]'
+compute-sanitizer --tool synccheck --error-exitcode=86 \
+  --kernel-name-exclude kns=nvjet_ python -m pytest -v \
+  'tests/test_flash_bwd.py::test_flash_bwd_sm100_blk128_topk_correctness[256-512-2-True]'
+```
+
+### 性能与证据
+
+每次 A/B 对比在同一 GPU 上交替运行旧版和修复版，完整矩阵各 4 轮；编译、
+参考校验与预热均在计时外。覆盖 BF16 blk64、FP8
+blk64/blk128，以及量化加 FP8 的 GPU 总耗时，另记录 Python eager 调用耗时。
+9 组输入包括短输入、动态 metadata、blk128 split=4、39756-token 客户形状，
+以及 119040 / 349440 / 695040-token 长输入。blk64 FP8 公开接口保留自动 split
+策略，显式 split=4 只传给 blk128。
+
+B200 的 9 组已完成，每组均通过采样 FP32 reference、全输出 finite、重复输出
+一致性及 A/B 输入摘要匹配。下表是 9 组 GPU 耗时比值的几何平均，正数表示修复版
+更慢。量化加计算采用 CUDA Graph，包含量化的 GPU 工作，不包括 Python 调度。
+
+| 路径 | B200 修复版相对旧版 |
+|---|---:|
+| BF16 blk64 | -0.73% |
+| FP8 blk64 | -0.20% |
+| FP8 blk128 | +0.90% |
+| 量化 + FP8 blk64 | +0.00% |
+| 量化 + FP8 blk128 | +1.22% |
+
+首次 B200 矩阵中，39756-token 与 119040-token/H=4 两组出现 10% 以上的轮间波动，
+个别量化加计算耗时比旧版高 6.49%。保留这些原始数据，并在另一张 B200 上将
+每个路径的持续预热延长至 500ms，交替运行各 8 轮（作业 `2331121`）。复测中
+10 个 GPU 指标的最大轮间跨度为 2.00%，修复版相对旧版的最大增幅为 0.65%，
+未复现原来的退化。轮间跨度定义为 `(max(各轮中位数)-min(各轮中位数))/中位数`。
+换卡和延长预热同时发生，不能仅据此断言最初波动只由预热不足造成。
+
+SM103 初次性能设备 `2u2g-gen-0468` 在持续负载下达到 87℃，SM 时钟下降到
+数百 MHz；旧版和修复版均出现明显波动。该轮在最终长输入计时中停止，保留原始
+结果作为环境异常记录，不作为性能稳定的证明。完整矩阵已转移至 B300 PCIe
+分区的 `2u2g-gen-0149`（作业 `5180997`），并对每个路径持续预热 500ms；
+运行时设备名仍为 `NVIDIA Graphics Device`，capability=(10,3)，因此本报告
+按 SM103 设备记录，分区标签不作为具体产品规格的证明。
+
+新节点的 9 组输入、每版各 4 轮已全部跑完，数值检查通过。各路径的 GPU 耗时
+几何平均变化如下；这些是在变频条件下取得的原始观测，不能用于证明稳定性。
+
+| 路径 | SM103 修复版相对旧版 |
+|---|---:|
+| BF16 blk64 | +0.06% |
+| FP8 blk64 | -0.10% |
+| FP8 blk128 | +0.40% |
+| 量化 + FP8 blk64 | +0.04% |
+| 量化 + FP8 blk128 | -0.63% |
+
+虽然没有观察到一致的平均性能退化，119040-token/H=4 的修复版仍有
+10.73%～19.05% 的轮间跨度，695040-token/H=8 的 FP8 blk128 为 12.54%。
+新节点最高 89℃，繁忙时最低采样 SM 时钟为 682MHz；现场额外查询确认
+`clocks_event_reasons.sw_thermal_slowdown=Active`，当时为 88℃、885MHz，
+power-cap slowdown 未激活。故 **SM103 的整体性能稳定性本轮不予确认**。
+需要散热与频率稳定的设备才能继续作稳定性判断；此次没有更改机器的功耗、
+时钟或散热设置。
+
+完整数值回归作业：B200 `2330834`、SM103 `5179562`；补充检查及 AOT 作业：
+B200 `2330990`、SM103 `5180217`。首次性能脚本误把显式 split 参数传入 blk64
+公开接口，已修正；完整性能重新安排为 B200 `2331063`、SM103 `5180550`，
+此前的局部计时不作为完整性能结论。
+本轮申请的作业均已退出，GPU 已释放。最终验收记录为
+`agent/agent_profiles/full-retest-20261021/acceptance.json`，明确保留整体未通过状态。
+
+原始日志、JUnit XML、环境、GPU telemetry 与分阶段返回码保存在
+`agent/agent_profiles/full-retest-20261021/`；固定源码归档及 SHA256 在
+`agent/agent_space/full-retest-20261021/manifest.json`，性能脚本在
+`agent/agent_benchmark/full-retest-20261021/benchmark.py`，持续预热复测脚本为
+同目录的 `benchmark_stability.py`；三个最终性能数据集另导出了 CSV。
+测试期间另修复了 `tools/ssh-gw` 在 cluster scratch 为空时忽略显式 workdir 的
+作业文件路径问题（独立工具提交 `5cc9ae4`，69 项测试通过，CPU 作业验证成功）。
+
+## 2026-10-21：blk128 warp 子集同步修复（cuDNN PR #1752 P1）
+
+[cuDNN review](https://github.com/NVIDIA/cudnn-frontend/pull/1752#pullrequestreview-5594779337)
+指出的 P1 同样存在于本仓库 FP8 blk128 路径。TMEM 的 416 个线程、S-read 的
+160 个线程，以及统计量交接中的 64/256 个线程从不同 warp 分支到达同步点，
+原 `bar.sync` / `bar.arrive` 的 aligned 约束不成立。
+
+修复覆盖 TMEM 分配和释放、S-read、统计量和 terminal handoff，以及 inline
+row-max publication。使用已有 blk64 unaligned helpers，保留 barrier ID、线程数
+与调用顺序；全 CTA 的初始化 barrier 保持原实现。直接调用 TMEM barrier，避免
+`TmemAllocator.wait_for_alloc()` 重新构造 aligned barrier。
+
+基线为 `b1e4cc9`。环境为 PyTorch 26.05（CUDA 13.2）、CUTLASS DSL 4.5.2、
+apache-tvm-ffi 0.1.14.post1、Compute Sanitizer 2026.1.1。
+
+| 设备 | 基线 synccheck（split=1） | 修复后 synccheck | 修复后 memcheck | 原有回归 |
+|---|---|---|---|---|
+| B200 / SM100 | 704 errors，含 divergent barrier | 2 passed，0 errors | 2 passed，0 errors | 22 passed |
+| GB110 开发板 / SM103 | 320 errors，含 divergent barrier | 2 passed，0 errors | 2 passed，0 errors | 22 passed |
+
+B200 作业为 `5175441`（`umbriel-b200-068`）；SM103 作业为 `5175669`
+（`2u2g-gen-0471`）。后者设备名为 NVIDIA Graphics Device，运行时确认
+capability=(10,3)，为 GB110 bring-up board。原计划 B300 作业因资源排队取消。
+
+新增 `tests/test_sm100_blk128_sync.py` 以 split=1/4 覆盖 CUDA Graph 和缓存重用，
+并在重放之间切换动态 block counts。输入包含空行、零长度块、Q/KV 尾块、pipeline
+环绕和无效闲置索引；结果对照 FP32 reference。旧版在同一输入上触发 synccheck，
+说明单看数值测试不足以发现该问题。
+
+原有 22 项测试覆盖不传及 rank-1/2/3 `block_sizes`、online rescaling、空块、
+scale views、独立 stream/graph，以及 split=2/3/4/8。本次验证 JIT 路径，已有
+blk128 AOT bundle 需重新生成。
+
+```bash
+compute-sanitizer --tool synccheck --error-exitcode=1 \
+  python -m pytest -q tests/test_sm100_blk128_sync.py
+compute-sanitizer --tool memcheck --error-exitcode=1 \
+  python -m pytest -q tests/test_sm100_blk128_sync.py
+```
+
+## 2026-10-21：blk64 warp 分工下的同步检查修复
+
+### 原因与修改
+
+TMEM 分配/释放和 softmax 统计量交换只同步指定的 warp，但原实现调用的是
+CTA-aligned named barrier（`bar.sync` / `bar.arrive`）。这些指令要求参与者的
+控制流满足 aligned 约束，不能用于这里分开的 warp 执行路径。改为
+`barrier.sync` / `barrier.arrive`（CUTLASS 的 unaligned API），保留原 barrier
+编号、参与线程数和调用次序。这里的 unaligned 指控制流，不是内存地址对齐。
+
+另一个问题在输出合并：某些行的 softmax 权重下溢为 0 时，原来的逐行判断会让
+部分 lane 跳过整 warp 必须共同执行的 TMEM load。现在由 warp 投票决定是否读取，
+再将零权重行写为 0；整 warp 都为空时仍跳过未初始化的 TMEM。
+
+同步约束依据：[PTX named barrier 文档](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-bar)。
+
+### 已完成的验证
+
+基线为 `c514e9a`，环境为 PyTorch 26.05（CUDA 13.2）、CUTLASS DSL 4.5.2、
+apache-tvm-ffi 0.1.14.post1；Compute Sanitizer 2026.1.1。
+
+- **最小复现（B300）**：不含 attention 的 416-thread named barrier 例子，aligned
+  指令在复用和不复用 barrier 两种情况下都触发 synccheck；仅改为 unaligned
+  指令后，两种情况均为 0 错误。
+- **B300 原问题复现**：旧内核在动态候选数、含空块和极端权重输入上触发
+  `Divergent thread(s) in block`；修复后同样输入输出校验通过，synccheck 0 错误。
+- **新增 16 例回归（B300）**：FP8/BF16 × split 1/2 × CLC 开/关 × Q 长度 65/128。
+  同时覆盖逐行权重下溢、候选数为 0、奇数候选数、部分 KV 块和 Q 尾块；
+  检查 O、LSE 以及空行的 O=0、LSE=-inf。synccheck 和 memcheck 各 16 passed，
+  均 0 错误；混合候选数用例 racecheck 为 0 errors / 0 warnings。
+- **B300 原有测试**：FP8 forward/quant、编译缓存键和 AOT dispatch 共 146 passed、
+  16 skipped；`tests/test_flash_fwd.py -k sm100` 为 190 passed、294 skipped、
+  12 deselected。无失败。
+- **B200（SM100）针对性复查**：同一组新增 16 例全部通过，O/LSE 校验通过，
+  synccheck 为 0 错误；覆盖 FP8/BF16、split 1/2、CLC 开关和 Q 尾块。
+  作业 `5175059`，相同软件版本；此处没有重复 B300 的完整旧测试套件。
+
+复现回归：
+
+```bash
+compute-sanitizer --tool synccheck --error-exitcode=1 \
+  python -m pytest -q tests/test_sm100_blk64_sync.py
+compute-sanitizer --tool memcheck --error-exitcode=1 \
+  python -m pytest -q tests/test_sm100_blk64_sync.py
+```
+
+源码指纹变化，已有 blk64 AOT bundle 需要重新生成。
+
+### 性能抽查（B300）
+
+同一张 B300 上依次运行 `c514e9a` 和修复版本，每个用例用 CUDA Graph 重放
+5 次调用，测量 11 轮取中位数。FP8 输入预先量化，表中只计 attention，不计
+量化和 Python 调用开销。未锁定时钟；这组数据未见明显性能回退，不据此声称加速。
+4 个用例的新旧 O 和 LSE 均逐位一致。
+
+| 用例（B=1，D=128） | 修复前 ms | 修复后 ms | 变化 |
+|---|---:|---:|---:|
+| FP8，H=14，Q=KV=39756，top-k≤160，split=1 | 1.98107 | 1.97516 | -0.3% |
+| BF16，同上 | 2.68296 | 2.71678 | +1.3% |
+| FP8，H=8，Q=KV=8192，固定 top-k=32，split=1 | 0.07939 | 0.07917 | -0.3% |
+| FP8，H=4，Q=64，KV=32768，top-k≤128，split=4 | 0.04303 | 0.04269 | -0.8% |
+
+变长候选数用例包含 0，所有用例均包含短 `block_sizes`。记录来自 B300 作业
+`5174215` 的 `candidate5` 检查阶段和一组修复前/后性能结果。GPU 验证使用 JIT
+路径；本次未重建 AOT bundle。
+
+## 2026-10-21：BF16 blk64 KV 尾块越界读取
+
+### 问题
+
+BF16 blk64 默认把 K/V 看成 rank-6 稀疏块视图 `(64, 64, 2, H, ceil(S/64), B)`，
+其中没有真实序列长度。KV 长度不是 64 的倍数时：
+
+- 最后一个短块会把下一 head 的前几行当成 key/value 读进来；不传
+  `block_sizes` 时这些行参与 softmax，结果错误。客户形状
+  `B=1,H=14,S=39756` 不传 `block_sizes` 时 14 个 head 里 13 个相对误差约 5%。
+- 最后一个 head 的短块读到 K/V 分配之外。传了 `block_sizes` 也只能把分数
+  置零，越界读到的 V 若是 NaN 仍会污染输出；若那段地址未映射则
+  illegal memory access，或者 TMA 永远不到账导致卡死。此前在客户形状、
+  `kv_splits=2` 序列中观察到的卡死即属此类：把 K/V 放在映射区末尾、后面
+  地址不映射时，旧代码四种配置（有无 `block_sizes` × split 1/2）全部
+  illegal memory access。
+- 实测 B>1 时从第二个 batch 起整个 head 都错（即使传了 `block_sizes`），与
+  rank-6 视图下 batch 基址不再是 64 行块整数倍一致。
+
+FP8 早已改为保留真实序列长度的视图，不受影响。
+
+### 修复
+
+- KV 长度不是 64 的倍数时，BF16 改用已有的 exact 序列视图（原本只在 stride
+  超出 Int32 TMA 范围时启用），TMA 按真实长度对尾块零填充；同时打开与 FP8
+  相同的物理尾块掩码，不依赖调用方传 `block_sizes`。对齐长度仍走 rank-6
+  视图，代码路径与结果不变。
+- exact 视图原来用 `zipped_divide` 取块，load warp 每次取块都要对动态块数做
+  一次除法取模，整体慢约 15%；改为只切序列维的 `local_tile`，与 FP8 写法一致，
+  速度与 rank-6 持平。大 stride（Int64）路径同样受益。
+- AOT 无需新增变体：exact 视图对应已有的 `use_int64_kv_strides=True` 变体。
+
+### 验证（B200 与 B300 各一遍）
+
+- **精度矩阵**：8 个形状（含 B>1、H>1、S_k=1/70/1000/1999/4097 及对齐长度）×
+  `block_sizes` 无/rank-1/rank-3 随机短块 × top-k 固定/变长含 0 × CLC 开关 ×
+  split 1/2，共 192 例，与 FP32 精确参考比较 O 最大误差 <3e-2、LSE <2e-3，空行
+  O=0、LSE=-inf：新代码 0 失败；旧代码 137 例失败。
+- **越界探针**：K/V 紧贴映射区末尾，新代码四种配置正常且无 NaN。
+- **客户形状**：S=39756 有无 `block_sizes`、split 1/2 全部正确；此前卡死的调用
+  序列 90 例全部完成；900 例完整矩阵无卡死、无 NaN、重复运行一致。
+- **对齐路径不变**：同种子、同进程顺序下，6 个对齐形状共 540 例（FP8 108、
+  BF16 432）新旧输出逐位一致；非对齐形状上 FP8 逐位一致，BF16 只在旧代码出错
+  的用例上不同。旧代码在非对齐矩阵第 48 例再次卡死，新代码 270 例全部完成。
+- **compute-sanitizer**：racecheck、memcheck 0 错误；synccheck 仍为既有的
+  correction warp divergent 报告，与本改动无关。该告警随后由上方的
+  blk64 warp 同步修复消除。
+- **测试套件**：FP8 相关 B200 257、B300 258 passed；`test_flash_fwd.py -k sm100`
+  190 passed（含新增 4 个尾块多 head 回归用例）；AOT 测试 34 passed；AOT-only
+  660 例与 JIT 逐位一致（未构建的 BF16 rank-3 `block_sizes` 变体除外）。
+
+### 性能（B200，客户形状 BF16 blk64，两轮）
+
+| S_k | `block_sizes` | 修复前 ms | 修复后 ms |
+|---:|---|---:|---:|
+| 39756 | 无 | 3.02 / 3.03（结果错误） | 3.06 / 2.97 |
+| 39756 | 有 | 3.14 / 3.13 | 3.09 / 3.02 |
+| 39744 | 无 | 3.05 / 3.01 | 3.06 / 3.00 |
+
+## 2026-10-20：blk64 softmax 推迟等待统计量槽位
+
+起因是客户在 4×B200、Ulysses=4 的视频生成流程中观察到 FP8 慢于 BF16。
+按客户单卡形状 `B=1,H=14,S=39756,D=128`、blk64 top-k 160 单独复测，FP8 本身
+并不慢：B200 上 BF16 blk64 3.00 ms，FP8 含新鲜量化 2.69 ms；FP8 wrapper 每次
+调用的 host 入队约 30–60 µs，没有隐藏的 host 同步。客户端到端变慢需要结合其
+集成代码和 attention 内部算子拆分再查。
+
+### 改动
+
+原实现中 softmax 每个 step 末尾都等 correction 读走上一份 `acc_scale` 才进入
+下一步；NCU 采样里这两个等待点约占全部 warp 采样的 15%。现在改到下一步算完
+row max、真正要写 `sScale` 之前再等，最后一步之后的等待移到写最终 row sum/max
+之前，与 blk128 已有做法一致。每个 tile 的等待次数、先后顺序和 named barrier
+arrive 次数都不变；只改同步时机，不改数值。BF16 blk64 共用这段代码。
+
+### 性能
+
+同一进程内先编译预热，CUDA event 每轮 30–40 次取中位数；`f953680` 与新树交替
+运行两轮。时钟未锁定。
+
+| GPU | 路径 | 形状 `B,H,S,top-k` | `f953680` ms | 本次 ms | 变化 |
+|---|---|---|---:|---:|---:|
+| B200 | FP8 blk64 | 1,14,39756,160（客户） | 2.4365 | 2.3708 | -2.7% |
+| B200 | BF16 blk64 | 1,14,39756,160（客户） | 3.1391 | 3.0214 | -3.8% |
+| B300 | FP8 blk64 | 1,14,39756,160（客户） | 2.1504 | 2.0777 | -3.4% |
+| B300 | BF16 blk64 | 1,14,39756,160（客户） | 2.8606 | 2.8258 | -1.2%（两轮 -2.8%/+0.3%，噪声内） |
+| B200 | FP8 blk64 | 1,8,16384,64 | 0.2769 | 0.2701 | -2.5% |
+| B200 | FP8 blk64 | 1,24,8192,32 | 0.2605 | 0.2585 | -0.8% |
+| B200 | FP8 blk64 | 1,4,216832,342 | 7.8621 | 7.6554 | -2.6% |
+
+`B=2,H=6,S=4096,top-k=8` 单次调用约 45 µs，低于 CUDA event 的可靠分辨率；
+nsys 统计 604 次 kernel，B200 平均 36.90→36.34 µs（-1.5%）。
+
+### 正确性与稳定性验证（B200 与 B300 各一遍）
+
+- **逐位一致**：10 个形状（含客户形状、Q/KV 尾块、top-k=1/2/奇数、B>1）×
+  普通/大动态范围数据 × `block_sizes` 无/rank-1/rank-3 × top-k 固定/变长/含 0，
+  FP8 与 BF16（CLC 开关、split 1/2）共 857 个用例，新旧输出逐位一致；
+  每例重复 3–5 次结果一致，无 NaN/Inf。
+- **FP8 精度**：与 FP32 精确参考（反量化输入、相同稀疏索引）相比相对平均误差
+  ≤2.3%，满足 <2.9% 合同。
+- **compute-sanitizer**：racecheck、memcheck 新旧均 0 错误。synccheck 在
+  `q2k_block_nums` 变体上新旧都报 correction warp 的 "Divergent thread(s) in
+  block"（固定 top-k 变体干净），属于既有问题，与本改动无关。该告警随后由
+  本页开头的 warp 同步修复消除。
+- **AOT**：重建精简 blk64 bundle（BF16 split 1/2、FP8 split 1/4、
+  `block_sizes` 0/1/3）后官方 AOT 测试 B200 34 passed、B300 35 passed，0 failed；
+  AOT-only 模式下 35 个用例与 JIT 输出逐位一致。
+- **测试套件**：FP8 相关 B200 257 passed、B300 258 passed；
+  `tests/test_flash_fwd.py -k sm100` 两卡均 186 passed；均 0 failed。
+
+### 验证中发现的既有问题（`f953680` 同样存在；1、2、3 已在 2026-10-21 修复）
+
+1. BF16 blk64 在客户形状、大动态范围数据、`kv_splits=2`、无 `block_sizes`
+   的调用上，按特定调用历史可稳定卡死（GPU 100%、停在 synchronize），单独
+   调用不复现。
+2. BF16 blk64 在 KV 长度不是 64 的倍数且 B×H>1 时结果错误或出现 NaN
+   （即使传了 `block_sizes`）；对齐长度正常。FP8 路径不受影响。
+3. 上述 synccheck 报告。
+4. 曾试验的 blk128 配置组合（SM100 用 SM103 的缓冲开关，或 SM103 用 16 列
+   correction/epilogue tile）会算错；生产配置不受影响。
+
+源码指纹变化，现有 blk64 AOT bundle 需要重新构建；blk128 未改动。环境：
+`nvcr.io/nvidia/pytorch:26.05-py3`（Torch `2.12.0a0+5aff3928d8.nv26.05`、
+CUDA 13.2）、CUTLASS DSL 4.5.2、apache-tvm-ffi 0.1.14.post1。
+
+## 2026-09-09：SM100/SM103 Sage FP8 AOT
+
+SM100 和 SM103 的 Sage FP8 forward 现已接入现有 CuTe native AOT artifact
+bundle。AOT 覆盖固定或逐 Q block 的 top-k、三种 `block_sizes` 作用域、
+split-KV producer/combine，以及 SM103 的软件和 16-token `ld.red` row-max
+两种路径。未命中 artifact 时仍可回退 JIT；`BSA_SM100_AOT_ONLY=1` 会严格
+禁止运行时调用 `cute.compile()`。
+
+最终代码已在 B200 和 B300 上真实导出并加载 AOT `.so`，分别覆盖动态
+top-k/三维 `block_sizes`、split-KV producer/combine 和 SM103 `ld.red`。
+三条 AOT-only 精度用例均通过，并在测试中显式禁止了 `cute.compile()`。
+
+最终回归在 B200 上为 123 passed、24 skipped，在 B300 上为 124 passed、
+23 skipped，均为 0 failed。最终源码重新生成的普通 FP8、split-KV、SM103
+`ld.red` 和原有 BF16 AOT 均通过 AOT-only 真机精度测试。
+
+### 尾块性能回退和修复
+
+早期实现把 KV 尾块长度的动态计算放进 SM100 的 softmax 热循环。SM100 有
+8 个 softmax warp，同一份判断会被重复执行并放大编译器控制流；B200 常用
+unsplit 用例因此从约 2.42 ms 退化到约 3.78 ms。两版内核都是 128 个寄存器
+且没有 spill，但 cubin 从 132264 bytes 增至 193536 bytes，反汇编从约 5218
+行增至 6378 行，确认问题是热循环代码膨胀而不是寄存器压力。
+
+最终实现不在 host 生成或修改 `block_sizes`，也不补齐 Q/K scale。一个
+SM100 FP8 kernel 根据运行时 K 长度做统一判断：64 对齐时直接执行原 hot
+loop；确有尾块时，同一 kernel 内计算最后一个物理块的有效长度、收紧用户
+提供的 block size 并完成 score masking。split-KV 的尾部 K-scale 也在同一
+判断下安全索引。
+
+性能回归使用 `origin/master` (`8a9e8d7`) 作为基线，在同一张 B200/B300
+上测试下方 12 组客户规模。每组预热 10 次、计时 21 次取中位数，前后版本
+交换顺序跑两轮，再取几何平均：
+
+- B200 最终 JIT 相对 master 快 0.871%，12 项范围为 -2.482% 到 +0.096%；
+- B300 最终 JIT 相对 master 快 2.883%，12 项范围为 -4.334% 到 -0.623%；
+- B200 原先约 2.42 ms 到 3.78 ms 的回退已消失，最终为 2.388 ms，
+  同场 master 为 2.416 ms；
+- 输出抽样汇总相对 master 的最大绝对差为 `2.0981e-05`，完整精度门槛
+  全部通过。
+
+AOT 的主要价值是免去首次编译：当前源码的首个 unsplit 调用在 B200/B300
+上需要约 34.78/37.03 秒 JIT，预编译后首次加载并执行为约 0.053/0.072 秒。
+同一 kernel 同时包含 aligned 和 tail 的内部实现，因此 JIT 编译时间高于
+master 的约 11.35/12.20 秒；这是一次性的编译开销，不是上述稳态执行时间。
+B200 上 AOT native ABI 的 12 项稳态几何平均比同一最终 JIT 慢 1.153%，
+主要来自调用开销。B300 bring-up 板在连续 AOT 轮次中触发了明显温度/时钟
+波动，因此不把其 AOT 稳态数字用于性能结论。
+
+## 2026-09-08：与 SM120 对齐动态输入能力
+
+SM100 和 SM103 的 Sage FP8 接口已解除原先 `B=1`、`H in {4,8}`、Q/KV
+长度必须是 64 倍数、uniform top-k 和 rank-1 `block_sizes` 的限制。现在支持：
+
+- 任意正数 batch 和 MHA head 数；
+- 非 64 对齐的 Q/KV 长度（Q/K/V 和 scale 均保持真实长度；SM100/SM103
+  kernel 根据运行时长度直接判断并屏蔽尾块）；
+- `[B,H,Q_blocks]` 的 `q2k_block_nums`，SM100/SM103 仍支持空行；
+- `[N]`、`[B,N]`、`[B,H,N]` 三种 `block_sizes`。
+
+真机定向验证覆盖 B200/SM100 和 B300/SM103，包括 `B=2`、`H=1/3/5`、
+Q/KV 尾块、三种 block-size 作用域、可变/空 top-k，以及 H=1/5 下
+1/4/8/16 路 split。完整 FP8/量化回归在 B200 上为 68 passed、14 skipped，
+在 B300 上为 69 passed、13 skipped；AOT、动态 compile-key 和 packaging
+定向回归为 49 passed、9 skipped。SM100/SM103 和 SM120 的 FP8 均支持 AOT
+或 JIT。
+
+以下早期性能结果中的 `B=1`、`H=4/8` 是当时的基准输入范围，不再是当前
+接口限制。
+
+## 早期固定形状性能基准
+
+以下性能数据使用前向、BHSD 布局的 Sage FP8 block-sparse attention：
+`B=1`、`H=4/8`、`D=128`、`64x64` 稀疏块、uniform top-k，输出为
+BF16。这些是基准输入，不是当前接口限制。
 
 在 B300/SM103 上，客户 PDF 的 12 组输入规模全部通过精度门槛。FP8 和
 BF16 使用相同的自动 split 后，两轮正式测试的 FP8/BF16 延迟几何平均为

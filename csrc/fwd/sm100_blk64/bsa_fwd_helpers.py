@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import tcgen05
 from cutlass import Float32, Int32, Uint32, Boolean, const_expr
 from cutlass.cutlass_dsl import T
@@ -15,6 +16,24 @@ from block_sparse_attention.csrc.utils.tcgen05_mma_helpers import (
     _tcgen05_mma_kind,
     i64_to_i32x2,
 )
+
+
+@cute.jit
+def named_barrier_arrive_unaligned(barrier: pipeline.NamedBarrier, index: Int32) -> None:
+    """Signal a warp-pair barrier from independently executing warp roles."""
+    pipeline.NamedBarrier(
+        barrier_id=barrier.barrier_id + index,
+        num_threads=barrier.num_threads,
+    ).arrive_unaligned()
+
+
+@cute.jit
+def named_barrier_wait_unaligned(barrier: pipeline.NamedBarrier, index: Int32) -> None:
+    """Arrive and wait without requiring CTA-uniform control flow."""
+    pipeline.NamedBarrier(
+        barrier_id=barrier.barrier_id + index,
+        num_threads=barrier.num_threads,
+    ).wait_unaligned()
 
 
 @cute.jit
@@ -179,6 +198,31 @@ def tmem_load_red_max_32dp32b32x(
 
 
 @cute.jit
+def tmem_load_red_max_32dp32b16x(
+    tmem_addr: Int32,
+) -> Tuple[Tuple[Float32, ...], Float32]:
+    """Load 16 FP32 TMEM values and return their hardware-reduced maximum."""
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 17),
+        [Int32(cute.arch.make_warp_uniform(tmem_addr)).ir_value()],
+        "tcgen05.ld.red.sync.aligned.32x32b.x16.max.f32 "
+        "{"
+        "$0, $1, $2, $3, $4, $5, $6, $7, "
+        "$8, $9, $10, $11, $12, $13, $14, $15"
+        "}, $16, [$17];",
+        ",".join(["=r"] * 17 + ["r"]),
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    values = tuple(
+        Float32(llvm.extractvalue(T.f32(), out, [i])) for i in range(16)
+    )
+    row_max = Float32(llvm.extractvalue(T.f32(), out, [16]))
+    return values, row_max
+
+
+@cute.jit
 def cvt_f32x2_to_bf16x2(a: Float32, b: Float32) -> Int32:
     return Int32(
         llvm.inline_asm(
@@ -229,6 +273,36 @@ def shr_u32(x: Uint32, shift: Uint32) -> Uint32:
             [Uint32(x).ir_value(), Uint32(shift).ir_value()],
             "shr.u32 $0, $1, $2;",
             "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
+def select_i32_if_equal(
+    lhs: Int32,
+    rhs: Int32,
+    if_equal: Int32,
+    otherwise: Int32,
+) -> Int32:
+    """Return one of two i32 values without creating DSL control flow."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Int32(lhs).ir_value(),
+                Int32(rhs).ir_value(),
+                Int32(if_equal).ir_value(),
+                Int32(otherwise).ir_value(),
+            ],
+            "{\n\t"
+            ".reg .pred p;\n\t"
+            "setp.eq.s32 p, $1, $2;\n\t"
+            "selp.b32 $0, $3, $4, p;\n\t"
+            "}",
+            "=r,r,r,r,r",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,

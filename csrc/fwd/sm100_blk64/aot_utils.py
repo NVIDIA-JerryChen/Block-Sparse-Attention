@@ -9,7 +9,7 @@ from typing import Iterable
 from cuda.bindings import runtime as cuda_runtime
 
 
-SM100_AOT_SCHEMA_VERSION = 1
+SM100_AOT_SCHEMA_VERSION = 3
 SM100_AOT_MANIFEST = "manifest.json"
 SM100_AOT_LAYOUT_MODE = "dynamic_strided_nonbroadcast"
 SM100_AOT_TARGET_ARCHES = ("sm_100a", "sm_103a")
@@ -29,11 +29,23 @@ class Sm100AotVariant:
     kv_splits: int
     use_clc_scheduler: bool
     use_int64_kv_strides: bool
+    block_sizes_mode: int = 0
+    use_sage_ldred_rowmax: bool = False
     layout_mode: str = SM100_AOT_LAYOUT_MODE
 
     def __post_init__(self) -> None:
-        if self.dtype != "bf16":
-            raise ValueError("SM100/SM103 AOT supports BF16 only")
+        if self.dtype not in ("bf16", "fp8"):
+            raise ValueError(f"Unsupported SM100/SM103 AOT dtype: {self.dtype}")
+        if self.has_block_sizes:
+            if self.block_sizes_mode not in (1, 2, 3):
+                raise ValueError(
+                    "block_sizes_mode must match rank 1, 2, or 3 when enabled"
+                )
+        else:
+            if self.block_sizes_mode != 0:
+                raise ValueError(
+                    "block_sizes_mode must be 0 when block sizes are disabled"
+                )
         if not 1 <= self.kv_splits <= 256:
             raise ValueError("kv_splits must be in [1, 256]")
         if self.kv_splits > 1 and not self.allow_empty_block_nums:
@@ -49,16 +61,27 @@ class Sm100AotVariant:
             )
         if self.layout_mode != SM100_AOT_LAYOUT_MODE:
             raise ValueError(f"Unsupported SM100 AOT layout mode: {self.layout_mode}")
+        if self.use_sage_ldred_rowmax and self.dtype != "fp8":
+            raise ValueError("Sage ld.red row-max requires an FP8 variant")
+        if self.use_sage_ldred_rowmax and self.kv_splits != 1:
+            raise ValueError("Sage ld.red row-max requires an unsplit variant")
+
+    @property
+    def is_fp8(self) -> bool:
+        return self.dtype == "fp8"
 
     @property
     def name(self) -> str:
-        return (
+        name = (
             f"bsa_sm100_blk64_{self.dtype}_bn{int(self.has_block_nums)}_"
             f"empty{int(self.allow_empty_block_nums)}_"
-            f"bs{int(self.has_block_sizes)}_split{self.kv_splits}_"
+            f"bs{self.block_sizes_mode}_split{self.kv_splits}_"
             f"clc{int(self.use_clc_scheduler)}_"
-            f"i64{int(self.use_int64_kv_strides)}_dyn"
+            f"i64{int(self.use_int64_kv_strides)}"
         )
+        if self.is_fp8:
+            name += f"_ldred{int(self.use_sage_ldred_rowmax)}"
+        return f"{name}_dyn"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -80,6 +103,15 @@ class Sm100AotVariant:
             raise ValueError("SM100 AOT kv_splits must be an integer")
         if not isinstance(value.get("dtype"), str):
             raise ValueError("SM100 AOT dtype must be a string")
+        use_sage_ldred_rowmax = value.get("use_sage_ldred_rowmax", False)
+        if type(use_sage_ldred_rowmax) is not bool:
+            raise ValueError("SM100 AOT Sage ld.red flag must be a boolean")
+        block_sizes_mode = value.get(
+            "block_sizes_mode",
+            1 if value["has_block_sizes"] else 0,
+        )
+        if type(block_sizes_mode) is not int:
+            raise ValueError("SM100 AOT block_sizes_mode must be an integer")
         return cls(
             dtype=value["dtype"],
             has_block_nums=value["has_block_nums"],
@@ -88,6 +120,8 @@ class Sm100AotVariant:
             kv_splits=value["kv_splits"],
             use_clc_scheduler=value["use_clc_scheduler"],
             use_int64_kv_strides=value["use_int64_kv_strides"],
+            block_sizes_mode=block_sizes_mode,
+            use_sage_ldred_rowmax=use_sage_ldred_rowmax,
             layout_mode=value.get("layout_mode", SM100_AOT_LAYOUT_MODE),
         )
 
@@ -121,8 +155,45 @@ def iter_sm100_aot_variants(
                                     use_int64_kv_strides=bool(
                                         use_int64_kv_strides
                                     ),
+                                    block_sizes_mode=(
+                                        1 if has_block_sizes else 0
+                                    ),
                                 )
                             )
+    return tuple(sorted(variants, key=lambda variant: variant.name))
+
+
+def iter_sm100_fp8_aot_variants(
+    has_block_nums_values: Iterable[bool],
+    block_sizes_modes: Iterable[int],
+    kv_splits_values: Iterable[int],
+    use_sage_ldred_rowmax_values: Iterable[bool] = (False,),
+) -> tuple[Sm100AotVariant, ...]:
+    """Build the static-scheduler variants used by the public FP8 API."""
+    variants = set()
+    for has_block_nums in has_block_nums_values:
+        for block_sizes_mode in block_sizes_modes:
+            for kv_splits in kv_splits_values:
+                for use_sage_ldred_rowmax in use_sage_ldred_rowmax_values:
+                    if use_sage_ldred_rowmax and int(kv_splits) != 1:
+                        continue
+                    variants.add(
+                        Sm100AotVariant(
+                            dtype="fp8",
+                            has_block_nums=bool(has_block_nums),
+                            allow_empty_block_nums=(
+                                bool(has_block_nums) or int(kv_splits) > 1
+                            ),
+                            has_block_sizes=int(block_sizes_mode) != 0,
+                            kv_splits=int(kv_splits),
+                            use_clc_scheduler=False,
+                            use_int64_kv_strides=False,
+                            block_sizes_mode=int(block_sizes_mode),
+                            use_sage_ldred_rowmax=bool(
+                                use_sage_ldred_rowmax
+                            ),
+                        )
+                    )
     return tuple(sorted(variants, key=lambda variant: variant.name))
 
 
@@ -191,7 +262,8 @@ def get_sm100_aot_combine_variant(
     if variant.kv_splits <= 1:
         raise ValueError("A combine variant requires kv_splits > 1")
     return Sm100AotCombineVariant(
-        dtype=variant.dtype,
+        # Both BF16 and Sage FP8 producers combine FP32 partials into BF16.
+        dtype="bf16",
         value_dim=128,
         log_max_splits=(variant.kv_splits - 1).bit_length(),
         num_threads=int(num_threads),

@@ -41,11 +41,13 @@ NCU_DIR := $(AGENT_PROFILES)/ncu
 SM90_AOT_DIR ?= $(AGENT_SPACE)/sm90_aot
 SM90_AOT_ARGS ?=
 SM100_AOT_DIR ?= $(AGENT_SPACE)/sm100_aot
+FP8_BLK128_AOT_DIR ?= $(AGENT_SPACE)/fp8_blk128_aot
+FP8_BLK128_AOT_ARGS ?=
 SM100_AOT_ARGS ?=
 SM120_AOT_DIR ?= $(AGENT_SPACE)/sm120_aot
 SM120_AOT_ARGS ?=
 
-.PHONY: wheel setup aot-sm90 aot-sm100 aot-sm120 tt vt ttb vtb bb bbb profile bm bm-cli clean help
+.PHONY: wheel setup aot-sm90 aot-sm100 aot-fp8-blk128 aot-sm120 tt vt ttb vtb bb bbb profile bm bm-cli clean help
 
 wheel:
 	mkdir -p $(WHEEL_DIR)
@@ -66,6 +68,12 @@ aot-sm100:
 		--output-dir $(SM100_AOT_DIR) --target-arch sm_100a $(SM100_AOT_ARGS)
 	CUTE_DSL_ARCH=sm_103a $(PYTHON) -m csrc.fwd.sm100_blk64.aot_build \
 		--output-dir $(SM100_AOT_DIR) --target-arch sm_103a $(SM100_AOT_ARGS)
+
+aot-fp8-blk128:
+	CUTE_DSL_ARCH=sm_100a $(PYTHON) -m csrc.fwd.sm100_blk128.aot_build \
+		--output-dir $(FP8_BLK128_AOT_DIR) --target-arch sm_100a $(FP8_BLK128_AOT_ARGS)
+	CUTE_DSL_ARCH=sm_103a $(PYTHON) -m csrc.fwd.sm100_blk128.aot_build \
+		--output-dir $(FP8_BLK128_AOT_DIR) --target-arch sm_103a $(FP8_BLK128_AOT_ARGS)
 
 aot-sm120:
 	$(PYTHON) -m csrc.fwd.sm120_blk64.aot_build \
@@ -130,6 +138,7 @@ help:
 	@echo ""
 	@echo "  make wheel                      Build unified CuTe DSL wheel"
 	@echo "  make aot-sm100                  Build SM100/SM103 forward/combine CuTe DSL AOT artifacts"
+	@echo "  make aot-fp8-blk128             Build SM100/SM103 FP8 blk128 producer/combine AOT artifacts"
 	@echo "  make setup                      Reinstall wheel (dependencies preinstalled)"
 	@echo "  make aot-sm90                   Build SM90 forward/combine CuTe DSL AOT artifacts"
 	@echo "  make aot-sm120                  Build SM120 CuTe DSL AOT artifacts"
@@ -149,4 +158,5 @@ help:
 	@echo "    e.g. make bm-cli BLK=64 VAR_BN=1 BLKSZ=1"
 	@echo "  SM90 AOT: SM90_AOT_DIR=<root> SM90_AOT_ARGS='<builder args>'"
 	@echo "  SM100 AOT: SM100_AOT_DIR=<root> SM100_AOT_ARGS='<builder args>'"
+	@echo "  FP8 blk128 AOT: FP8_BLK128_AOT_DIR=<root> FP8_BLK128_AOT_ARGS='<builder args>'"
 	@echo "  SM120 AOT: SM120_AOT_DIR=<root> SM120_AOT_ARGS='<builder args>'"

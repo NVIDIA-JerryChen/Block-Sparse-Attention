@@ -6,10 +6,11 @@ from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
+from tvm_ffi import Function as TVMFFIFunction
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float32
+from cutlass import Float32
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
 from block_sparse_attention.utils.cache_utils import get_jit_cache
@@ -19,6 +20,15 @@ from block_sparse_attention.utils import fa_logging
 from block_sparse_attention.csrc.fwd.sm100_blk128.bsa_fwd_sm100 import (
     BlockSparseAttnForwardSm100Blk128,
 )
+from block_sparse_attention.csrc.fwd.sm100_blk128.bsa_fwd_sm100_fp8_fused_pv import (
+    BlockSparseAttnForwardFp8FusedPvSm100Blk128,
+)
+from block_sparse_attention.csrc.fwd.sm100_blk128.aot_runtime import (
+    dispatch_token as fp8_blk128_aot_dispatch_token,
+    get_fp8_blk128_aot_bundle,
+)
+from block_sparse_attention.csrc.fwd.sm100_blk128.aot_utils import Sm100Fp8Blk128AotVariant
+
 from block_sparse_attention.csrc.fwd.sm90_blk64.bsa_fwd_sm90 import (
     BlockSparseAttnForwardSm90Blk64,
     SM90_FWD_BLOCK_SIZE,
@@ -51,6 +61,7 @@ from block_sparse_attention.csrc.fwd.sm100_blk64.aot_runtime import (
     Sm100AotArtifactError,
     get_sm100_aot_combine_kernel,
     get_sm100_aot_kernel,
+    get_sm100_aot_manifest_token,
     is_sm100_aot_only,
 )
 from block_sparse_attention.csrc.fwd.sm100_blk64.aot_utils import (
@@ -251,7 +262,7 @@ def _validate_sm100_blk64_int32_bounds(
     q2k_block_nums: Optional[torch.Tensor],
 ) -> None:
     """Guard values that the SM100 blk64 path stores or casts as int32."""
-    batch, num_heads, seqlen_q, head_dim = q.shape
+    batch, num_heads, seqlen_q, _ = q.shape
     seqlen_k = k.shape[2]
     num_m_blocks = (seqlen_q + 63) // 64
 
@@ -683,11 +694,12 @@ def _sm100_blk64_auto_fp8_kv_splits(
     topk_num: int,
     heads: int = 4,
     seqlen_q: int = 64,
+    batch: int = 1,
 ) -> int:
     """Choose FP8 splits for short-Q parallelism without over-splitting long Q."""
     topk_num = int(topk_num)
     heads = int(heads)
-    q_tiles = heads * ((int(seqlen_q) + 63) // 64)
+    q_tiles = int(batch) * heads * ((int(seqlen_q) + 63) // 64)
     if q_tiles >= 512:
         # SLA-scale Q already exposes thousands of independent CTAs.  Splitting
         # medium top-k rows only adds FP32 partial workspace and a combine pass;
@@ -706,18 +718,49 @@ def _sm100_blk64_auto_fp8_kv_splits(
     return 16
 
 
+_SM103_SAGE_FP8_LDRED_MIN_Q_TILES = 512
+
+
+def _sm103_blk64_use_sage_fp8_ldred(
+    arch: int,
+    batch_size: int,
+    heads: int,
+    seqlen_q: int,
+    kv_splits: int,
+) -> bool:
+    """Use 16-token hardware row-max only where it wins on SM103."""
+    q_tiles = (
+        int(batch_size)
+        * int(heads)
+        * _ceil_div_int(int(seqlen_q), 64)
+    )
+    return (
+        int(arch) == 103
+        and int(kv_splits) == 1
+        and q_tiles >= _SM103_SAGE_FP8_LDRED_MIN_Q_TILES
+    )
+
+
 # The public FP8 contract has fixed ranks, dtypes, layouts, and feature flags.
 # Cache the warmed compiled function separately so repeated hot-path calls do
 # not rebuild the general-purpose dynamic compile key and validation state.
 _bsa_fp8_blk64_fast_cache = {}
 _bsa_fp8_blk64_combine_fast_cache = {}
+_bsa_fp8_blk64_aot_fast_cache = {}
 
 
-def _bsa_fp8_blk64_fast_key(q: torch.Tensor, kv_splits: int) -> tuple:
+def _bsa_fp8_blk64_fast_key(
+    q: torch.Tensor,
+    kv_splits: int,
+    block_sizes_mode: int = 0,
+    use_sage_ldred_rowmax: bool = False,
+) -> tuple:
     return (
         _get_device_arch(q.device),
         q.device.index,
         int(kv_splits),
+        int(block_sizes_mode),
+        bool(use_sage_ldred_rowmax),
         fa_logging.get_fa_log_level(),
     )
 
@@ -725,6 +768,31 @@ def _bsa_fp8_blk64_fast_key(q: torch.Tensor, kv_splits: int) -> tuple:
 def _bsa_fp8_blk64_fast_layout(*tensors: torch.Tensor) -> bool:
     """Return whether tensors match the warmed dynamic-layout specialization."""
     return all(tensor.is_contiguous() for tensor in tensors)
+
+
+def _bsa_fp8_blk64_aot_fast_layout(*tensors: torch.Tensor) -> bool:
+    """Return whether contiguous FP8 inputs also satisfy the native AOT ABI."""
+    if not _bsa_fp8_blk64_fast_layout(*tensors):
+        return False
+    try:
+        return all(
+            tensor.data_ptr()
+            % (4 if tensor.dtype == torch.float32 else 16)
+            == 0
+            for tensor in tensors
+        )
+    except (RuntimeError, TypeError):
+        return False
+
+
+def _get_sm100_fp8_aot_fast_entry(fast_key: tuple, device_arch: int):
+    entry = _bsa_fp8_blk64_aot_fast_cache.get(fast_key)
+    if entry is None:
+        return None
+    if entry[0] != get_sm100_aot_manifest_token(device_arch):
+        _bsa_fp8_blk64_aot_fast_cache.pop(fast_key, None)
+        return None
+    return entry[1:]
 
 
 def _build_sm100_blk64_kv_split_offsets(
@@ -1822,11 +1890,7 @@ def _combine_blk64_kv_bucketed_partials(
             log_max_splits=log_max_splits,
         )
         aot_kernel = get_sm90_aot_combine_kernel(combine_variant, device_arch)
-    elif (
-        device_arch in (100, 103)
-        and q.dtype == torch.bfloat16
-        and output_dtype == torch.bfloat16
-    ):
+    elif device_arch in (100, 103) and output_dtype == torch.bfloat16:
         combine_variant = Sm100AotCombineVariant(
             dtype="bf16",
             value_dim=head_dim,
@@ -1949,6 +2013,8 @@ def _combine_blk64_kv_bucketed_partials_precompiled(
     kv_splits: int,
     compiled_fn,
     output_dtype: Optional[torch.dtype] = None,
+    *,
+    native_abi: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Hot combine path with layout/config checks hoisted out of each launch."""
     batch, num_heads, seqlen_q, _ = q.shape
@@ -1985,18 +2051,29 @@ def _combine_blk64_kv_bucketed_partials_precompiled(
         device=q.device,
     )
     current_stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
-    compiled_fn(
-        o_partial,
-        lse_partial,
-        out_bshd,
-        lse_bsh,
-        None,
-        None,
-        None,
-        None,
-        None,
-        current_stream,
-    )
+    if native_abi:
+        native_args = _make_blk64_combine_cute_args(
+            o_partial,
+            lse_partial,
+            out_bshd,
+            lse_bsh,
+            current_stream,
+            enable_tvm_ffi=False,
+        )
+        compiled_fn(*native_args)
+    else:
+        compiled_fn(
+            o_partial,
+            lse_partial,
+            out_bshd,
+            lse_bsh,
+            None,
+            None,
+            None,
+            None,
+            None,
+            current_stream,
+        )
     return out_bshd.transpose(1, 2), lse_bsh.transpose(1, 2)
 
 
@@ -2297,8 +2374,6 @@ def _bsa_attn_fwd_sm100_blk64(
         assert q_scale.dtype == torch.float32
         assert k_scale.dtype == torch.float32
         assert v_scale.dtype == torch.float32
-        assert q2k_block_nums is None, "FP8 v1 requires a uniform top-k"
-        assert block_sizes is None, "FP8 v1 requires full 64-token KV blocks"
     else:
         assert k_scale is None and v_scale is None, "Q/K/V scales must be provided together"
         assert q.dtype == k.dtype == v.dtype == torch.bfloat16, (
@@ -2335,8 +2410,9 @@ def _bsa_attn_fwd_sm100_blk64(
     assert k_bhsd.shape == (batch_size, num_head_kv, seqlen_k, head_dim)
     assert v_bhsd.shape == (batch_size, num_head_kv, seqlen_k, head_dim_v)
     if is_sage_fp8:
-        assert batch_size == 1, "FP8 v1 requires batch size 1"
-        assert num_head in (4, 8), "FP8 v1 supports H=4 or H=8"
+        assert batch_size >= 1 and num_head >= 1, (
+            "Sage FP8 requires positive batch and head counts"
+        )
         q_scale = maybe_contiguous(q_scale)
         k_scale = maybe_contiguous(k_scale)
         v_scale = maybe_contiguous(v_scale)
@@ -2376,11 +2452,21 @@ def _bsa_attn_fwd_sm100_blk64(
     )
     q2k_block_index = maybe_contiguous(q2k_block_index)
     has_block_sizes = block_sizes is not None and block_sizes.numel() > 0
+    block_sizes_mode = 0
     if has_block_sizes:
         block_sizes = maybe_contiguous(block_sizes)
         assert block_sizes.dtype == torch.int32
         assert block_sizes.device == q_bhsd.device
-        assert block_sizes.shape == (num_kv_blocks,)
+        if block_sizes.ndim == 1:
+            assert block_sizes.shape == (num_kv_blocks,)
+            block_sizes_mode = 1
+        elif block_sizes.ndim == 2:
+            assert block_sizes.shape == (batch_size, num_kv_blocks)
+            block_sizes_mode = 2
+        else:
+            assert block_sizes.ndim == 3
+            assert block_sizes.shape == (batch_size, num_head, num_kv_blocks)
+            block_sizes_mode = 3
     else:
         block_sizes = None
     has_variable_block_nums = q2k_block_nums is not None and q2k_block_nums.numel() > 0
@@ -2416,9 +2502,12 @@ def _bsa_attn_fwd_sm100_blk64(
         block_sizes,
         q2k_block_nums,
     )
-    use_exact_kv_layout = _sm100_blk64_requires_int64_kv_strides(
-        k_bhsd,
-        v_bhsd,
+    # The rank-6 sparse-block view has no sequence bound: a short final block
+    # would read the next head/batch (or past the allocation).  The exact
+    # layout keeps the real KV length so TMA zero-fills the tail.
+    use_exact_kv_layout = not is_sage_fp8 and (
+        seqlen_k % 64 != 0
+        or _sm100_blk64_requires_int64_kv_strides(k_bhsd, v_bhsd)
     )
 
     if softmax_scale is None:
@@ -2441,6 +2530,13 @@ def _bsa_attn_fwd_sm100_blk64(
         head_dim_v,
         kv_splits_i,
         allow_fallback=auto_kv_splits,
+    )
+    use_sage_ldred_rowmax = is_sage_fp8 and _sm103_blk64_use_sage_fp8_ldred(
+        arch,
+        batch_size,
+        num_head,
+        seqlen_q,
+        kv_splits_i,
     )
     allow_empty_block_nums = (
         allow_empty_block_nums and has_variable_block_nums
@@ -2529,6 +2625,7 @@ def _bsa_attn_fwd_sm100_blk64(
             has_variable_block_nums,
             allow_empty_block_nums,
             has_block_sizes,
+            block_sizes_mode,
             kv_splits_i,
             out_bhsd.dtype,
             is_persistent,
@@ -2536,6 +2633,7 @@ def _bsa_attn_fwd_sm100_blk64(
             input_layout,
             use_exact_kv_layout,
             is_sage_fp8,
+            use_sage_ldred_rowmax,
             "tvm_ffi_env_stream_v1",
         ),
         (
@@ -2556,21 +2654,17 @@ def _bsa_attn_fwd_sm100_blk64(
 
     aot_kernel = None
     sm100_aot_only = is_sm100_aot_only()
-    if is_sage_fp8:
-        if sm100_aot_only:
-            raise Sm100AotArtifactError(
-                "SM100 AOT-only mode supports BF16 forward only; "
-                "Sage/FP8 remains JIT-only"
-            )
-    elif arch in (100, 103):
+    if arch in (100, 103):
         aot_variant = Sm100AotVariant(
-            dtype="bf16",
+            dtype="fp8" if is_sage_fp8 else "bf16",
             has_block_nums=has_variable_block_nums,
             allow_empty_block_nums=allow_empty_block_nums,
             has_block_sizes=has_block_sizes,
             kv_splits=kv_splits_i,
             use_clc_scheduler=use_clc_scheduler,
             use_int64_kv_strides=use_exact_kv_layout,
+            block_sizes_mode=block_sizes_mode,
+            use_sage_ldred_rowmax=use_sage_ldred_rowmax,
         )
         aot_runtime_tensors = (
             q_bhsd,
@@ -2578,6 +2672,9 @@ def _bsa_attn_fwd_sm100_blk64(
             v_bhsd,
             out_bhsd,
             lse,
+            q_scale,
+            k_scale,
+            v_scale,
             q2k_block_index,
             block_sizes,
             q2k_block_nums,
@@ -2634,7 +2731,9 @@ def _bsa_attn_fwd_sm100_blk64(
             use_clc_scheduler=use_clc_scheduler,
             allow_empty_block_nums=allow_empty_block_nums,
             has_block_sizes=has_block_sizes,
+            block_sizes_mode=block_sizes_mode,
             num_splits=kv_splits_i,
+            use_sage_ldred_rowmax=use_sage_ldred_rowmax,
             use_exact_kv_layout=use_exact_kv_layout,
         )
 
@@ -2653,9 +2752,9 @@ def _bsa_attn_fwd_sm100_blk64(
                     v_bhsd,
                     out_bhsd,
                     lse,
-                    None,
-                    None,
-                    None,
+                    q_scale,
+                    k_scale,
+                    v_scale,
                     softmax_scale,
                     q2k_block_index,
                     block_sizes,
@@ -2669,17 +2768,28 @@ def _bsa_attn_fwd_sm100_blk64(
                 compiled_fn = None
             else:
                 compiled_fn = _bsa_attn_fwd_sm100_blk64.compile_cache[compile_key]
-            if is_sage_fp8 and _bsa_fp8_blk64_fast_layout(
-                q_bhsd,
-                k_bhsd,
-                v_bhsd,
-                q_scale,
-                k_scale,
-                v_scale,
-                q2k_block_index,
+            if (
+                is_sage_fp8
+                and not has_variable_block_nums
+                and compiled_fn is not None
+                and _bsa_fp8_blk64_fast_layout(
+                    q_bhsd,
+                    k_bhsd,
+                    v_bhsd,
+                    q_scale,
+                    k_scale,
+                    v_scale,
+                    q2k_block_index,
+                    *([block_sizes] if has_block_sizes else []),
+                )
             ):
                 _bsa_fp8_blk64_fast_cache[
-                    _bsa_fp8_blk64_fast_key(q_bhsd, kv_splits_i)
+                    _bsa_fp8_blk64_fast_key(
+                        q_bhsd,
+                        kv_splits_i,
+                        block_sizes_mode,
+                        use_sage_ldred_rowmax,
+                    )
                 ] = compiled_fn
             if compiled_fn is not None:
                 compiled_fn(
@@ -2700,6 +2810,12 @@ def _bsa_attn_fwd_sm100_blk64(
                     current_stream,
                 )
 
+    use_fast_16_split = (
+        kv_splits_i == 16
+        and not has_variable_block_nums
+        and uniform_block_sparse_num >= kv_splits_i
+    )
+    aot_combine_kernel = None
     if kv_splits_i > 1:
         out_bhsd, lse = _combine_blk64_kv_bucketed_partials(
             q_bhsd,
@@ -2707,14 +2823,41 @@ def _bsa_attn_fwd_sm100_blk64(
             lse,
             kv_splits_i,
             output_dtype=torch.bfloat16 if is_sage_fp8 else None,
-            use_fast_16_split=(
-                kv_splits_i == 16
-                and not has_variable_block_nums
-                and uniform_block_sparse_num >= kv_splits_i
-            ),
+            use_fast_16_split=use_fast_16_split,
         )
         # Keep split_offsets alive through the combine launch on the same stream.
         _ = split_offsets
+
+        if aot_kernel is not None and is_sage_fp8:
+            combine_variant = Sm100AotCombineVariant(
+                dtype="bf16",
+                value_dim=head_dim,
+                log_max_splits=_ceil_log2_int(kv_splits_i),
+                num_threads=256 if use_fast_16_split else 128,
+            )
+            aot_combine_kernel = get_sm100_aot_combine_kernel(
+                combine_variant,
+                arch,
+                required=sm100_aot_only,
+                device_index=q_bhsd.device.index,
+            )
+
+    if aot_kernel is not None and is_sage_fp8 and not has_variable_block_nums:
+        manifest_token = get_sm100_aot_manifest_token(arch)
+        if manifest_token is not None and (
+            kv_splits_i == 1 or aot_combine_kernel is not None
+        ):
+            fast_key = _bsa_fp8_blk64_fast_key(
+                q_bhsd,
+                kv_splits_i,
+                block_sizes_mode,
+                use_sage_ldred_rowmax,
+            )
+            _bsa_fp8_blk64_aot_fast_cache[fast_key] = (
+                manifest_token,
+                aot_kernel,
+                aot_combine_kernel,
+            )
 
     result_out = out_bhsd if layout == "bhsd" else out_bhsd.transpose(1, 2).contiguous()
     if requested_out is not None and result_out is not requested_out:
@@ -2738,9 +2881,13 @@ def _bsa_fp8_blk64_launch_cached(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
     q2k_block_index: torch.Tensor,
+    block_sizes: Optional[torch.Tensor],
     topk_num: int,
     softmax_scale: float,
     kv_splits: int,
+    *,
+    native_abi: bool = False,
+    combine_compiled=None,
 ) -> torch.Tensor:
     batch, heads, seqlen_q, _ = q_fp8.shape
     if kv_splits > 1:
@@ -2767,35 +2914,61 @@ def _bsa_fp8_blk64_launch_cached(
         )
 
     current_stream = cuda.CUstream(torch.cuda.current_stream(q_fp8.device).cuda_stream)
-    compiled_fn(
-        q_fp8,
-        k_fp8,
-        v_fp8,
-        out,
-        lse,
-        q_scale,
-        k_scale,
-        v_scale,
-        softmax_scale,
-        q2k_block_index,
-        None,
-        topk_num,
-        None,
-        None,
-        current_stream,
-    )
+    if native_abi:
+        native_args = _make_sm100_blk64_cute_args(
+            q_fp8,
+            k_fp8,
+            v_fp8,
+            out,
+            lse,
+            q_scale,
+            k_scale,
+            v_scale,
+            softmax_scale,
+            q2k_block_index,
+            block_sizes,
+            topk_num,
+            None,
+            None,
+            current_stream,
+            enable_tvm_ffi=False,
+        )
+        compiled_fn(*native_args)
+    else:
+        compiled_fn(
+            q_fp8,
+            k_fp8,
+            v_fp8,
+            out,
+            lse,
+            q_scale,
+            k_scale,
+            v_scale,
+            softmax_scale,
+            q2k_block_index,
+            block_sizes,
+            topk_num,
+            None,
+            None,
+            current_stream,
+        )
     if kv_splits > 1:
-        combine_key = _bsa_fp8_blk64_fast_key(q_fp8, kv_splits)
-        combine_compiled = _bsa_fp8_blk64_combine_fast_cache.get(combine_key)
         if combine_compiled is None:
-            combine_compiled = _get_precompiled_blk64_kv_combine(
-                torch.bfloat16,
-                128,
-                kv_splits,
-                kv_splits == 16 and topk_num >= kv_splits,
-                q_fp8.device,
+            combine_key = _bsa_fp8_blk64_fast_key(q_fp8, kv_splits)
+            combine_compiled = _bsa_fp8_blk64_combine_fast_cache.get(
+                combine_key
             )
-            _bsa_fp8_blk64_combine_fast_cache[combine_key] = combine_compiled
+            if combine_compiled is None:
+                combine_compiled = _get_precompiled_blk64_kv_combine(
+                    torch.bfloat16,
+                    128,
+                    kv_splits,
+                    kv_splits == 16 and topk_num >= kv_splits,
+                    q_fp8.device,
+                )
+                _bsa_fp8_blk64_combine_fast_cache[
+                    combine_key
+                ] = combine_compiled
         out, _ = _combine_blk64_kv_bucketed_partials_precompiled(
             q_fp8,
             out,
@@ -2803,6 +2976,7 @@ def _bsa_fp8_blk64_launch_cached(
             kv_splits,
             combine_compiled,
             output_dtype=torch.bfloat16,
+            native_abi=native_abi,
         )
     return out
 
@@ -2825,12 +2999,11 @@ def bsa_fp8_blk64_fwd(
 
     Q/K/V use BHSD E4M3 storage.  Q scales are per token, K scales are
     per 16-token block, and V scales are per output channel. P uses a fixed
-    256 E4M3 scale for one native FP8 PV MMA. The result is BHSD BF16. This
-    SM100/SM110 use the fixed B=1, H in {4, 8}, D=128 contract with sequence
-    lengths aligned to the logical 64-token sparse block. SM120 accepts dynamic
-    positive batch/head counts and Q/KV tails, while retaining D=128 and MHA.
-    SM120 also supports per-Q-block ``q2k_block_nums`` and rank-1/2/3
-    ``block_sizes``.
+    256 E4M3 scale for one native FP8 PV MMA. The result is BHSD BF16.
+    SM100/SM103 and SM120 accept positive batch/head counts, Q/KV tails,
+    per-Q-block ``q2k_block_nums``, and rank-1/2/3 ``block_sizes`` while
+    retaining D=128 and MHA. Both backends handle non-64-aligned FP8 storage
+    directly in their native 64-token kernels.
     """
     assert q_fp8.dim() == 4 and k_fp8.dim() == 4 and v_fp8.dim() == 4
     batch, heads, seqlen_q, dim = q_fp8.shape
@@ -2845,23 +3018,10 @@ def bsa_fp8_blk64_fwd(
     assert arch_family in (10, 12), (
         "FP8 blk64 BSA only supports SM100 and SM120"
     )
-    if arch_family == 10 and is_sm100_aot_only():
-        raise Sm100AotArtifactError(
-            "SM100 AOT-only mode supports BF16 forward only; "
-            "Sage/FP8 remains JIT-only"
-        )
-    if arch_family == 12:
-        assert batch >= 1 and heads >= 1, (
-            "SM120 FP8 blk64 requires positive batch and head counts"
-        )
-        num_q_blocks = _ceil_div_int(seqlen_q, SM120_FWD_BLOCK_SIZE)
-    else:
-        assert batch == 1, "FP8 blk64 v1 requires B=1"
-        assert heads in (4, 8), "FP8 blk64 v1 supports H=4 or H=8"
-        assert seqlen_q % 64 == 0 and k_fp8.shape[2] % 64 == 0, (
-            "FP8 blk64 v1 requires Sq and Sk to be multiples of 64"
-        )
-        num_q_blocks = seqlen_q // 64
+    assert batch >= 1 and heads >= 1, (
+        "FP8 blk64 requires positive batch and head counts"
+    )
+    num_q_blocks = _ceil_div_int(seqlen_q, 64)
     assert q2k_block_index.dtype == torch.int32
     assert q2k_block_index.device == q_fp8.device
     assert q2k_block_index.shape == (
@@ -2904,23 +3064,89 @@ def bsa_fp8_blk64_fwd(
         )
         return out
 
-    assert q2k_block_nums is None or q2k_block_nums.numel() == 0, (
-        "FP8 q2k_block_nums is currently supported only on SM120"
-    )
-    assert block_sizes is None or block_sizes.numel() == 0, (
-        "FP8 block_sizes is currently supported only on SM120"
+    if has_block_nums:
+        assert q2k_block_nums.dtype == torch.int32
+        assert q2k_block_nums.device == q_fp8.device
+        assert q2k_block_nums.shape == (batch, heads, num_q_blocks)
+        q2k_block_nums = q2k_block_nums.contiguous()
+    else:
+        q2k_block_nums = None
+
+    num_kv_blocks = _ceil_div_int(k_fp8.shape[2], 64)
+    has_block_sizes = block_sizes is not None and block_sizes.numel() > 0
+    block_sizes_mode = 0
+    if has_block_sizes:
+        assert block_sizes.dtype == torch.int32
+        assert block_sizes.device == q_fp8.device
+        if block_sizes.ndim == 1:
+            assert block_sizes.shape == (num_kv_blocks,)
+            block_sizes_mode = 1
+        elif block_sizes.ndim == 2:
+            assert block_sizes.shape == (batch, num_kv_blocks)
+            block_sizes_mode = 2
+        else:
+            assert block_sizes.ndim == 3
+            assert block_sizes.shape == (batch, heads, num_kv_blocks)
+            block_sizes_mode = 3
+        block_sizes = block_sizes.contiguous()
+    else:
+        block_sizes = None
+
+    policy_topk = (
+        q2k_block_index.shape[-1] if has_block_nums else topk_num
     )
     kv_splits = _sm100_blk64_auto_fp8_kv_splits(
-        topk_num,
+        policy_topk,
         heads,
         seqlen_q,
+        batch,
     )
-    fast_key = _bsa_fp8_blk64_fast_key(q_fp8, kv_splits)
-    compiled_fn = _bsa_fp8_blk64_fast_cache.get(fast_key)
+
+    # Q/K/V and scale metadata keep their true extents. The SM100 kernel itself
+    # detects and masks its final physical KV block, matching SM120's contract.
+    use_sage_ldred_rowmax = _sm103_blk64_use_sage_fp8_ldred(
+        _get_device_arch(q_fp8.device),
+        batch,
+        heads,
+        seqlen_q,
+        kv_splits,
+    )
+    fast_key = _bsa_fp8_blk64_fast_key(
+        q_fp8,
+        kv_splits,
+        block_sizes_mode,
+        use_sage_ldred_rowmax,
+    )
+    aot_fast_entry = (
+        None
+        if has_block_nums or is_fake_mode()
+        else _get_sm100_fp8_aot_fast_entry(
+            fast_key,
+            _get_device_arch(q_fp8.device),
+        )
+    )
+    compiled_fn = (
+        None
+        if has_block_nums or is_sm100_aot_only() or aot_fast_entry is not None
+        else _bsa_fp8_blk64_fast_cache.get(fast_key)
+    )
+    fast_tensors = (
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_scale,
+        k_scale,
+        v_scale,
+        q2k_block_index,
+        *([block_sizes] if has_block_sizes else []),
+    )
     if (
-        compiled_fn is not None
-        and not is_fake_mode()
-        and _bsa_fp8_blk64_fast_layout(
+        aot_fast_entry is not None
+        and _bsa_fp8_blk64_aot_fast_layout(*fast_tensors)
+    ):
+        aot_kernel, aot_combine_kernel = aot_fast_entry
+        return _bsa_fp8_blk64_launch_cached(
+            aot_kernel,
             q_fp8,
             k_fp8,
             v_fp8,
@@ -2928,7 +3154,17 @@ def bsa_fp8_blk64_fwd(
             k_scale,
             v_scale,
             q2k_block_index,
+            block_sizes,
+            topk_num,
+            softmax_scale,
+            kv_splits,
+            native_abi=True,
+            combine_compiled=aot_combine_kernel,
         )
+    if (
+        compiled_fn is not None
+        and not is_fake_mode()
+        and _bsa_fp8_blk64_fast_layout(*fast_tensors)
     ):
         return _bsa_fp8_blk64_launch_cached(
             compiled_fn,
@@ -2939,6 +3175,7 @@ def bsa_fp8_blk64_fwd(
             k_scale,
             v_scale,
             q2k_block_index,
+            block_sizes,
             topk_num,
             softmax_scale,
             kv_splits,
@@ -2953,19 +3190,262 @@ def bsa_fp8_blk64_fwd(
         k_fp8,
         v_fp8,
         q2k_block_index,
-        None,
-        q2k_block_nums=None,
+        block_sizes,
+        q2k_block_nums=q2k_block_nums,
         softmax_scale=softmax_scale,
         layout="bhsd",
         block_sparse_num=topk_num,
         use_clc=False,
         kv_splits=kv_splits,
-        allow_empty_block_nums=False,
+        allow_empty_block_nums=has_block_nums,
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
     )
     return out
+
+
+_bsa_fp8_blk128_cache = get_jit_cache("bsa_fp8_blk128_fwd")
+_bsa_fp8_blk128_aot_dispatch_cache = {}
+
+
+def _make_fp8_blk128_native_args(args):
+    native = []
+    for index, value in enumerate(args):
+        if isinstance(value, torch.Tensor):
+            native.append(_to_cute_tensor_dynamic_compact_shape(
+                value, mode=(0, 1, 2) if index < 4 else tuple(range(value.ndim)),
+                assumed_align=16 if index < 4 else 4, enable_tvm_ffi=False,
+            ))
+        else:
+            native.append(value)
+    return tuple(native)
+
+
+def _combine_fp8_blk128_aot_partials(q, out, lse, kv_splits, compiled):
+    return _combine_blk64_kv_bucketed_partials_precompiled(
+        q, out, lse, kv_splits, compiled,
+        output_dtype=torch.bfloat16, native_abi=True,
+    )[0]
+
+
+def _bsa_fp8_blk128_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    block_index: torch.Tensor,
+    topk: int,
+    softmax_scale: Optional[float],
+    block_sizes: Optional[torch.Tensor],
+    block_nums: Optional[torch.Tensor],
+    kv_splits: int = 1,
+) -> torch.Tensor:
+    assert type(kv_splits) is int and 1 <= kv_splits <= 256, "kv_splits must be an integer in [1, 256]"
+    assert q.ndim == k.ndim == v.ndim == 4
+    batch, heads, sq, dim = q.shape
+    assert batch > 0 and heads > 0 and sq > 0 and dim == 128
+    assert k.shape[:2] == (batch, heads) and k.shape[-1] == 128
+    assert v.shape == k.shape and k.shape[2] > 0
+    assert q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
+    assert q.is_cuda and k.device == v.device == q.device
+    # Match the public blk64 contract for valid views while retaining compact
+    # native descriptors. Already contiguous quantizer outputs are unchanged.
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    arch = _get_device_arch(q.device)
+    assert arch in (100, 103), "FP8 blk128 requires SM100/SM103"
+    sk = k.shape[2]
+    q_blocks, kv_blocks = _ceil_div_int(sq, 128), _ceil_div_int(sk, 128)
+    assert block_index.ndim == 4 and block_index.shape[:3] == (batch, heads, q_blocks)
+    assert block_index.dtype == torch.int32 and block_index.device == q.device
+    assert block_index.shape[-1] >= 1
+    block_index = block_index.contiguous()
+    has_block_nums = block_nums is not None and block_nums.numel() > 0
+    if has_block_nums:
+        assert block_nums.dtype == torch.int32 and block_nums.device == q.device
+        assert block_nums.shape == (batch, heads, q_blocks)
+        block_nums = block_nums.contiguous()
+    else:
+        block_nums = None
+        assert 1 <= int(topk) <= block_index.shape[-1]
+
+    block_sizes_mode = 0
+    if block_sizes is not None and block_sizes.numel() > 0:
+        assert block_sizes.dtype == torch.int32 and block_sizes.device == q.device
+        shapes = {1: (kv_blocks,), 2: (batch, kv_blocks), 3: (batch, heads, kv_blocks)}
+        assert block_sizes.ndim in shapes and block_sizes.shape == shapes[block_sizes.ndim]
+        block_sizes_mode = block_sizes.ndim
+        block_sizes = block_sizes.contiguous()
+    else:
+        block_sizes = None
+    # Quantization already returns these shapes. Avoid allocating three view
+    # objects on each eager call, while retaining flattened/noncontiguous input.
+    q_scale = (q_scale if q_scale.shape == (batch, heads, sq)
+               else q_scale.reshape(batch, heads, -1)).contiguous()
+    k_scale = (k_scale if k_scale.shape == (batch, heads, _ceil_div_int(sk, 16))
+               else k_scale.reshape(batch, heads, -1)).contiguous()
+    v_scale = (v_scale if v_scale.shape == (heads, 128)
+               else v_scale.reshape(heads, 128)).contiguous()
+    assert q_scale.shape == (batch, heads, sq)
+    assert k_scale.shape == (batch, heads, _ceil_div_int(sk, 16))
+    for scale in (q_scale, k_scale, v_scale):
+        assert scale.dtype == torch.float32 and scale.device == q.device
+    softmax_scale = dim ** -0.5 if softmax_scale is None else softmax_scale
+    out = torch.empty(
+        (batch, heads * kv_splits, sq, dim), device=q.device,
+        dtype=torch.float32 if kv_splits > 1 else torch.bfloat16,
+    )
+    lse = (
+        torch.empty((batch, heads * kv_splits, sq), device=q.device, dtype=torch.float32)
+        if kv_splits > 1 else None
+    )
+    # Every extent/stride except D is dynamic; ranks and layouts are validated
+    # above. Keep this cache separate from blk64 and from half-precision blk128.
+    cache_key = (arch, q.device.index, has_block_nums, block_sizes_mode, kv_splits, fa_logging.get_fa_log_level())
+    fake_mode = is_fake_mode()
+    stream = (
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        if fake_mode
+        else cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
+    )
+    aot_key = (*cache_key, fp8_blk128_aot_dispatch_token())
+    if aot_key not in _bsa_fp8_blk128_aot_dispatch_cache:
+        variant = Sm100Fp8Blk128AotVariant(has_block_nums, block_sizes_mode, kv_splits)
+        _bsa_fp8_blk128_aot_dispatch_cache[aot_key] = get_fp8_blk128_aot_bundle(
+            variant, arch, q.device.index,
+        )
+    aot_bundle = _bsa_fp8_blk128_aot_dispatch_cache[aot_key]
+    if aot_bundle is not None:
+        if not fake_mode:
+            args = (q, k, v, out, lse, q_scale, k_scale, v_scale, softmax_scale,
+                    block_index, block_sizes, int(topk), block_nums, stream)
+            aot_bundle[0](*_make_fp8_blk128_native_args(args))
+        if kv_splits > 1:
+            return _combine_fp8_blk128_aot_partials(q, out, lse, kv_splits, aot_bundle[1])
+        return out
+    if cache_key not in _bsa_fp8_blk128_cache:
+        kernel = BlockSparseAttnForwardFp8FusedPvSm100Blk128(
+            128,
+            allow_empty_block_nums=has_block_nums,
+            has_block_sizes=block_sizes_mode != 0,
+            block_sizes_mode=block_sizes_mode,
+            num_splits=kv_splits,
+        )
+        q_c, k_c, v_c, o_c = [
+            _to_cute_tensor_with_dynamic_modes(t, dynamic_modes=(0, 1, 2))
+            for t in (q, k, v, out)
+        ]
+        def metadata(t):
+            return (
+                _to_cute_tensor_with_dynamic_modes(
+                    t, dynamic_modes=tuple(range(t.ndim)), assumed_align=4
+                )
+                if t is not None else None
+            )
+        _bsa_fp8_blk128_cache[cache_key] = cute.compile(
+            kernel, q_c, k_c, v_c, o_c, metadata(lse),
+            metadata(q_scale), metadata(k_scale), metadata(v_scale),
+            softmax_scale, metadata(block_index), metadata(block_sizes),
+            int(topk), metadata(block_nums), stream,
+            options="--enable-tvm-ffi",
+        )
+    if not fake_mode:
+        compiled_fn = _bsa_fp8_blk128_cache[cache_key]
+        if isinstance(compiled_fn, TVMFFIFunction):
+            # All arguments are flat tensors/scalars/streams. The native TVM
+            # entry can consume them directly; no dataclass flattening is needed.
+            TVMFFIFunction.__call__(
+                compiled_fn, q, k, v, out, lse, q_scale, k_scale, v_scale,
+                softmax_scale, block_index, block_sizes, int(topk), block_nums, stream,
+            )
+        else:
+            compiled_fn(
+                q, k, v, out, lse, q_scale, k_scale, v_scale,
+                softmax_scale, block_index, block_sizes, int(topk), block_nums, stream,
+            )
+    if kv_splits > 1:
+        out, _ = _combine_blk64_kv_bucketed_partials(
+            q, out, lse, kv_splits, output_dtype=torch.bfloat16
+        )
+    return out
+
+
+def bsa_fp8_blk128_fwd(
+    q_fp8: torch.Tensor,
+    k_fp8: torch.Tensor,
+    v_fp8: torch.Tensor,
+    q_sfs: torch.Tensor,
+    k_sfs: torch.Tensor,
+    v_sfs: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    topk_num: int,
+    softmax_scale: Optional[float] = None,
+    *,
+    block_sizes: Optional[torch.Tensor] = None,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    kv_splits: int = 1,
+) -> torch.Tensor:
+    """Forward-only SM100/SM103 Sage FP8 attention with 128-token blocks.
+
+    The positional arguments, scale recipe and sparse metadata follow
+    ``bsa_fp8_blk64_fwd``. Q/K/V use E4M3 BHSD storage with D=128 and MHA;
+    the result is one BF16 BHSD tensor. Dynamic B/H, physical sequence tails,
+    odd/zero per-row block counts and rank-1/2/3 block extents are supported.
+    Noncontiguous input/metadata views are materialized as needed.
+
+    The validated default split policy is one: measured 2/4/8-way splitting
+    has not improved the covered workloads. The optional keyword override
+    selects 1 through 256 native FP32 producers and a native combine. It does
+    not change the meaning of ``topk_num`` or the sparse index prefix.
+    """
+    return _bsa_fp8_blk128_fwd(
+        q_fp8, k_fp8, v_fp8, q_sfs, k_sfs, v_sfs,
+        q2k_block_index, topk_num, softmax_scale, block_sizes, q2k_block_nums, kv_splits,
+    )
+
+
+def bsa_fp8_fwd(
+    q_fp8: torch.Tensor,
+    k_fp8: torch.Tensor,
+    v_fp8: torch.Tensor,
+    q_sfs: torch.Tensor,
+    k_sfs: torch.Tensor,
+    v_sfs: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    topk_num: int,
+    softmax_scale: Optional[float] = None,
+    *,
+    sparse_block_size: int = 64,
+    block_sizes: Optional[torch.Tensor] = None,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    kv_splits: int = 1,
+) -> torch.Tensor:
+    """Sage FP8 forward with explicit 64- or 128-token sparse blocks.
+
+    Q/K/V are BHSD E4M3 tensors with D=128 and MHA heads.
+    Blk128 materializes noncontiguous views; quantizer outputs need no copy.
+    The output is BHSD BF16. Scales follow ``quantize_sage_bhsd`` for either
+    block size. Sparse indices/counts must use the selected block size.
+    SM100/SM103 support both sizes; SM120 supports 64 only. For blk128,
+    ``kv_splits`` explicitly partitions each sparse row (default 1). Split
+    producers write FP32 partials and statistics before a native combine.
+    Both paths accept sequence tails and empty rows on SM100/SM103, plus
+    rank-1/2/3 ``block_sizes``. Blk64 retains its existing automatic policy.
+    """
+    assert sparse_block_size in (64, 128), "sparse_block_size must be 64 or 128"
+    if sparse_block_size == 64:
+        assert kv_splits == 1, "Explicit kv_splits is supported for blk128 only"
+        return bsa_fp8_blk64_fwd(
+            q_fp8, k_fp8, v_fp8, q_sfs, k_sfs, v_sfs,
+            q2k_block_index, topk_num, softmax_scale,
+            block_sizes=block_sizes, q2k_block_nums=q2k_block_nums,
+        )
+    return _bsa_fp8_blk128_fwd(
+        q_fp8, k_fp8, v_fp8, q_sfs, k_sfs, v_sfs,
+        q2k_block_index, topk_num, softmax_scale, block_sizes, q2k_block_nums, kv_splits,
+    )
 
 
 def bsa_attn_fwd(
@@ -3003,7 +3483,8 @@ def bsa_attn_fwd(
             requires at least 1; blk128 requires an even value >= 2. Ignored
             when q2k_block_nums is provided.
         block_sizes: Actual token count per KV block (num_kv_blocks,), int32. Used for masking padding positions.
-            When None, block_size masking is skipped (assumes all blocks are full).
+            When None, block_size masking is skipped (assumes all blocks are full);
+            SM100/SM110 blk64 still masks the physical KV tail.
         q2k_block_nums: Per-(batch, head, q_block) number of KV blocks to attend to,
             (batch, num_heads, num_q_blocks) int32, each value >= 0.
             When None, uses fixed block_sparse_num for all Q blocks.

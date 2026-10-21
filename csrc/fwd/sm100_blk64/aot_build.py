@@ -22,6 +22,7 @@ from block_sparse_attention.csrc.fwd.sm100_blk64.aot_utils import (
     get_host_cpu_arch,
     get_sm100_aot_artifact_dir,
     iter_sm100_aot_combine_variants,
+    iter_sm100_fp8_aot_variants,
     iter_sm100_aot_variants,
     sha256_file,
     write_sm100_aot_manifest,
@@ -72,14 +73,36 @@ def _make_dynamic_compact_fake_tensor(
 
 def make_sm100_aot_fake_args(variant: Sm100AotVariant):
     output_dtype = cutlass.Float32 if variant.kv_splits > 1 else cutlass.BFloat16
-    mQ = _make_dynamic_fake_tensor(cutlass.BFloat16, 4, 16)
-    mK = _make_dynamic_fake_tensor(cutlass.BFloat16, 4, 16)
-    mV = _make_dynamic_fake_tensor(cutlass.BFloat16, 4, 16)
+    input_dtype = (
+        cutlass.Float8E4M3FN if variant.is_fp8 else cutlass.BFloat16
+    )
+    mQ = _make_dynamic_fake_tensor(input_dtype, 4, 16)
+    mK = _make_dynamic_fake_tensor(input_dtype, 4, 16)
+    mV = _make_dynamic_fake_tensor(input_dtype, 4, 16)
     mO = _make_dynamic_fake_tensor(output_dtype, 4, 16)
     mLSE = _make_dynamic_fake_tensor(cutlass.Float32, 3, 4)
+    mQScale = (
+        _make_dynamic_fake_tensor(cutlass.Float32, 3, 4)
+        if variant.is_fp8
+        else None
+    )
+    mKScale = (
+        _make_dynamic_fake_tensor(cutlass.Float32, 3, 4)
+        if variant.is_fp8
+        else None
+    )
+    mVScale = (
+        _make_dynamic_fake_tensor(cutlass.Float32, 2, 4)
+        if variant.is_fp8
+        else None
+    )
     mBlockIndex = _make_dynamic_fake_tensor(cutlass.Int32, 4, 16)
     mBlockSizes = (
-        _make_dynamic_fake_tensor(cutlass.Int32, 1, 16)
+        _make_dynamic_fake_tensor(
+            cutlass.Int32,
+            variant.block_sizes_mode,
+            16,
+        )
         if variant.has_block_sizes
         else None
     )
@@ -102,9 +125,9 @@ def make_sm100_aot_fake_args(variant: Sm100AotVariant):
         mV,
         mO,
         mLSE,
-        None,
-        None,
-        None,
+        mQScale,
+        mKScale,
+        mVScale,
         cutlass.Float32(128**-0.5),
         mBlockIndex,
         mBlockSizes,
@@ -156,6 +179,10 @@ def make_sm100_aot_combine_fake_args(variant: Sm100AotCombineVariant):
 
 
 def compile_sm100_aot_variant(variant: Sm100AotVariant, target_arch: str):
+    if variant.use_sage_ldred_rowmax and target_arch != "sm_103a":
+        raise ValueError(
+            "Sage ld.red row-max AOT variants require target sm_103a"
+        )
     kernel = BlockSparseAttnForwardSm100Blk64(
         128,
         128,
@@ -168,7 +195,9 @@ def compile_sm100_aot_variant(variant: Sm100AotVariant, target_arch: str):
         use_clc_scheduler=variant.use_clc_scheduler,
         allow_empty_block_nums=variant.allow_empty_block_nums,
         has_block_sizes=variant.has_block_sizes,
+        block_sizes_mode=variant.block_sizes_mode,
         num_splits=variant.kv_splits,
+        use_sage_ldred_rowmax=variant.use_sage_ldred_rowmax,
         use_exact_kv_layout=variant.use_int64_kv_strides,
     )
     return cute.compile(
@@ -258,6 +287,12 @@ def build_sm100_aot_artifacts(
         )
     if not variants:
         raise ValueError("At least one SM100 AOT variant is required")
+    if target_arch != "sm_103a" and any(
+        variant.use_sage_ldred_rowmax for variant in variants
+    ):
+        raise ValueError(
+            "Sage ld.red row-max AOT variants require target sm_103a"
+        )
     _require_configured_target_arch(target_arch)
     artifact_dir = get_sm100_aot_artifact_dir(output_root, target_arch)
     entries = {}
@@ -323,7 +358,7 @@ def _parse_bool_matrix(value: str) -> tuple[bool, ...]:
 
 def _create_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Build SM100/SM103 blk64 BF16 CuTe DSL AOT artifacts"
+        description="Build SM100/SM103 blk64 BF16 and FP8 CuTe DSL AOT artifacts"
     )
     parser.add_argument(
         "--output-dir",
@@ -335,7 +370,15 @@ def _create_argument_parser() -> argparse.ArgumentParser:
         choices=SM100_AOT_TARGET_ARCHES,
         default=os.environ.get("CUTE_DSL_ARCH", "sm_100a"),
     )
+    parser.add_argument("--dtypes", default="bf16,fp8")
     parser.add_argument("--kv-splits", default="1,2,4,8")
+    parser.add_argument("--fp8-kv-splits", default="1,4,8,16")
+    parser.add_argument("--fp8-block-sizes-modes", default="0,1,2,3")
+    parser.add_argument(
+        "--fp8-ldred",
+        choices=("auto", "both", "disabled", "enabled"),
+        default="auto",
+    )
     parser.add_argument(
         "--block-nums",
         choices=("both", "disabled", "enabled"),
@@ -368,14 +411,40 @@ def _create_argument_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = _create_argument_parser().parse_args(argv)
-    variants = iter_sm100_aot_variants(
-        _parse_bool_matrix(args.block_nums),
-        _parse_bool_matrix(args.allow_empty_block_nums),
-        _parse_bool_matrix(args.block_sizes),
-        _parse_csv(args.kv_splits, int),
-        _parse_bool_matrix(args.use_clc),
-        _parse_bool_matrix(args.int64_kv_strides),
-    )
+    dtypes = _parse_csv(args.dtypes, str)
+    unsupported_dtypes = sorted(set(dtypes) - {"bf16", "fp8"})
+    if unsupported_dtypes:
+        raise ValueError(
+            f"Unsupported SM100 AOT dtypes: {', '.join(unsupported_dtypes)}"
+        )
+    variants = ()
+    if "bf16" in dtypes:
+        variants += iter_sm100_aot_variants(
+            _parse_bool_matrix(args.block_nums),
+            _parse_bool_matrix(args.allow_empty_block_nums),
+            _parse_bool_matrix(args.block_sizes),
+            _parse_csv(args.kv_splits, int),
+            _parse_bool_matrix(args.use_clc),
+            _parse_bool_matrix(args.int64_kv_strides),
+        )
+    if "fp8" in dtypes:
+        if args.fp8_ldred == "auto":
+            ldred_values = (
+                (False, True) if args.target_arch == "sm_103a" else (False,)
+            )
+        elif args.fp8_ldred == "both":
+            ldred_values = (False, True)
+        else:
+            ldred_values = (args.fp8_ldred == "enabled",)
+        if args.target_arch != "sm_103a" and True in ldred_values:
+            raise ValueError("FP8 ld.red is only available for target sm_103a")
+        variants += iter_sm100_fp8_aot_variants(
+            _parse_bool_matrix(args.block_nums),
+            _parse_csv(args.fp8_block_sizes_modes, int),
+            _parse_csv(args.fp8_kv_splits, int),
+            ldred_values,
+        )
+    variants = tuple(sorted(set(variants), key=lambda variant: variant.name))
     combine_variants = iter_sm100_aot_combine_variants(variants)
     if args.dry_run:
         for variant in variants:
@@ -384,6 +453,13 @@ def main(argv=None) -> int:
             print(f"{args.target_arch}/{variant.name}")
         print(f"Target: {args.target_arch}")
         print(f"Main variants: {len(variants)}")
+        print(
+            "Dtype variants: "
+            + ", ".join(
+                f"{dtype}={sum(variant.dtype == dtype for variant in variants)}"
+                for dtype in sorted(set(dtypes))
+            )
+        )
         print(f"Combine variants: {len(combine_variants)}")
         return 0
     build_sm100_aot_artifacts(

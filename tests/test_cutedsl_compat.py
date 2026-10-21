@@ -16,7 +16,8 @@ from block_sparse_attention.csrc.utils import copy_utils, cute_dsl_utils
         ("4.5.2", False),
         ("4.6.0", True),
         ("4.6.1", True),
-        ("4.7.0.dev0", True),
+        ("4.6.2", False),
+        ("4.7.0.dev0", False),
     ),
 )
 def test_cute_dsl_bulk_copy_self_election_version(
@@ -56,20 +57,36 @@ def test_bulk_copy_elect_one_uses_version_selected_context(monkeypatch):
 
 
 def test_constexpr_tvm_ffi_converter_handles_tuple_field():
+    ctx = converter.ConverterContext()
+    converted_field = converter._convert_single_arg(
+        (64, 128),
+        "tile_shape",
+        cutlass.Constexpr[Tuple[int, int]],
+        ctx,
+    )
+    assert isinstance(converted_field, spec.ConstNone)
+
     @dataclass
     class Params:
         tile_shape: cutlass.Constexpr[Tuple[int, int]]
+        active_rows: cutlass.Int32
 
     converted = converter._convert_single_arg(
-        Params((64, 128)),
+        Params((64, 128), 7),
         "params",
         Params,
-        converter.ConverterContext(),
+        ctx,
     )
 
     assert isinstance(converted, spec.TupleParam)
-    assert len(converted.params) == 1
-    assert isinstance(converted.params[0], spec.ConstNone)
+    # Some DSL versions omit static dataclass fields before calling the
+    # converter. Others retain a ConstNone placeholder. The dynamic field
+    # must survive either representation.
+    runtime_params = [
+        param for param in converted.params if not isinstance(param, spec.ConstNone)
+    ]
+    assert len(runtime_params) == 1
+    assert isinstance(runtime_params[0], spec.Var)
 
 
 def test_constexpr_tvm_ffi_converter_forwards_new_signature(monkeypatch):

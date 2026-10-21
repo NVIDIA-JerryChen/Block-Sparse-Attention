@@ -20,6 +20,17 @@ def _make_fake_bf16_inputs(device="cuda"):
     return q, k, v, q2k
 
 
+def _make_fake_fp8_inputs(device="cuda"):
+    q = torch.empty((1, 4, 64, 128), dtype=torch.float8_e4m3fn, device=device)
+    k = torch.empty((1, 4, 128, 128), dtype=torch.float8_e4m3fn, device=device)
+    v = torch.empty_like(k)
+    q_scale = torch.empty((1, 4, 64), dtype=torch.float32, device=device)
+    k_scale = torch.empty((1, 4, 8), dtype=torch.float32, device=device)
+    v_scale = torch.empty((4, 128), dtype=torch.float32, device=device)
+    q2k = torch.empty((1, 4, 1, 2), dtype=torch.int32, device=device)
+    return q, k, v, q_scale, k_scale, v_scale, q2k
+
+
 def test_device_arch_lookup_uses_explicit_device(monkeypatch):
     device_indices = []
 
@@ -180,7 +191,8 @@ def test_sm100_bf16_aot_hit_precedes_jit(monkeypatch, device_arch):
     assert variant.kv_splits == 1
     assert variant.use_clc_scheduler is False
     assert variant.use_int64_kv_strides is False
-    assert len(captured["tensors"]) == 9
+    assert len(captured["tensors"]) == 12
+    assert captured["tensors"][5:8] == (None, None, None)
     assert out.shape == q.shape
     assert lse.shape == q.shape[:3]
 
@@ -212,33 +224,30 @@ def test_sm100_aot_only_missing_forward_never_jits(monkeypatch):
         )
 
 
-def test_sm100_aot_only_rejects_sage_without_lookup_or_jit(monkeypatch):
+@pytest.mark.parametrize("device_arch", [100, 103])
+def test_sm100_fp8_aot_hit_precedes_jit(monkeypatch, device_arch):
+    captured = {}
+    aot_kernel = object()
     monkeypatch.setattr(
-        bsa_attn_interface, "_get_device_arch", lambda _device=None: 100
+        bsa_attn_interface, "_get_device_arch", lambda _device=None: device_arch
     )
-    monkeypatch.setattr(bsa_attn_interface, "is_sm100_aot_only", lambda: True)
+    monkeypatch.setattr(bsa_attn_interface, "is_sm100_aot_only", lambda: False)
 
-    def fail_aot_lookup(*args, **kwargs):
-        raise AssertionError("Sage/FP8 must not use the BF16 AOT resolver")
+    def fake_get_aot(variant, arch, tensors):
+        captured["variant"] = variant
+        captured["arch"] = arch
+        captured["tensors"] = tuple(tensors)
+        return aot_kernel
+
+    monkeypatch.setattr(bsa_attn_interface, "get_sm100_aot_kernel", fake_get_aot)
 
     def fail_compile(*args, **kwargs):
-        raise AssertionError("Sage/FP8 must not JIT in SM100 AOT-only mode")
+        raise AssertionError("cute.compile must not run on an FP8 AOT hit")
 
-    monkeypatch.setattr(bsa_attn_interface, "get_sm100_aot_kernel", fail_aot_lookup)
     monkeypatch.setattr(bsa_attn_interface.cute, "compile", fail_compile)
-    with FakeTensorMode(), pytest.raises(Sm100AotArtifactError, match="BF16"):
-        q = torch.empty(
-            (1, 4, 64, 128), dtype=torch.float8_e4m3fn, device="cuda"
-        )
-        k = torch.empty(
-            (1, 4, 128, 128), dtype=torch.float8_e4m3fn, device="cuda"
-        )
-        v = torch.empty_like(k)
-        q_scale = torch.empty((1, 4, 64), dtype=torch.float32, device="cuda")
-        k_scale = torch.empty((1, 4, 8), dtype=torch.float32, device="cuda")
-        v_scale = torch.empty((4, 128), dtype=torch.float32, device="cuda")
-        q2k = torch.empty((1, 4, 1, 2), dtype=torch.int32, device="cuda")
-        bsa_attn_interface._bsa_attn_fwd_sm100_blk64(
+    with FakeTensorMode():
+        q, k, v, q_scale, k_scale, v_scale, q2k = _make_fake_fp8_inputs()
+        out, _ = bsa_attn_interface._bsa_attn_fwd_sm100_blk64(
             q,
             k,
             v,
@@ -251,33 +260,49 @@ def test_sm100_aot_only_rejects_sage_without_lookup_or_jit(monkeypatch):
             v_scale=v_scale,
         )
 
+    variant = captured["variant"]
+    assert captured["arch"] == device_arch
+    assert variant.dtype == "fp8"
+    assert variant.block_sizes_mode == 0
+    assert variant.use_sage_ldred_rowmax is False
+    assert len(captured["tensors"]) == 12
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            captured["tensors"][5:8],
+            (q_scale, k_scale, v_scale),
+        )
+    )
+    assert out.dtype == torch.bfloat16
 
-def test_sm100_aot_only_rejects_sage_before_fast_cache(monkeypatch):
+
+def test_sm100_aot_only_missing_fp8_never_uses_fast_cache_or_jit(monkeypatch):
     monkeypatch.setattr(
         bsa_attn_interface, "_get_device_arch", lambda _device=None: 100
     )
     monkeypatch.setattr(bsa_attn_interface, "is_sm100_aot_only", lambda: True)
+    monkeypatch.setattr(
+        bsa_attn_interface,
+        "get_sm100_aot_kernel",
+        lambda *args, **kwargs: None,
+    )
 
-    def fail_cache_lookup(*args, **kwargs):
-        raise AssertionError("AOT-only mode must reject Sage before cache lookup")
+    class FailOnCacheLookup(dict):
+        def get(self, *args, **kwargs):
+            raise AssertionError("AOT-only FP8 must not use the JIT fast cache")
 
     monkeypatch.setattr(
         bsa_attn_interface,
-        "_sm100_blk64_auto_fp8_kv_splits",
-        fail_cache_lookup,
+        "_bsa_fp8_blk64_fast_cache",
+        FailOnCacheLookup(),
     )
-    with FakeTensorMode(), pytest.raises(Sm100AotArtifactError, match="BF16"):
-        q = torch.empty(
-            (1, 4, 64, 128), dtype=torch.float8_e4m3fn, device="cuda"
-        )
-        k = torch.empty(
-            (1, 4, 128, 128), dtype=torch.float8_e4m3fn, device="cuda"
-        )
-        v = torch.empty_like(k)
-        q_scale = torch.empty((1, 4, 64), dtype=torch.float32, device="cuda")
-        k_scale = torch.empty((1, 4, 8), dtype=torch.float32, device="cuda")
-        v_scale = torch.empty((4, 128), dtype=torch.float32, device="cuda")
-        q2k = torch.empty((1, 4, 1, 2), dtype=torch.int32, device="cuda")
+
+    def fail_compile(*args, **kwargs):
+        raise AssertionError("cute.compile must not run in AOT-only mode")
+
+    monkeypatch.setattr(bsa_attn_interface.cute, "compile", fail_compile)
+    with FakeTensorMode(), pytest.raises(Sm100AotArtifactError, match="missing"):
+        q, k, v, q_scale, k_scale, v_scale, q2k = _make_fake_fp8_inputs()
         bsa_attn_interface.bsa_fp8_blk64_fwd(
             q,
             k,
@@ -290,22 +315,106 @@ def test_sm100_aot_only_rejects_sage_before_fast_cache(monkeypatch):
         )
 
 
-def test_sm100_non_strict_sage_remains_jit_only(monkeypatch):
+def test_sm100_fp8_aot_fast_hit_uses_native_producer_and_combine(monkeypatch):
+    producer = object()
+    combine = object()
+    captured = {}
+    monkeypatch.setattr(
+        bsa_attn_interface, "_get_device_arch", lambda _device=None: 100
+    )
+    monkeypatch.setattr(
+        bsa_attn_interface, "_sm100_blk64_auto_fp8_kv_splits", lambda *args: 4
+    )
+    monkeypatch.setattr(
+        bsa_attn_interface,
+        "_get_sm100_fp8_aot_fast_entry",
+        lambda *args: (producer, combine),
+    )
+    monkeypatch.setattr(
+        bsa_attn_interface,
+        "_bsa_fp8_blk64_aot_fast_layout",
+        lambda *args: True,
+    )
+    monkeypatch.setattr(bsa_attn_interface, "is_fake_mode", lambda: False)
+    monkeypatch.setattr(bsa_attn_interface, "is_sm100_aot_only", lambda: True)
+
+    def fake_launch(compiled_fn, q, *args, **kwargs):
+        captured.update(
+            compiled_fn=compiled_fn,
+            native_abi=kwargs["native_abi"],
+            combine_compiled=kwargs["combine_compiled"],
+        )
+        return torch.empty_like(q, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(
+        bsa_attn_interface, "_bsa_fp8_blk64_launch_cached", fake_launch
+    )
+    monkeypatch.setattr(
+        bsa_attn_interface,
+        "_bsa_attn_fwd_sm100_blk64",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("an AOT fast hit must bypass general dispatch")
+        ),
+    )
+
+    with FakeTensorMode():
+        q, k, v, q_scale, k_scale, v_scale, q2k = _make_fake_fp8_inputs()
+        out = bsa_attn_interface.bsa_fp8_blk64_fwd(
+            q,
+            k,
+            v,
+            q_scale,
+            k_scale,
+            v_scale,
+            q2k,
+            2,
+        )
+
+    assert captured == {
+        "compiled_fn": producer,
+        "native_abi": True,
+        "combine_compiled": combine,
+    }
+    assert out.dtype == torch.bfloat16
+
+
+def test_sm100_fp8_aot_fast_cache_rejects_stale_manifest(monkeypatch):
+    fast_key = ("fp8", 4)
+    cache = {fast_key: (("old",), object(), object())}
+    monkeypatch.setattr(
+        bsa_attn_interface,
+        "_bsa_fp8_blk64_aot_fast_cache",
+        cache,
+    )
+    monkeypatch.setattr(
+        bsa_attn_interface,
+        "get_sm100_aot_manifest_token",
+        lambda _arch: ("new",),
+    )
+
+    assert (
+        bsa_attn_interface._get_sm100_fp8_aot_fast_entry(fast_key, 103)
+        is None
+    )
+    assert fast_key not in cache
+
+
+def test_sm100_non_strict_fp8_aot_miss_falls_back_to_jit(monkeypatch):
     monkeypatch.setattr(
         bsa_attn_interface, "_get_device_arch", lambda _device=None: 100
     )
     monkeypatch.setattr(bsa_attn_interface, "is_sm100_aot_only", lambda: False)
-
-    def fail_aot_lookup(*args, **kwargs):
-        raise AssertionError("Sage/FP8 must not use the BF16 AOT resolver")
-
+    monkeypatch.setattr(
+        bsa_attn_interface,
+        "get_sm100_aot_kernel",
+        lambda *args, **kwargs: None,
+    )
     compile_calls = []
 
     def fake_compile(*args, **kwargs):
         compile_calls.append((args, kwargs))
         return object()
 
-    monkeypatch.setattr(bsa_attn_interface, "get_sm100_aot_kernel", fail_aot_lookup)
     monkeypatch.setattr(bsa_attn_interface.cute, "compile", fake_compile)
     monkeypatch.setattr(
         bsa_attn_interface._bsa_attn_fwd_sm100_blk64,
@@ -313,17 +422,7 @@ def test_sm100_non_strict_sage_remains_jit_only(monkeypatch):
         {},
     )
     with FakeTensorMode():
-        q = torch.empty(
-            (1, 4, 64, 128), dtype=torch.float8_e4m3fn, device="cuda"
-        )
-        k = torch.empty(
-            (1, 4, 128, 128), dtype=torch.float8_e4m3fn, device="cuda"
-        )
-        v = torch.empty_like(k)
-        q_scale = torch.empty((1, 4, 64), dtype=torch.float32, device="cuda")
-        k_scale = torch.empty((1, 4, 8), dtype=torch.float32, device="cuda")
-        v_scale = torch.empty((4, 128), dtype=torch.float32, device="cuda")
-        q2k = torch.empty((1, 4, 1, 2), dtype=torch.int32, device="cuda")
+        q, k, v, q_scale, k_scale, v_scale, q2k = _make_fake_fp8_inputs()
         out, _ = bsa_attn_interface._bsa_attn_fwd_sm100_blk64(
             q,
             k,
@@ -343,7 +442,12 @@ def test_sm100_non_strict_sage_remains_jit_only(monkeypatch):
 
 
 @pytest.mark.parametrize("device_arch", [100, 103])
-def test_sm100_split_combine_aot_hit_never_jits(monkeypatch, device_arch):
+@pytest.mark.parametrize("q_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_sm100_split_combine_aot_hit_never_jits(
+    monkeypatch,
+    device_arch,
+    q_dtype,
+):
     captured = {}
     aot_kernel = object()
     monkeypatch.setattr(
@@ -368,7 +472,7 @@ def test_sm100_split_combine_aot_hit_never_jits(monkeypatch, device_arch):
         raise AssertionError("cute.compile must not run on an SM100 combine AOT hit")
 
     monkeypatch.setattr(bsa_attn_interface.cute, "compile", fail_compile)
-    q = torch.empty((1, 2, 64, 128), dtype=torch.bfloat16)
+    q = torch.empty((1, 2, 64, 128), dtype=q_dtype)
     o_partial = torch.empty((1, 4, 64, 128), dtype=torch.float32)
     lse_partial = torch.empty((1, 4, 64), dtype=torch.float32)
     out, lse = bsa_attn_interface._combine_blk64_kv_bucketed_partials(
@@ -376,6 +480,7 @@ def test_sm100_split_combine_aot_hit_never_jits(monkeypatch, device_arch):
         o_partial,
         lse_partial,
         2,
+        output_dtype=torch.bfloat16,
     )
 
     variant = captured["variant"]

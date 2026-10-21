@@ -8,7 +8,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
 
 import math
-from typing import Type, Tuple, Callable, Optional
+from typing import Tuple, Callable, Optional
 from functools import partial
 
 import cuda.bindings.driver as cuda
@@ -66,7 +66,9 @@ class BlockSparseAttnForwardSm100Blk64:
         use_clc_scheduler: cutlass.Constexpr[bool] = False,
         allow_empty_block_nums: cutlass.Constexpr[bool] = False,
         has_block_sizes: cutlass.Constexpr[bool] = True,
+        block_sizes_mode: cutlass.Constexpr[int] = 1,
         num_splits: cutlass.Constexpr[int] = 1,
+        use_sage_ldred_rowmax: cutlass.Constexpr[bool] = False,
         use_exact_kv_layout: cutlass.Constexpr[bool] = False,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
@@ -124,12 +126,17 @@ class BlockSparseAttnForwardSm100Blk64:
         self.is_split_kv = num_splits > 1
         self.allow_empty_block_nums = allow_empty_block_nums
         self.has_block_sizes = has_block_sizes
+        self.block_sizes_mode = block_sizes_mode
+        self.use_sage_ldred_rowmax = use_sage_ldred_rowmax
         self.use_exact_kv_layout = use_exact_kv_layout
         self.qhead_per_kvhead = qhead_per_kvhead
         self.pack_gqa = pack_gqa
         if pack_gqa:
             assert m_block_size % self.qhead_per_kvhead == 0, "For PackGQA, m_block_size must be divisible by qhead_per_kvhead"
         is_sm103 = self.arch >= Arch.sm_103 and self.arch <= Arch.sm_103f
+        assert not self.use_sage_ldred_rowmax or (
+            is_sm103 and not self.is_split_kv
+        ), "Sage ld.red row-max requires an unsplit SM103 kernel"
         self.enable_ex2_emu = self.head_dim_padded <= 128 and not is_sm103
 
         self.softmax0_warp_ids = (0, 1, 2, 3)
@@ -216,7 +223,7 @@ class BlockSparseAttnForwardSm100Blk64:
         mVScale: Optional[cute.Tensor],  # Sage FP8: (h, dv)
         softmax_scale: Float32,
         mBlockIndex: cute.Tensor,  # (batch, heads, num_q_blocks, max_kv_blocks), int32
-        mBlockSizes: Optional[cute.Tensor],  # (num_kv_blocks,), int32 or None
+        mBlockSizes: Optional[cute.Tensor],  # [N], [B,N], or [B,H,N] int32
         block_sparse_num: Int32,  # runtime scalar, even, >= 2
         mBlockNums: Optional[cute.Tensor],  # (batch, heads, num_q_blocks), int32 or None
         mSplitOffsets: Optional[cute.Tensor],  # (batch, heads, num_q_blocks, num_splits + 1), int32 or None
@@ -262,34 +269,9 @@ class BlockSparseAttnForwardSm100Blk64:
         seqlen_q_static = mQ_seq.shape[0]
         num_q_heads_static = mQ_seq.shape[2]
         batch_size_static = mQ_seq.shape[3]
-        if const_expr(self.is_sage_fp8):
-            q_stride_s = Int32(mQ_seq.layout.stride[0])
-            q_stride_d = Int32(mQ_seq.layout.stride[1])
-            q_stride_h = Int32(mQ_seq.layout.stride[2])
-            q_stride_b = Int32(mQ_seq.layout.stride[3])
-            mQ = cute.make_tensor(
-                mQ_seq.iterator,
-                cute.make_layout(
-                    (
-                        self.head_dim_padded,
-                        32,
-                        2,
-                        mQ_seq.shape[2],
-                        cute.ceil_div(mQ_seq.shape[0], self.m_block_size),
-                        mQ_seq.shape[3],
-                    ),
-                    stride=(
-                        q_stride_d,
-                        q_stride_s,
-                        32 * q_stride_s,
-                        q_stride_h,
-                        self.m_block_size * q_stride_s,
-                        q_stride_b,
-                    ),
-                ),
-            )
-        else:
-            mQ = mQ_seq
+        # Keeping the real sequence extent in the TMA descriptor lets TMA
+        # zero-fill out-of-bounds rows in the final 64-token tile.
+        mQ = mQ_seq
         # (s_k, d, h_k, b_k)
         KV_layout_transpose = [2, 3, 1, 0]
         mK_seq, mV_seq = [cute.make_tensor(t.iterator, cute.select(t.layout, mode=KV_layout_transpose)) for t in (mK, mV)]
@@ -298,11 +280,16 @@ class BlockSparseAttnForwardSm100Blk64:
         num_splits = Int32(self.num_splits)
         mO = cute.make_tensor(mO.iterator, cute.select(mO.layout, mode=O_layout_transpose))
         mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose)) if const_expr(mLSE is not None) else None
-        # The normal layout maps physical 64-token KV blocks directly. Keep the
-        # exact rank-5 layout only for strides outside the TMA coordinate range.
+        # The normal layout maps physical 64-token KV blocks directly. BF16 uses
+        # the exact rank-5 layout for a KV tail or for strides outside the TMA
+        # coordinate range.
         k_dim_half = self.head_dim_padded // 2
         v_dim_part = self.head_dim_v_padded // 2
-        if const_expr(self.use_exact_kv_layout):
+        if const_expr(self.is_sage_fp8):
+            # As with Q, retaining the original sequence mode lets TMA handle
+            # a short final sparse block without reading the next head/batch.
+            mK, mV = mK_seq, mV_seq
+        elif const_expr(self.use_exact_kv_layout):
             k_stride_s = Int64(mK_seq.layout.stride[0])
             k_stride_d = Int64(mK_seq.layout.stride[1])
             k_stride_h = Int64(mK_seq.layout.stride[2])
@@ -354,101 +341,52 @@ class BlockSparseAttnForwardSm100Blk64:
             k_stride_d = Int32(mK_seq.layout.stride[1])
             k_stride_h = Int32(mK_seq.layout.stride[2])
             k_stride_b = Int32(mK_seq.layout.stride[3])
-            if const_expr(self.is_sage_fp8):
-                mK = cute.make_tensor(
-                    mK_seq.iterator,
-                    cute.make_layout(
-                        (
-                            self.head_dim_padded,
-                            32,
-                            2,
-                            mK_seq.shape[2],
-                            cute.ceil_div(mK_seq.shape[0], self.sparse_block_size),
-                            mK_seq.shape[3],
-                        ),
-                        stride=(
-                            k_stride_d,
-                            k_stride_s,
-                            32 * k_stride_s,
-                            k_stride_h,
-                            self.sparse_block_size * k_stride_s,
-                            k_stride_b,
-                        ),
+            mK = cute.make_tensor(
+                mK_seq.iterator,
+                cute.make_layout(
+                    (
+                        self.sparse_block_size,
+                        k_dim_half,
+                        2,
+                        mK_seq.shape[2],
+                        cute.ceil_div(mK_seq.shape[0], self.sparse_block_size),
+                        mK_seq.shape[3],
                     ),
-                )
-            else:
-                mK = cute.make_tensor(
-                    mK_seq.iterator,
-                    cute.make_layout(
-                        (
-                            self.sparse_block_size,
-                            k_dim_half,
-                            2,
-                            mK_seq.shape[2],
-                            cute.ceil_div(mK_seq.shape[0], self.sparse_block_size),
-                            mK_seq.shape[3],
-                        ),
-                        stride=(
-                            k_stride_s,
-                            k_stride_d,
-                            k_dim_half * k_stride_d,
-                            k_stride_h,
-                            self.sparse_block_size * k_stride_s,
-                            k_stride_b,
-                        ),
+                    stride=(
+                        k_stride_s,
+                        k_stride_d,
+                        k_dim_half * k_stride_d,
+                        k_stride_h,
+                        self.sparse_block_size * k_stride_s,
+                        k_stride_b,
                     ),
-                )
+                ),
+            )
             v_stride_s = Int32(mV_seq.layout.stride[0])
             v_stride_d = Int32(mV_seq.layout.stride[1])
             v_stride_h = Int32(mV_seq.layout.stride[2])
             v_stride_b = Int32(mV_seq.layout.stride[3])
-            if const_expr(self.is_sage_fp8):
-                # FP8 PV uses the native SM100 B-major layout: D is
-                # contiguous and a 64-token sparse block is represented as
-                # two 32-token MMA-K groups.
-                mV = cute.make_tensor(
-                    mV_seq.iterator,
-                    cute.make_layout(
-                        (
-                            self.head_dim_v_padded,
-                            32,
-                            2,
-                            mV_seq.shape[2],
-                            cute.ceil_div(mV_seq.shape[0], self.sparse_block_size),
-                            mV_seq.shape[3],
-                        ),
-                        stride=(
-                            v_stride_d,
-                            v_stride_s,
-                            32 * v_stride_s,
-                            v_stride_h,
-                            self.sparse_block_size * v_stride_s,
-                            v_stride_b,
-                        ),
+            mV = cute.make_tensor(
+                mV_seq.iterator,
+                cute.make_layout(
+                    (
+                        v_dim_part,
+                        self.sparse_block_size,
+                        2,
+                        mV_seq.shape[2],
+                        cute.ceil_div(mV_seq.shape[0], self.sparse_block_size),
+                        mV_seq.shape[3],
                     ),
-                )
-            else:
-                mV = cute.make_tensor(
-                    mV_seq.iterator,
-                    cute.make_layout(
-                        (
-                            v_dim_part,
-                            self.sparse_block_size,
-                            2,
-                            mV_seq.shape[2],
-                            cute.ceil_div(mV_seq.shape[0], self.sparse_block_size),
-                            mV_seq.shape[3],
-                        ),
-                        stride=(
-                            v_stride_d,
-                            v_stride_s,
-                            v_dim_part * v_stride_d,
-                            v_stride_h,
-                            self.sparse_block_size * v_stride_s,
-                            v_stride_b,
-                        ),
+                    stride=(
+                        v_stride_d,
+                        v_stride_s,
+                        v_dim_part * v_stride_d,
+                        v_stride_h,
+                        self.sparse_block_size * v_stride_s,
+                        v_stride_b,
                     ),
-                )
+                ),
+            )
 
         # check type consistency
         if const_expr(self.q_dtype != self.k_dtype):
@@ -502,8 +440,8 @@ class BlockSparseAttnForwardSm100Blk64:
                 cute.make_swizzle(3, 4, 3),
                 0,
                 cute.make_layout(
-                    (self.head_dim_padded, 32, 2),
-                    stride=(1, self.head_dim_padded, 32 * self.head_dim_padded),
+                    (self.m_block_size, self.head_dim_padded),
+                    stride=(self.head_dim_padded, 1),
                 ),
             )
             if const_expr(self.is_sage_fp8)
@@ -552,8 +490,8 @@ class BlockSparseAttnForwardSm100Blk64:
                 cute.make_swizzle(3, 4, 3),
                 0,
                 cute.make_layout(
-                    (self.head_dim_padded, 32, 2),
-                    stride=(1, self.head_dim_padded, 32 * self.head_dim_padded),
+                    (self.sparse_block_size, self.head_dim_padded),
+                    stride=(self.head_dim_padded, 1),
                 ),
             )
         else:
@@ -574,8 +512,8 @@ class BlockSparseAttnForwardSm100Blk64:
                 cute.make_swizzle(3, 4, 3),
                 0,
                 cute.make_layout(
-                    (self.head_dim_v_padded, 32, 2),
-                    stride=(1, self.head_dim_v_padded, 32 * self.head_dim_v_padded),
+                    (self.sparse_block_size, self.head_dim_v_padded),
+                    stride=(self.head_dim_v_padded, 1),
                 ),
             )
         else:
@@ -617,8 +555,8 @@ class BlockSparseAttnForwardSm100Blk64:
             tma_atom_Q, mQ = cpasync.make_tiled_tma_atom(
                 tma_load_op,
                 mQ,
-                cute.select(sQ_tma_layout, mode=[0, 1, 2]),
-                (self.head_dim_padded, 32, 2),
+                cute.select(sQ_tma_layout, mode=[0, 1]),
+                (self.m_block_size, self.head_dim_padded),
             )
         else:
             tma_atom_Q, mQ = cute.nvgpu.make_tiled_tma_atom_A(
@@ -632,26 +570,32 @@ class BlockSparseAttnForwardSm100Blk64:
         # K/V are sparse 64-block indexed. Issue four TMAs per
         # 64x256 KV iteration; each copy targets a sub-tile of the full
         # 256x128 WS SMEM layout.
-        tma_atom_K, mK = cpasync.make_tiled_tma_atom(
-            tma_load_op,
-            mK,
-            cute.select(sK_tma_layout, mode=[0, 1, 2]),
-            (
-                (self.head_dim_padded, 32, 2)
-                if const_expr(self.is_sage_fp8)
-                else (self.sparse_block_size, k_dim_half, 2)
-            ),
-        )
-        tma_atom_V, mV = cpasync.make_tiled_tma_atom(
-            tma_load_op,
-            mV,
-            cute.select(sV_tma_layout, mode=[0, 1, 2]),
-            (
-                (self.head_dim_v_padded, 32, 2)
-                if const_expr(self.is_sage_fp8)
-                else (v_dim_part, self.sparse_block_size, 2)
-            ),
-        )
+        if const_expr(self.is_sage_fp8):
+            tma_atom_K, mK = cpasync.make_tiled_tma_atom(
+                tma_load_op,
+                mK,
+                cute.select(sK_tma_layout, mode=[0, 1]),
+                (self.sparse_block_size, self.head_dim_padded),
+            )
+            tma_atom_V, mV = cpasync.make_tiled_tma_atom(
+                tma_load_op,
+                mV,
+                cute.select(sV_tma_layout, mode=[0, 1]),
+                (self.sparse_block_size, self.head_dim_v_padded),
+            )
+        else:
+            tma_atom_K, mK = cpasync.make_tiled_tma_atom(
+                tma_load_op,
+                mK,
+                cute.select(sK_tma_layout, mode=[0, 1, 2]),
+                (self.sparse_block_size, k_dim_half, 2),
+            )
+            tma_atom_V, mV = cpasync.make_tiled_tma_atom(
+                tma_load_op,
+                mV,
+                cute.select(sV_tma_layout, mode=[0, 1, 2]),
+                (v_dim_part, self.sparse_block_size, 2),
+            )
 
         self.num_epilogue_threads = cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
         if const_expr(self.use_tma_O):
@@ -770,8 +714,6 @@ class BlockSparseAttnForwardSm100Blk64:
         self.shared_storage = SharedStorage
 
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale)
-        fastdiv_mods = None
-
         # Launch the kernel synchronously
         self.kernel(
             mQ,
@@ -874,6 +816,8 @@ class BlockSparseAttnForwardSm100Blk64:
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
+        # These barriers are reached from different warp-specialized paths.
+        # Use unaligned arrive/wait operations rather than CTA-aligned barriers.
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierFwdSm100.TmemPtr),
             num_threads=cute.arch.WARP_SIZE * len((self.mma_warp_id, *self.softmax0_warp_ids, *self.softmax1_warp_ids, *self.correction_warp_ids)),
@@ -1038,11 +982,7 @@ class BlockSparseAttnForwardSm100Blk64:
                 else mQ.shape[0] if const_expr(not self.pack_gqa)
                 else mQ.shape[0][1]
             ),
-            seqlen_k_static=(
-                mKScale.shape[2] * 16
-                if const_expr(self.is_sage_fp8)
-                else mK.shape[0]
-            ),
+            seqlen_k_static=mK.shape[0],
         )
         # Split-KV expands O's physical head axis to num_splits * H.  Scale
         # tensors keep the logical H axis, which is what the scheduler and
@@ -1132,7 +1072,7 @@ class BlockSparseAttnForwardSm100Blk64:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
             # Alloc tensor memory buffer
             tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.wait_unaligned()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             self.mma(
                 tiled_mma_qk,
@@ -1161,7 +1101,7 @@ class BlockSparseAttnForwardSm100Blk64:
                 bsa_fwd_helpers.tcgen05_fence_before_thread_sync()
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
-            tmem_alloc_barrier.arrive_and_wait()
+            tmem_alloc_barrier.wait_unaligned()
             tmem.free(tmem_ptr)
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1190,7 +1130,7 @@ class BlockSparseAttnForwardSm100Blk64:
             # increase register after decreasing
             cute.arch.setmaxregister_increase(self.num_regs_softmax)
             # sync with mma warp before retrieving tmem ptr
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.wait_unaligned()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             softmax_loop = partial(
                 self.softmax_loop,
@@ -1211,17 +1151,36 @@ class BlockSparseAttnForwardSm100Blk64:
                 block_sparse_num=block_sparse_num,
                 mBlockNums=mBlockNums,
                 mSplitOffsets=mSplitOffsets,
+                seqlen_k=mK.shape[0],
+            )
+
+            # This is one runtime-uniform branch inside one compiled kernel.
+            # Keeping arbitrary tail sizes out of the aligned softmax body is
+            # important on SM100: otherwise its eight softmax warps all pay
+            # for the generic partial-block mask, even when K is aligned.
+            # Only the sequence-mode K layouts (FP8 and exact BF16) expose the
+            # real KV length; the rank-6 view requires aligned storage.
+            aligned_k_storage = (
+                mK.shape[0] % self.sparse_block_size == Int32(0)
+                if const_expr(self.is_sage_fp8 or self.use_exact_kv_layout)
+                else True
             )
 
             # Keep stage constexpr so each softmax path has a fixed stage.
             # Runtime stage selection leaves TMEM offsets, barrier indices, and
             # stats strides as uniform arithmetic in the hot softmax loop.
             if warp_idx < self.softmax1_warp_ids[0]:
-                softmax_loop(stage=0)
+                if aligned_k_storage:
+                    softmax_loop(stage=0, mask_physical_tail=False)
+                else:
+                    softmax_loop(stage=0, mask_physical_tail=True)
             if warp_idx < self.correction_warp_ids[0] and warp_idx >= self.softmax1_warp_ids[0]:
-                softmax_loop(stage=1)
+                if aligned_k_storage:
+                    softmax_loop(stage=1, mask_physical_tail=False)
+                else:
+                    softmax_loop(stage=1, mask_physical_tail=True)
 
-            tmem_alloc_barrier.arrive()
+            tmem_alloc_barrier.arrive_unaligned()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Correction
@@ -1229,7 +1188,7 @@ class BlockSparseAttnForwardSm100Blk64:
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_correction)
             # sync with mma warp before retrieving tmem ptr
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.wait_unaligned()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             self.correction_loop(
                 thr_mma_pv,
@@ -1258,7 +1217,7 @@ class BlockSparseAttnForwardSm100Blk64:
                 mBlockNums,
                 mSplitOffsets,
             )
-            tmem_alloc_barrier.arrive()
+            tmem_alloc_barrier.arrive_unaligned()
 
         return
 
@@ -1371,8 +1330,6 @@ class BlockSparseAttnForwardSm100Blk64:
         mBlockNums: Optional[cute.Tensor],
         mSplitOffsets: Optional[cute.Tensor],
     ):
-        num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
-        tidx = cute.arch.thread_idx()[0] % num_load_threads
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         q_producer_phase = Int32(1)
         kv_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.kv_stage)
@@ -1386,8 +1343,16 @@ class BlockSparseAttnForwardSm100Blk64:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             if const_expr(self.is_sage_fp8):
-                mQ_cur = mQ[None, None, None, head_idx, None, batch_idx]
-                gQ_tma = cute.group_modes(mQ_cur, 0, 3)
+                mQ_cur = mQ[None, None, head_idx, batch_idx]
+                gQ_tma = cute.group_modes(
+                    cute.local_tile(
+                        mQ_cur,
+                        (self.m_block_size, self.head_dim_padded),
+                        (None, 0),
+                    ),
+                    0,
+                    2,
+                )
                 tQsQ, tQgQ = cpasync.tma_partition(
                     tma_atom_Q,
                     0,
@@ -1398,7 +1363,7 @@ class BlockSparseAttnForwardSm100Blk64:
                             cute.append(sQ_tma_layout.outer, cute.make_layout((self.q_stage,), stride=(cute.cosize(sQ_tma_layout.outer),))),
                         ),
                         0,
-                        3,
+                        2,
                     ),
                     gQ_tma,
                 )
@@ -1410,11 +1375,50 @@ class BlockSparseAttnForwardSm100Blk64:
                 load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(tma_atom_Q, 0, cute.make_layout(1), tSgQ, sQ)
 
             head_idx_kv = head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
-            if const_expr(self.use_exact_kv_layout):
+            if const_expr(self.is_sage_fp8):
+                mK_cur = mK[None, None, head_idx_kv, batch_idx]
+                mV_cur = mV[None, None, head_idx_kv, batch_idx]
+                gK_tma = cute.group_modes(
+                    cute.local_tile(
+                        mK_cur,
+                        (self.sparse_block_size, self.head_dim_padded),
+                        (None, 0),
+                    ),
+                    0,
+                    2,
+                )
+                gV_tma = cute.group_modes(
+                    cute.local_tile(
+                        mV_cur,
+                        (self.sparse_block_size, self.head_dim_v_padded),
+                        (None, 0),
+                    ),
+                    0,
+                    2,
+                )
+            elif const_expr(self.use_exact_kv_layout):
                 mK_cur = mK[None, None, None, head_idx_kv, batch_idx]
                 mV_cur = mV[None, None, None, head_idx_kv, batch_idx]
-                gK_tma = cute.zipped_divide(mK_cur, (self.sparse_block_size, self.head_dim_padded // 2, 2))
-                gV_tma = cute.zipped_divide(mV_cur, (self.head_dim_v_padded // 2, self.sparse_block_size, 2))
+                # Tile only the sequence mode so a sparse block index addresses
+                # a flat mode, without a runtime divmod in the load warp.
+                gK_tma = cute.group_modes(
+                    cute.local_tile(
+                        mK_cur,
+                        (self.sparse_block_size, self.head_dim_padded // 2, 2),
+                        (None, 0, 0),
+                    ),
+                    0,
+                    3,
+                )
+                gV_tma = cute.group_modes(
+                    cute.local_tile(
+                        mV_cur,
+                        (self.head_dim_v_padded // 2, self.sparse_block_size, 2),
+                        (0, None, 0),
+                    ),
+                    0,
+                    3,
+                )
             else:
                 mK_cur = mK[None, None, None, head_idx_kv, None, batch_idx]
                 mV_cur = mV[None, None, None, head_idx_kv, None, batch_idx]
@@ -1815,10 +1819,14 @@ class BlockSparseAttnForwardSm100Blk64:
             key_block = n_block(
                 kv_block_idx * self.sparse_blocks_per_kv + logical_sub
             )
+            scale_idx = cutlass.min(
+                key_block * 4 + scale_group,
+                mKScale.shape[2] - 1,
+            )
             sKScale[score_stage * 16 + tidx] = mKScale[
                 batch_idx,
                 head_idx,
-                key_block * 4 + scale_group,
+                scale_idx,
             ]
         cute.arch.sync_warp()
         cute.arch.fence_view_async_shared()
@@ -1891,6 +1899,8 @@ class BlockSparseAttnForwardSm100Blk64:
         block_sparse_num: Int32,
         mBlockNums: Optional[cute.Tensor],
         mSplitOffsets: Optional[cute.Tensor],
+        seqlen_k: Int32,
+        mask_physical_tail: bool,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -1908,6 +1918,22 @@ class BlockSparseAttnForwardSm100Blk64:
 
         mma_si_consumer_phase = Int32(0)
         sm_stats_producer_phase = Int32(1)
+
+        if const_expr(mask_physical_tail):
+            last_k_block = (seqlen_k - Int32(1)) // self.sparse_block_size
+            last_k_block_size = (
+                seqlen_k - last_k_block * self.sparse_block_size
+            )
+        else:
+            last_k_block = Int32(0)
+            last_k_block_size = Int32(self.sparse_block_size)
+        # Q-tail protection follows the same pattern: one uniform shape check
+        # avoids a per-row bounds predicate for the usual aligned case.
+        aligned_q_scale = (
+            mQScale.shape[2] % self.m_block_size == Int32(0)
+            if const_expr(self.is_sage_fp8)
+            else True
+        )
 
         tmem_s_addr = Int32(stage) * Int32(self.tmem_s_offset[1] - self.tmem_s_offset[0])
         tmem_p_addr = Int32(stage) * Int32(self.tmem_p_offset[1] - self.tmem_p_offset[0])
@@ -1961,13 +1987,20 @@ class BlockSparseAttnForwardSm100Blk64:
                 batch_idx=batch_idx,
                 head_idx=head_idx,
                 score_scale_log2=softmax_scale_log2,
+                mask_physical_tail=mask_physical_tail,
             )
 
+            q_scale = Float32(1.0)
             if const_expr(self.is_sage_fp8):
                 q_row = m_block * self.m_block_size + (warp_idx & 1) * cute.arch.WARP_SIZE + (tidx % cute.arch.WARP_SIZE)
-                q_scale = mQScale[batch_idx, head_idx, q_row] if q_row < mQScale.shape[2] else Float32(1.0)
-            else:
-                q_scale = Float32(1.0)
+                if aligned_q_scale:
+                    q_scale = mQScale[batch_idx, head_idx, q_row]
+                else:
+                    q_scale = (
+                        mQScale[batch_idx, head_idx, q_row]
+                        if q_row < mQScale.shape[2]
+                        else Float32(1.0)
+                    )
 
             # Always acquire pipeline_sm_stats to stay in sync with correction
             pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
@@ -1982,7 +2015,9 @@ class BlockSparseAttnForwardSm100Blk64:
                 warp_col = warp_idx // 2
 
                 first_bs_lo, first_bs_hi, first_nb_lo, first_nb_hi = self.get_softmax_block_info(
-                    Int32(0), stage, warp_col, block_iter_count, raw_block_count, n_block, mBlockSizes
+                    Int32(0), stage, warp_col, block_iter_count, raw_block_count,
+                    n_block, mBlockSizes, batch_idx, head_idx,
+                    last_k_block, last_k_block_size, mask_physical_tail
                 )
                 mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
                     mma_si_consumer_phase,
@@ -2000,7 +2035,10 @@ class BlockSparseAttnForwardSm100Blk64:
                 )
                 for n_tile in cutlass.range(wg_count - 1, unroll=1):
                     bs_lo, bs_hi, nb_lo, nb_hi = self.get_softmax_block_info(
-                        n_tile + 1, stage, warp_col, block_iter_count, raw_block_count, n_block, mBlockSizes
+                        n_tile + 1, stage, warp_col, block_iter_count,
+                        raw_block_count, n_block, mBlockSizes, batch_idx,
+                        head_idx, last_k_block, last_k_block_size,
+                        mask_physical_tail
                     )
                     mma_si_consumer_phase, sm_stats_producer_phase = softmax_step(
                         mma_si_consumer_phase,
@@ -2016,13 +2054,16 @@ class BlockSparseAttnForwardSm100Blk64:
                         sm_stats_bar_index=sm_stats_bar_index,
                     )
 
+                # The final statistics reuse the scale slot consumed after the last step.
+                pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
+                sm_stats_producer_phase ^= 1
                 sScale[tidx + stage * self.stats_stride] = softmax.row_sum[0]
                 if const_expr(mLSE is not None or self.q_stage == 1):
                     sScale[tidx + stage * self.stats_stride + self.s_stage * self.stats_stride] = softmax.row_max[0]
-                sm_stats_barrier.arrive_w_index(index=sm_stats_bar_index)
+                bsa_fwd_helpers.named_barrier_arrive_unaligned(sm_stats_barrier, sm_stats_bar_index)
             else:
                 # Empty tile: arrive barrier once (synthetic "no work" signal for correction)
-                sm_stats_barrier.arrive_w_index(index=sm_stats_bar_index)
+                bsa_fwd_helpers.named_barrier_arrive_unaligned(sm_stats_barrier, sm_stats_bar_index)
 
             # Advance to next tile
             work_tile = tile_scheduler.consumer_advance()
@@ -2041,21 +2082,85 @@ class BlockSparseAttnForwardSm100Blk64:
         raw_block_count: Int32,
         n_block: Callable,
         mBlockSizes: Optional[cute.Tensor],
+        batch_idx: Int32,
+        head_idx: Int32,
+        last_k_block: Int32,
+        last_k_block_size: Int32,
+        mask_physical_tail: bool,
     ) -> Tuple[Int32, Int32, Int32, Int32]:
         kv_block = block_iter_count - 1 - (self.s_stage * kv_iter + Int32(stage))
         logical_lo = kv_block * self.sparse_blocks_per_kv + warp_col
         logical_hi = logical_lo + 2
-        if const_expr(self.has_block_sizes):
-            bs_lo = Int32(0) if logical_lo >= raw_block_count else mBlockSizes[n_block(logical_lo)]
-            bs_hi = Int32(0) if logical_hi >= raw_block_count else mBlockSizes[n_block(logical_hi)]
-        else:
-            bs_lo = Int32(0) if logical_lo >= raw_block_count else Int32(self.sparse_block_size)
-            bs_hi = Int32(0) if logical_hi >= raw_block_count else Int32(self.sparse_block_size)
         # Invalid padded entries are masked to zero.  Clamp their lookup so no
         # out-of-range global-memory access is generated in the FP8 scale path.
         nb_lo = n_block(cutlass.min(logical_lo, cutlass.max(raw_block_count - 1, Int32(0))))
         nb_hi = n_block(cutlass.min(logical_hi, cutlass.max(raw_block_count - 1, Int32(0))))
+        if const_expr(mask_physical_tail):
+            native_bs_lo = bsa_fwd_helpers.select_i32_if_equal(
+                nb_lo,
+                last_k_block,
+                last_k_block_size,
+                Int32(self.sparse_block_size),
+            )
+            native_bs_hi = bsa_fwd_helpers.select_i32_if_equal(
+                nb_hi,
+                last_k_block,
+                last_k_block_size,
+                Int32(self.sparse_block_size),
+            )
+            if const_expr(self.has_block_sizes):
+                native_bs_lo = cutlass.min(
+                    native_bs_lo,
+                    self.get_sparse_block_size(
+                        mBlockSizes, batch_idx, head_idx, nb_lo
+                    ),
+                )
+                native_bs_hi = cutlass.min(
+                    native_bs_hi,
+                    self.get_sparse_block_size(
+                        mBlockSizes, batch_idx, head_idx, nb_hi
+                    ),
+                )
+            bs_lo = (
+                Int32(0) if logical_lo >= raw_block_count else native_bs_lo
+            )
+            bs_hi = (
+                Int32(0) if logical_hi >= raw_block_count else native_bs_hi
+            )
+        elif const_expr(self.has_block_sizes):
+            bs_lo = (
+                Int32(0)
+                if logical_lo >= raw_block_count
+                else self.get_sparse_block_size(
+                    mBlockSizes, batch_idx, head_idx, nb_lo
+                )
+            )
+            bs_hi = (
+                Int32(0)
+                if logical_hi >= raw_block_count
+                else self.get_sparse_block_size(
+                    mBlockSizes, batch_idx, head_idx, nb_hi
+                )
+            )
+        else:
+            bs_lo = Int32(0) if logical_lo >= raw_block_count else Int32(self.sparse_block_size)
+            bs_hi = Int32(0) if logical_hi >= raw_block_count else Int32(self.sparse_block_size)
         return bs_lo, bs_hi, nb_lo, nb_hi
+
+    @cute.jit
+    def get_sparse_block_size(
+        self,
+        mBlockSizes: cute.Tensor,
+        batch_idx: Int32,
+        head_idx: Int32,
+        n_block_idx: Int32,
+    ) -> Int32:
+        """Load a block size from the public rank-1/2/3 metadata forms."""
+        if const_expr(self.block_sizes_mode == 1):
+            return mBlockSizes[n_block_idx]
+        if const_expr(self.block_sizes_mode == 2):
+            return mBlockSizes[batch_idx, n_block_idx]
+        return mBlockSizes[batch_idx, head_idx, n_block_idx]
 
     @cute.jit
     def get_tile_n_block_idx(
@@ -2121,6 +2226,7 @@ class BlockSparseAttnForwardSm100Blk64:
         batch_idx: Int32,
         head_idx: Int32,
         score_scale_log2: Float32,
+        mask_physical_tail: bool,
         tidx: Int32,
         tmem_s_addr: Int32,
         tmem_p_addr: Int32,
@@ -2172,22 +2278,43 @@ class BlockSparseAttnForwardSm100Blk64:
             and self.arch <= Arch.sm_103f
             and not self.is_sage_fp8
         )
+        use_sage_ldred_rowmax = (
+            self.arch >= Arch.sm_103
+            and self.arch <= Arch.sm_103f
+            and self.is_sage_fp8
+            and self.use_sage_ldred_rowmax
+        )
         tSrS_t2r = cute.make_rmem_tensor((128,), Float32)
         row_max_tile = -Float32.inf
-        for c in cutlass.range_constexpr(4):
-            if const_expr(use_ldred_rowmax):
-                vals, row_max_chunk = (
-                    bsa_fwd_helpers.tmem_load_red_max_32dp32b32x(
-                        tmem_s_addr + c * 32
+        if const_expr(use_sage_ldred_rowmax):
+            sage_group_max = cute.make_rmem_tensor((8,), Float32)
+            # Sage K scales cover 16 tokens, so reduce exactly one scale group
+            # per instruction.  A 32-value reduction would mix two groups that
+            # generally have different scales and would therefore be invalid.
+            for c in cutlass.range_constexpr(8):
+                vals, group_max = (
+                    bsa_fwd_helpers.tmem_load_red_max_32dp32b16x(
+                        tmem_s_addr + c * 16
                     )
                 )
-                row_max_tile = cute.arch.fmax(row_max_tile, row_max_chunk)
-            else:
-                vals = bsa_fwd_helpers.tmem_load_32dp32b32x(
-                    tmem_s_addr + c * 32
-                )
-            for j in cutlass.range_constexpr(32):
-                tSrS_t2r[c * 32 + j] = vals[j]
+                sage_group_max[c] = group_max
+                for j in cutlass.range_constexpr(16):
+                    tSrS_t2r[c * 16 + j] = vals[j]
+        else:
+            for c in cutlass.range_constexpr(4):
+                if const_expr(use_ldred_rowmax):
+                    vals, row_max_chunk = (
+                        bsa_fwd_helpers.tmem_load_red_max_32dp32b32x(
+                            tmem_s_addr + c * 32
+                        )
+                    )
+                    row_max_tile = cute.arch.fmax(row_max_tile, row_max_chunk)
+                else:
+                    vals = bsa_fwd_helpers.tmem_load_32dp32b32x(
+                        tmem_s_addr + c * 32
+                    )
+                for j in cutlass.range_constexpr(32):
+                    tSrS_t2r[c * 32 + j] = vals[j]
 
         tSrS_blocks = cute.logical_divide(tSrS_t2r, cute.make_layout(self.sparse_block_size))
         bsa_fwd_helpers.apply_block_size_mask_64(tSrS_blocks[None, 0], block_size_lo)
@@ -2202,13 +2329,32 @@ class BlockSparseAttnForwardSm100Blk64:
             scaled_group_max = cute.make_rmem_tensor((8,), Float32)
             tSrS_groups = cute.logical_divide(tSrS_t2r, cute.make_layout(16))
             if const_expr(not self.is_split_kv):
-                for scale_idx in cutlass.range_constexpr(8):
-                    group_max = softmax._compute_row_max(
-                        tSrS_groups[None, scale_idx].load()
-                    )
-                    scaled_group_max[scale_idx] = (
-                        group_max * qk_scales[scale_idx]
-                    )
+                if const_expr(use_sage_ldred_rowmax):
+                    full_blocks = (
+                        block_size_lo == Int32(self.sparse_block_size)
+                    ) & (block_size_hi == Int32(self.sparse_block_size))
+                    if full_blocks:
+                        for scale_idx in cutlass.range_constexpr(8):
+                            scaled_group_max[scale_idx] = (
+                                sage_group_max[scale_idx]
+                                * qk_scales[scale_idx]
+                            )
+                    else:
+                        for scale_idx in cutlass.range_constexpr(8):
+                            group_max = softmax._compute_row_max(
+                                tSrS_groups[None, scale_idx].load()
+                            )
+                            scaled_group_max[scale_idx] = (
+                                group_max * qk_scales[scale_idx]
+                            )
+                else:
+                    for scale_idx in cutlass.range_constexpr(8):
+                        group_max = softmax._compute_row_max(
+                            tSrS_groups[None, scale_idx].load()
+                        )
+                        scaled_group_max[scale_idx] = (
+                            group_max * qk_scales[scale_idx]
+                        )
             else:
                 qk_scales = cute.make_rmem_tensor((8,), Float32)
                 q_log2_scale = q_scale * score_scale_log2
@@ -2220,10 +2366,19 @@ class BlockSparseAttnForwardSm100Blk64:
                     )
                     for key_scale_group in cutlass.range_constexpr(4):
                         scale_idx = block_idx * 4 + key_scale_group
+                        if const_expr(mask_physical_tail):
+                            key_scale_idx = cutlass.min(
+                                key_block * 4 + key_scale_group,
+                                mKScale.shape[2] - 1,
+                            )
+                        else:
+                            key_scale_idx = (
+                                key_block * 4 + key_scale_group
+                            )
                         qk_scale = q_log2_scale * mKScale[
                             batch_idx,
                             head_idx,
-                            key_block * 4 + key_scale_group,
+                            key_scale_idx,
                         ]
                         qk_scales[scale_idx] = qk_scale
                         group_max = softmax._compute_row_max(
@@ -2256,9 +2411,16 @@ class BlockSparseAttnForwardSm100Blk64:
                 )
 
         if const_expr(not is_first):
+            # Wait for correction to consume the previous scale only now, after
+            # this step's score load and row-max reduction have overlapped it.
+            bsa_fwd_helpers.mbar_wait(
+                Int32(pipeline_sm_stats.sync_object_empty.get_barrier(stage).toint()),
+                sm_stats_producer_phase,
+            )
+            sm_stats_producer_phase ^= 1
             sScale[tidx + stage * self.stats_stride] = acc_scale
         # Notify correction wg that row_max is ready
-        sm_stats_barrier.arrive_w_index(index=sm_stats_bar_index)
+        bsa_fwd_helpers.named_barrier_arrive_unaligned(sm_stats_barrier, sm_stats_bar_index)
 
         if const_expr(self.is_sage_fp8):
             # Generate P * 256 directly in exp2.  The softmax numerator and
@@ -2366,11 +2528,7 @@ class BlockSparseAttnForwardSm100Blk64:
         sum2 = cute.arch.add_packed_f32x2(sum2, sum3)
         sum0 = cute.arch.add_packed_f32x2(sum0, sum2)
         softmax.row_sum[0] = sum0[0] + sum0[1]
-        bsa_fwd_helpers.mbar_wait(
-            Int32(pipeline_sm_stats.sync_object_empty.get_barrier(stage).toint()),
-            sm_stats_producer_phase,
-        )
-        return mma_si_consumer_phase ^ 1, sm_stats_producer_phase ^ 1
+        return mma_si_consumer_phase ^ 1, sm_stats_producer_phase
 
     @cute.jit
     def correction_loop(
@@ -2454,10 +2612,10 @@ class BlockSparseAttnForwardSm100Blk64:
 
             if has_work:
                 # Ignore first signal from softmax as no correction is required
-                sm_stats_barrier.arrive_and_wait_w_index(index=0 * 4 + warp_idx)
+                bsa_fwd_helpers.named_barrier_wait_unaligned(sm_stats_barrier, 0 * 4 + warp_idx)
                 pipeline_sm_stats.consumer_release_w_index(0)
                 # Wait for both softmax warp groups.
-                sm_stats_barrier.arrive_and_wait_w_index(index=1 * 4 + warp_idx)
+                bsa_fwd_helpers.named_barrier_wait_unaligned(sm_stats_barrier, 1 * 4 + warp_idx)
                 sm_stats_consumer_phase ^= 1
 
                 # q_stage=1 correction loop
@@ -2466,7 +2624,7 @@ class BlockSparseAttnForwardSm100Blk64:
                 # Rescale the two alternating stages as a pair.
                 for i in cutlass.range(corr_pair_count, unroll=1):
                     for stage in cutlass.range_constexpr(self.s_stage):
-                        sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
+                        bsa_fwd_helpers.named_barrier_wait_unaligned(sm_stats_barrier, stage * 4 + warp_idx)
                         scale = sScale[tidx + stage * self.stats_stride]
                         should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
                         if should_rescale:
@@ -2480,7 +2638,7 @@ class BlockSparseAttnForwardSm100Blk64:
 
                 # Read final softmax stats for both stages
                 for stage in cutlass.range_constexpr(self.s_stage):
-                    sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
+                    bsa_fwd_helpers.named_barrier_wait_unaligned(sm_stats_barrier, stage * 4 + warp_idx)
                     row_sum = sScale[tidx + stage * self.stats_stride]
                     if const_expr(mLSE is not None or self.q_stage == 1):
                         row_max = sScale[tidx + stage * self.stats_stride + self.s_stage * self.stats_stride]
@@ -2549,7 +2707,7 @@ class BlockSparseAttnForwardSm100Blk64:
                 # Empty tile (block_count == 0): sync pipelines and write O=0.
                 # Match softmax's 1 barrier arrive per stage.
                 for stage_idx in cutlass.range_constexpr(self.s_stage):
-                    sm_stats_barrier.arrive_and_wait_w_index(index=stage_idx * 4 + warp_idx)
+                    bsa_fwd_helpers.named_barrier_wait_unaligned(sm_stats_barrier, stage_idx * 4 + warp_idx)
                     pipeline_sm_stats.consumer_release_w_index(stage_idx)
                 sm_stats_consumer_phase ^= 1
                 # Write O=0 through the raw WS exchange path without reading stale TMEM.
@@ -2658,7 +2816,9 @@ class BlockSparseAttnForwardSm100Blk64:
         exchange_addr = Int32((oExchange.iterator + exchange_warp_base + lane_idx * 4).toint())
         if const_expr(self.allow_empty_block_nums):
             is_zero_output = my_scale0 == Float32(0.0) and my_scale1 == Float32(0.0)
-            if not is_zero_output:
+            # TMEM loads are warp collective, including rows whose weights
+            # underflow to zero. Entirely empty warps must skip stale TMEM.
+            if cute.arch.vote_ballot_sync(not is_zero_output) != 0:
                 bsa_fwd_helpers.tmem_combine_store_exchange_4x32dp32b32x(
                     Int32(tmem_o0_addr),
                     Int32(tmem_o1_addr),
@@ -2666,7 +2826,7 @@ class BlockSparseAttnForwardSm100Blk64:
                     my_scale0,
                     my_scale1,
                 )
-            else:
+            if is_zero_output:
                 bsa_fwd_helpers.smem_zero_store_exchange_4x32dp32b32x(exchange_addr)
         else:
             bsa_fwd_helpers.tmem_combine_store_exchange_4x32dp32b32x(
@@ -2822,7 +2982,7 @@ class BlockSparseAttnForwardSm100Blk64:
                     )
         else:
             # PackGQA retains the existing whole-fragment path. The supported
-            # Sage FP8 v1 contract does not use PackGQA.
+            # The Sage FP8 path does not use PackGQA.
             tOrO = cute.make_rmem_tensor_like(tOsO, self.o_dtype)
             cute.autovec_copy(tOsO, tOrO)
             pack_gqa.store_O(mO_cur, tOrO, gmem_tiled_copy_O, tidx, m_tile_idx, seqlen_q)
@@ -2955,7 +3115,11 @@ class BlockSparseAttnForwardSm100Blk64:
                 tma_atom_K,
                 0,
                 cute.make_layout(1),
-                cute.group_modes(sK_sub, 0, 3),
+                cute.group_modes(
+                    sK_sub,
+                    0,
+                    2 if const_expr(self.is_sage_fp8) else 3,
+                ),
                 gK,
             )
             cute.copy(
@@ -3016,7 +3180,11 @@ class BlockSparseAttnForwardSm100Blk64:
                 tma_atom_V,
                 0,
                 cute.make_layout(1),
-                cute.group_modes(sV_sub, 0, 3),
+                cute.group_modes(
+                    sV_sub,
+                    0,
+                    2 if const_expr(self.is_sage_fp8) else 3,
+                ),
                 gV,
             )
             cute.copy(
