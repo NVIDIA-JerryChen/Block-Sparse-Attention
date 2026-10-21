@@ -280,8 +280,9 @@ class BlockSparseAttnForwardSm100Blk64:
         num_splits = Int32(self.num_splits)
         mO = cute.make_tensor(mO.iterator, cute.select(mO.layout, mode=O_layout_transpose))
         mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose)) if const_expr(mLSE is not None) else None
-        # The normal layout maps physical 64-token KV blocks directly. Keep the
-        # exact rank-5 layout only for strides outside the TMA coordinate range.
+        # The normal layout maps physical 64-token KV blocks directly. BF16 uses
+        # the exact rank-5 layout for a KV tail or for strides outside the TMA
+        # coordinate range.
         k_dim_half = self.head_dim_padded // 2
         v_dim_part = self.head_dim_v_padded // 2
         if const_expr(self.is_sage_fp8):

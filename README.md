@@ -181,8 +181,9 @@ pair and invalidate that fast entry when the manifest identity changes.
 - `block_sizes`: BF16 AOT supports absent or rank-1 int32; FP8 AOT supports
   absent, `[N]`, `[B,N]`, or `[B,H,N]`
 - BF16 AOT supports static or CLC scheduling and 32-bit or 64-bit K/V stride
-  lowering; the public FP8 path uses its static scheduler and native sequence
-  layout
+  lowering; BF16 K/V with a non-64-aligned length uses the 64-bit exact
+  sequence-layout variant; the public FP8 path uses its static scheduler and
+  native sequence layout
 - Exact split count from 1 through 256; the default BF16 matrix builds 1, 2, 4,
   and 8, while the FP8 matrix builds the automatically selected 1, 4, 8, and 16
 - SM103 FP8 bundles contain both software and 16-token `ld.red` row-max variants

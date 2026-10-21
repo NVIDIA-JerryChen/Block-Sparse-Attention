@@ -3483,7 +3483,8 @@ def bsa_attn_fwd(
             requires at least 1; blk128 requires an even value >= 2. Ignored
             when q2k_block_nums is provided.
         block_sizes: Actual token count per KV block (num_kv_blocks,), int32. Used for masking padding positions.
-            When None, block_size masking is skipped (assumes all blocks are full).
+            When None, block_size masking is skipped (assumes all blocks are full);
+            SM100/SM110 blk64 still masks the physical KV tail.
         q2k_block_nums: Per-(batch, head, q_block) number of KV blocks to attend to,
             (batch, num_heads, num_q_blocks) int32, each value >= 0.
             When None, uses fixed block_sparse_num for all Q blocks.
