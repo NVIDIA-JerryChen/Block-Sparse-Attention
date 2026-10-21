@@ -794,6 +794,65 @@ def test_sm100_blk64_cutedsl_partial_tail_rows(seqlen_q):
         torch.testing.assert_close(lse, ref_lse, rtol=2e-3, atol=2e-3)
 
 
+@pytest.mark.parametrize("with_block_sizes", [False, True])
+@pytest.mark.parametrize("kv_splits", [1, 2])
+def test_sm100_blk64_cutedsl_unaligned_kv_multi_head(with_block_sizes, kv_splits):
+    """A short final KV block must not read the next head/batch or past K/V."""
+    if (
+        not torch.cuda.is_available()
+        or torch.cuda.get_device_capability()[0] not in (10, 11)
+    ):
+        pytest.skip("SM100/SM110 blk64 CuTe DSL test")
+
+    torch.manual_seed(11)
+    bs, h, sq, sk, d, topk = 2, 3, 128, 1000, 128, 4
+    device = "cuda"
+    dtype = torch.bfloat16
+    q = torch.randn(bs, h, sq, d, device=device, dtype=dtype)
+    k = torch.randn(bs, h, sk, d, device=device, dtype=dtype)
+    v = torch.randn_like(k)
+    num_q_blocks = (sq + 63) // 64
+    num_kv_blocks = (sk + 63) // 64
+    # Every row attends the physical tail block (40 valid tokens).
+    q2k_block_index = (
+        torch.tensor([0, 5, 9, num_kv_blocks - 1], device=device, dtype=torch.int32)
+        .view(1, 1, 1, topk)
+        .expand(bs, h, num_q_blocks, topk)
+        .contiguous()
+    )
+    block_sizes = (
+        (sk - torch.arange(num_kv_blocks, device=device) * 64).clamp(0, 64).int()
+        if with_block_sizes
+        else None
+    )
+
+    cols = torch.cat(
+        [
+            torch.arange(j * 64, min(sk, j * 64 + 64), device=device)
+            for j in q2k_block_index[0, 0, 0].tolist()
+        ]
+    )
+    scale = 1.0 / math.sqrt(d)
+    scores = torch.matmul(q.float(), k[:, :, cols].float().transpose(-1, -2)) * scale
+    ref_out = torch.matmul(torch.softmax(scores, dim=-1), v[:, :, cols].float())
+    ref_lse = torch.logsumexp(scores, dim=-1)
+
+    out, lse = bsa_attn_fwd(
+        q,
+        k,
+        v,
+        q2k_block_index,
+        topk,
+        block_sizes,
+        softmax_scale=scale,
+        return_lse=True,
+        sparse_block_size=64,
+        kv_splits=kv_splits,
+    )
+    torch.testing.assert_close(out.float(), ref_out, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(lse, ref_lse, rtol=2e-3, atol=2e-3)
+
+
 def test_sm90_blk64_empty_variable_row():
     """An empty sparse row must produce O=0 and LSE=-inf on SM90."""
     if (

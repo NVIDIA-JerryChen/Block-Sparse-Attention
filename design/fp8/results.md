@@ -1,5 +1,63 @@
 # SM100 blk64 Sage FP8 最终验证结果
 
+## 2026-10-21：BF16 blk64 KV 尾块越界读取
+
+### 问题
+
+BF16 blk64 默认把 K/V 看成 rank-6 稀疏块视图 `(64, 64, 2, H, ceil(S/64), B)`，
+其中没有真实序列长度。KV 长度不是 64 的倍数时：
+
+- 最后一个短块会把下一 head 的前几行当成 key/value 读进来；不传
+  `block_sizes` 时这些行参与 softmax，结果错误。客户形状
+  `B=1,H=14,S=39756` 不传 `block_sizes` 时 14 个 head 里 13 个相对误差约 5%。
+- 最后一个 head 的短块读到 K/V 分配之外。传了 `block_sizes` 也只能把分数
+  置零，越界读到的 V 若是 NaN 仍会污染输出；若那段地址未映射则
+  illegal memory access，或者 TMA 永远不到账导致卡死。此前在客户形状、
+  `kv_splits=2` 序列中观察到的卡死即属此类：把 K/V 放在映射区末尾、后面
+  地址不映射时，旧代码四种配置（有无 `block_sizes` × split 1/2）全部
+  illegal memory access。
+- 实测 B>1 时从第二个 batch 起整个 head 都错（即使传了 `block_sizes`），与
+  rank-6 视图下 batch 基址不再是 64 行块整数倍一致。
+
+FP8 早已改为保留真实序列长度的视图，不受影响。
+
+### 修复
+
+- KV 长度不是 64 的倍数时，BF16 改用已有的 exact 序列视图（原本只在 stride
+  超出 Int32 TMA 范围时启用），TMA 按真实长度对尾块零填充；同时打开与 FP8
+  相同的物理尾块掩码，不依赖调用方传 `block_sizes`。对齐长度仍走 rank-6
+  视图，代码路径与结果不变。
+- exact 视图原来用 `zipped_divide` 取块，load warp 每次取块都要对动态块数做
+  一次除法取模，整体慢约 15%；改为只切序列维的 `local_tile`，与 FP8 写法一致，
+  速度与 rank-6 持平。大 stride（Int64）路径同样受益。
+- AOT 无需新增变体：exact 视图对应已有的 `use_int64_kv_strides=True` 变体。
+
+### 验证（B200 与 B300 各一遍）
+
+- **精度矩阵**：8 个形状（含 B>1、H>1、S_k=1/70/1000/1999/4097 及对齐长度）×
+  `block_sizes` 无/rank-1/rank-3 随机短块 × top-k 固定/变长含 0 × CLC 开关 ×
+  split 1/2，共 192 例，与 FP32 精确参考比较 O 最大误差 <3e-2、LSE <2e-3，空行
+  O=0、LSE=-inf：新代码 0 失败；旧代码 137 例失败。
+- **越界探针**：K/V 紧贴映射区末尾，新代码四种配置正常且无 NaN。
+- **客户形状**：S=39756 有无 `block_sizes`、split 1/2 全部正确；此前卡死的调用
+  序列 90 例全部完成；900 例完整矩阵无卡死、无 NaN、重复运行一致。
+- **对齐路径不变**：同种子、同进程顺序下，6 个对齐形状共 540 例（FP8 108、
+  BF16 432）新旧输出逐位一致；非对齐形状上 FP8 逐位一致，BF16 只在旧代码出错
+  的用例上不同。旧代码在非对齐矩阵第 48 例再次卡死，新代码 270 例全部完成。
+- **compute-sanitizer**：racecheck、memcheck 0 错误；synccheck 仍为既有的
+  correction warp divergent 报告，与本改动无关。
+- **测试套件**：FP8 相关 B200 257、B300 258 passed；`test_flash_fwd.py -k sm100`
+  190 passed（含新增 4 个尾块多 head 回归用例）；AOT 测试 34 passed；AOT-only
+  660 例与 JIT 逐位一致（未构建的 BF16 rank-3 `block_sizes` 变体除外）。
+
+### 性能（B200，客户形状 BF16 blk64，两轮）
+
+| S_k | `block_sizes` | 修复前 ms | 修复后 ms |
+|---:|---|---:|---:|
+| 39756 | 无 | 3.02 / 3.03（结果错误） | 3.06 / 2.97 |
+| 39756 | 有 | 3.14 / 3.13 | 3.09 / 3.02 |
+| 39744 | 无 | 3.05 / 3.01 | 3.06 / 3.00 |
+
 ## 2026-10-20：blk64 softmax 推迟等待统计量槽位
 
 起因是客户在 4×B200、Ulysses=4 的视频生成流程中观察到 FP8 慢于 BF16。
@@ -51,7 +109,7 @@ nsys 统计 604 次 kernel，B200 平均 36.90→36.34 µs（-1.5%）。
 - **测试套件**：FP8 相关 B200 257 passed、B300 258 passed；
   `tests/test_flash_fwd.py -k sm100` 两卡均 186 passed；均 0 failed。
 
-### 验证中发现的既有问题（`f953680` 同样存在，本次未修改）
+### 验证中发现的既有问题（`f953680` 同样存在，本次未修改；1、2 已在 2026-10-21 修复）
 
 1. BF16 blk64 在客户形状、大动态范围数据、`kv_splits=2`、无 `block_sizes`
    的调用上，按特定调用历史可稳定卡死（GPU 100%、停在 synchronize），单独

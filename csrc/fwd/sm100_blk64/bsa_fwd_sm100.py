@@ -1155,9 +1155,11 @@ class BlockSparseAttnForwardSm100Blk64:
             # Keeping arbitrary tail sizes out of the aligned softmax body is
             # important on SM100: otherwise its eight softmax warps all pay
             # for the generic partial-block mask, even when K is aligned.
+            # Only the sequence-mode K layouts (FP8 and exact BF16) expose the
+            # real KV length; the rank-6 view requires aligned storage.
             aligned_k_storage = (
                 mK.shape[0] % self.sparse_block_size == Int32(0)
-                if const_expr(self.is_sage_fp8)
+                if const_expr(self.is_sage_fp8 or self.use_exact_kv_layout)
                 else True
             )
 
@@ -1394,8 +1396,26 @@ class BlockSparseAttnForwardSm100Blk64:
             elif const_expr(self.use_exact_kv_layout):
                 mK_cur = mK[None, None, None, head_idx_kv, batch_idx]
                 mV_cur = mV[None, None, None, head_idx_kv, batch_idx]
-                gK_tma = cute.zipped_divide(mK_cur, (self.sparse_block_size, self.head_dim_padded // 2, 2))
-                gV_tma = cute.zipped_divide(mV_cur, (self.head_dim_v_padded // 2, self.sparse_block_size, 2))
+                # Tile only the sequence mode so a sparse block index addresses
+                # a flat mode, without a runtime divmod in the load warp.
+                gK_tma = cute.group_modes(
+                    cute.local_tile(
+                        mK_cur,
+                        (self.sparse_block_size, self.head_dim_padded // 2, 2),
+                        (None, 0, 0),
+                    ),
+                    0,
+                    3,
+                )
+                gV_tma = cute.group_modes(
+                    cute.local_tile(
+                        mV_cur,
+                        (self.head_dim_v_padded // 2, self.sparse_block_size, 2),
+                        (0, None, 0),
+                    ),
+                    0,
+                    3,
+                )
             else:
                 mK_cur = mK[None, None, None, head_idx_kv, None, batch_idx]
                 mV_cur = mV[None, None, None, head_idx_kv, None, batch_idx]
@@ -2072,7 +2092,7 @@ class BlockSparseAttnForwardSm100Blk64:
         # out-of-range global-memory access is generated in the FP8 scale path.
         nb_lo = n_block(cutlass.min(logical_lo, cutlass.max(raw_block_count - 1, Int32(0))))
         nb_hi = n_block(cutlass.min(logical_hi, cutlass.max(raw_block_count - 1, Int32(0))))
-        if const_expr(self.is_sage_fp8 and mask_physical_tail):
+        if const_expr(mask_physical_tail):
             native_bs_lo = bsa_fwd_helpers.select_i32_if_equal(
                 nb_lo,
                 last_k_block,

@@ -2502,8 +2502,12 @@ def _bsa_attn_fwd_sm100_blk64(
         block_sizes,
         q2k_block_nums,
     )
+    # The rank-6 sparse-block view has no sequence bound: a short final block
+    # would read the next head/batch (or past the allocation).  The exact
+    # layout keeps the real KV length so TMA zero-fills the tail.
     use_exact_kv_layout = not is_sage_fp8 and (
-        _sm100_blk64_requires_int64_kv_strides(k_bhsd, v_bhsd)
+        seqlen_k % 64 != 0
+        or _sm100_blk64_requires_int64_kv_strides(k_bhsd, v_bhsd)
     )
 
     if softmax_scale is None:
