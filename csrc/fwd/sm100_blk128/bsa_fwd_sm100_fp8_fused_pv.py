@@ -568,6 +568,8 @@ class BlockSparseAttnForwardFp8FusedPvSm100Blk128(BlockSparseAttnForwardFp8Sm100
         cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.barrier()
 
+        # Warp roles reach these subset barriers through different branches.
+        # Use unaligned instructions; a smaller count does not relax bar.sync.
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierFwdSm100.TmemPtr),
             num_threads=cute.arch.WARP_SIZE
@@ -660,7 +662,7 @@ class BlockSparseAttnForwardFp8FusedPvSm100Blk128(BlockSparseAttnForwardFp8Sm100
             defer_sync=True,
         )
         # Should put the NamedBarrier inside the pipeline class so we'll just have pipeline_sm_stats
-        sm_stats_barrier = pipeline_custom.NamedBarrier(
+        sm_stats_barrier = pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierFwdSm100.SoftmaxStatsW0), num_threads=cute.arch.WARP_SIZE * 2
         )
         pipeline_o_epi = pipeline_custom.PipelineAsync.create(
@@ -802,7 +804,8 @@ class BlockSparseAttnForwardFp8FusedPvSm100Blk128(BlockSparseAttnForwardFp8Sm100
             cute.arch.setmaxregister_decrease(self.num_regs_other)
             # Alloc tensor memory buffer
             tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
-            tmem.wait_for_alloc()
+            # TmemAllocator.wait_for_alloc() reconstructs an aligned barrier.
+            tmem_alloc_barrier.wait_unaligned()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             self.mma(
                 tiled_mma_qk,
@@ -827,7 +830,7 @@ class BlockSparseAttnForwardFp8FusedPvSm100Blk128(BlockSparseAttnForwardFp8Sm100
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
-            tmem_alloc_barrier.arrive_and_wait()
+            tmem_alloc_barrier.wait_unaligned()
             tmem.free(tmem_ptr)
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -852,7 +855,7 @@ class BlockSparseAttnForwardFp8FusedPvSm100Blk128(BlockSparseAttnForwardFp8Sm100
             # increase register after decreasing
             cute.arch.setmaxregister_increase(self.num_regs_softmax)
             # sync with mma warp before retrieving tmem ptr
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.wait_unaligned()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             softmax_loop = partial(
                 self.softmax_loop,
@@ -880,7 +883,7 @@ class BlockSparseAttnForwardFp8FusedPvSm100Blk128(BlockSparseAttnForwardFp8Sm100
             stage = Int32(0 if warp_idx < self.softmax1_warp_ids[0] else 1)
             softmax_loop(stage=stage)
 
-            tmem_alloc_barrier.arrive()
+            tmem_alloc_barrier.arrive_unaligned()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Correction
@@ -888,7 +891,7 @@ class BlockSparseAttnForwardFp8FusedPvSm100Blk128(BlockSparseAttnForwardFp8Sm100
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_correction)
             # sync with mma warp before retrieving tmem ptr
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.wait_unaligned()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             self.correction_loop(
                 thr_mma_pv,
@@ -908,7 +911,7 @@ class BlockSparseAttnForwardFp8FusedPvSm100Blk128(BlockSparseAttnForwardFp8Sm100
                 mBlockNums,
                 mVScale,
             )
-            tmem_alloc_barrier.arrive()
+            tmem_alloc_barrier.arrive_unaligned()
 
         return
 
@@ -1004,7 +1007,7 @@ class BlockSparseAttnForwardFp8FusedPvSm100Blk128(BlockSparseAttnForwardFp8Sm100
             pipeline.PipelineUserType.Consumer, self.kv_stage
         )
         p_read_counter = Int32(0)
-        s_read_barrier = pipeline_custom.NamedBarrier(barrier_id=12, num_threads=160)
+        s_read_barrier = pipeline.NamedBarrier(barrier_id=12, num_threads=160)
         # Pipeline s_p_o phases for stage 0 and stage 1.
         # These phases must persist across tiles
         # so that mbarrier phase stays in sync when block_iter_count varies.
@@ -1078,7 +1081,7 @@ class BlockSparseAttnForwardFp8FusedPvSm100Blk128(BlockSparseAttnForwardFp8Sm100
                 Ki_index = mma_kv_consumer_state.index
                 sK_cur = sK[None, None, None, Ki_index]
                 # The single S tile is reusable once all raw reads retire.
-                s_read_barrier.arrive_and_wait_w_index(index=0)
+                fp8_helpers.named_barrier_wait_unaligned(s_read_barrier, 0)
                 fp8_helpers.tcgen05_fence_after_thread_sync()
                 publish_scales(key_block=n_block(block_iter_count - 2), stage=phase_s1 * 2 + 1)
                 gemm_Si[1](smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator))
@@ -1123,7 +1126,7 @@ class BlockSparseAttnForwardFp8FusedPvSm100Blk128(BlockSparseAttnForwardFp8Sm100
                         pipeline_kv.consumer_wait(mma_kv_consumer_state)
                         Ki_index = mma_kv_consumer_state.index
                         sK_cur = sK[None, None, None, Ki_index]
-                        s_read_barrier.arrive_and_wait_w_index(index=0)
+                        fp8_helpers.named_barrier_wait_unaligned(s_read_barrier, 0)
                         fp8_helpers.tcgen05_fence_after_thread_sync()
                         # Two generations per stream protect deferred scale LDS.
                         self.publish_prefetched_k_scale(
@@ -1183,7 +1186,7 @@ class BlockSparseAttnForwardFp8FusedPvSm100Blk128(BlockSparseAttnForwardFp8Sm100
                         mma_kv_consumer_state.advance()
 
                 # Retire the final raw-score read credit before the next tile.
-                s_read_barrier.arrive_and_wait_w_index(index=0)
+                fp8_helpers.named_barrier_wait_unaligned(s_read_barrier, 0)
                 fp8_helpers.tcgen05_fence_after_thread_sync()
                 # release Q0
                 pipeline_q.consumer_release_w_index(0)
@@ -1460,9 +1463,10 @@ class BlockSparseAttnForwardFp8FusedPvSm100Blk128(BlockSparseAttnForwardFp8Sm100
                 if const_expr(self.double_buffer_stats):
                     # Drain the last scale readers before reusing both slots for
                     # the final payload. Terminal and steady ready IDs are distinct.
-                    pipeline_custom.NamedBarrier(
-                        barrier_id=11, num_threads=256
-                    ).arrive_and_wait_w_index(index=stage * 2)
+                    fp8_helpers.named_barrier_wait_unaligned(
+                        pipeline.NamedBarrier(barrier_id=11, num_threads=256),
+                        stage * 2,
+                    )
                 else:
                     # Final statistics have no next-QK ownership edge. Wait for
                     # the last scale reader before reusing its shared slot.
@@ -1474,19 +1478,27 @@ class BlockSparseAttnForwardFp8FusedPvSm100Blk128(BlockSparseAttnForwardFp8Sm100
                         softmax.row_max[0]
                     )
                 if const_expr(self.double_buffer_stats):
-                    pipeline_custom.NamedBarrier(
-                        barrier_id=11, num_threads=256
-                    ).arrive_w_index(index=stage * 2)
+                    fp8_helpers.named_barrier_arrive_unaligned(
+                        pipeline.NamedBarrier(barrier_id=11, num_threads=256),
+                        stage * 2,
+                    )
                 else:
-                    sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
+                    fp8_helpers.named_barrier_arrive_unaligned(
+                        sm_stats_barrier,
+                        stage * 4 + warp_idx,
+                    )
             else:
                 # Empty tiles publish only their terminal notification.
                 if const_expr(self.double_buffer_stats):
-                    pipeline_custom.NamedBarrier(
-                        barrier_id=11, num_threads=256
-                    ).arrive_w_index(index=stage * 2)
+                    fp8_helpers.named_barrier_arrive_unaligned(
+                        pipeline.NamedBarrier(barrier_id=11, num_threads=256),
+                        stage * 2,
+                    )
                 else:
-                    sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
+                    fp8_helpers.named_barrier_arrive_unaligned(
+                        sm_stats_barrier,
+                        stage * 4 + warp_idx,
+                    )
 
             # Advance to next tile
             work_tile = tile_scheduler.consumer_advance()
@@ -1559,7 +1571,10 @@ class BlockSparseAttnForwardFp8FusedPvSm100Blk128(BlockSparseAttnForwardFp8Sm100
         # Retire every raw S load before another QK may overwrite its tile.
         cute.arch.fence_view_async_tmem_load()
         fp8_helpers.tcgen05_fence_before_thread_sync()
-        pipeline_custom.NamedBarrier(barrier_id=12, num_threads=160).arrive_w_index(index=0)
+        fp8_helpers.named_barrier_arrive_unaligned(
+            pipeline.NamedBarrier(barrier_id=12, num_threads=160),
+            0,
+        )
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r)
         tSrS_groups = cute.logical_divide(tSrS_t2r, cute.make_layout(16))
@@ -1594,7 +1609,7 @@ class BlockSparseAttnForwardFp8FusedPvSm100Blk128(BlockSparseAttnForwardFp8Sm100
                 thread_idx = cute.arch.thread_idx()[0] % self.m_block_size
                 sScale[thread_idx + stage * self.m_block_size] = acc_scale
             # Publish scale ownership for every block, including the first.
-            sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
+            fp8_helpers.named_barrier_arrive_unaligned(sm_stats_barrier, stage * 4 + warp_idx)
 
         # Fold input dequantization, attention scale and P*128 into one FMA.
         # Store rounded P in 32-token chunks. The widened PV accumulates
@@ -1711,18 +1726,19 @@ class BlockSparseAttnForwardFp8FusedPvSm100Blk128(BlockSparseAttnForwardFp8Sm100
             if has_work:
                 if const_expr(not self.double_buffer_stats):
                     # The first dummy credit starts explicit scale ownership.
-                    sm_stats_barrier.arrive_and_wait_w_index(index=0 * 4 + warp_idx)
+                    fp8_helpers.named_barrier_wait_unaligned(sm_stats_barrier, 0 * 4 + warp_idx)
                     pipeline_sm_stats.consumer_release_w_index(0)
-                    sm_stats_barrier.arrive_and_wait_w_index(index=1 * 4 + warp_idx)
+                    fp8_helpers.named_barrier_wait_unaligned(sm_stats_barrier, 1 * 4 + warp_idx)
                     pipeline_sm_stats.consumer_release_w_index(1)
                     sm_stats_consumer_phase ^= 1
 
                 if const_expr(self.double_buffer_stats):
                     previous_row_max = cute.make_rmem_tensor((2,), Float32)
                     for stage in cutlass.range_constexpr(self.s_stage):
-                        pipeline_custom.NamedBarrier(
-                            barrier_id=3, num_threads=256
-                        ).arrive_and_wait_w_index(index=stage * 2 + o_corr_consumer_phase)
+                        fp8_helpers.named_barrier_wait_unaligned(
+                            pipeline.NamedBarrier(barrier_id=3, num_threads=256),
+                            stage * 2 + o_corr_consumer_phase,
+                        )
                         previous_row_max[stage] = sScale[
                             tidx + (o_corr_consumer_phase * 2 + stage) * self.m_block_size
                         ]
@@ -1741,9 +1757,10 @@ class BlockSparseAttnForwardFp8FusedPvSm100Blk128(BlockSparseAttnForwardFp8Sm100
                     for stage in cutlass.range_constexpr(self.s_stage):
                         if const_expr(self.double_buffer_stats):
                             scale_slot = o_corr_consumer_phase ^ 1
-                            pipeline_custom.NamedBarrier(
-                                barrier_id=3, num_threads=256
-                            ).arrive_and_wait_w_index(index=stage * 2 + scale_slot)
+                            fp8_helpers.named_barrier_wait_unaligned(
+                                pipeline.NamedBarrier(barrier_id=3, num_threads=256),
+                                stage * 2 + scale_slot,
+                            )
                             selected_max = sScale[tidx + (scale_slot * 2 + stage) * self.m_block_size]
                             safe_max = selected_max if selected_max != -Float32.inf else Float32(0.0)
                             scale = cute.math.exp2(previous_row_max[stage] - safe_max, fastmath=True)
@@ -1751,7 +1768,10 @@ class BlockSparseAttnForwardFp8FusedPvSm100Blk128(BlockSparseAttnForwardFp8Sm100
                             # Correction retains O credits and the previous-PV
                             # wait, bounding both scale and arrival generations.
                         else:
-                            sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
+                            fp8_helpers.named_barrier_wait_unaligned(
+                                sm_stats_barrier,
+                                stage * 4 + warp_idx,
+                            )
                             scale = sScale[tidx + stage * self.m_block_size]
                             # Lookahead QK bypasses O ownership. Release the scale
                             # slot after every reader before the next writer.
@@ -1774,14 +1794,19 @@ class BlockSparseAttnForwardFp8FusedPvSm100Blk128(BlockSparseAttnForwardFp8Sm100
                 for stage in cutlass.range_constexpr(self.s_stage):
                     if const_expr(self.double_buffer_stats):
                         # Drain scale readers, then wait for the final payload.
-                        pipeline_custom.NamedBarrier(
-                            barrier_id=11, num_threads=256
-                        ).arrive_and_wait_w_index(index=stage * 2)
-                        pipeline_custom.NamedBarrier(
-                            barrier_id=11, num_threads=256
-                        ).arrive_and_wait_w_index(index=stage * 2)
+                        fp8_helpers.named_barrier_wait_unaligned(
+                            pipeline.NamedBarrier(barrier_id=11, num_threads=256),
+                            stage * 2,
+                        )
+                        fp8_helpers.named_barrier_wait_unaligned(
+                            pipeline.NamedBarrier(barrier_id=11, num_threads=256),
+                            stage * 2,
+                        )
                     else:
-                        sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
+                        fp8_helpers.named_barrier_wait_unaligned(
+                            sm_stats_barrier,
+                            stage * 4 + warp_idx,
+                        )
                     # The final PV owns both O and its appended denominator.
                     pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
                     fp8_helpers.tcgen05_fence_after_thread_sync()
@@ -1854,11 +1879,15 @@ class BlockSparseAttnForwardFp8FusedPvSm100Blk128(BlockSparseAttnForwardFp8Sm100
                 # Match softmax's 1 barrier arrive per stage.
                 for stage_idx in cutlass.range_constexpr(self.s_stage):
                     if const_expr(self.double_buffer_stats):
-                        pipeline_custom.NamedBarrier(
-                            barrier_id=11, num_threads=256
-                        ).arrive_and_wait_w_index(index=stage_idx * 2)
+                        fp8_helpers.named_barrier_wait_unaligned(
+                            pipeline.NamedBarrier(barrier_id=11, num_threads=256),
+                            stage_idx * 2,
+                        )
                     else:
-                        sm_stats_barrier.arrive_and_wait_w_index(index=stage_idx * 4 + warp_idx)
+                        fp8_helpers.named_barrier_wait_unaligned(
+                            sm_stats_barrier,
+                            stage_idx * 4 + warp_idx,
+                        )
                     pipeline_sm_stats.consumer_release_w_index(stage_idx)
                 sm_stats_consumer_phase ^= 1
                 # Write O=0 via correction_epilogue_combine with scale=0.
@@ -1987,7 +2016,7 @@ def _publish_row_max(address: Int32, value: Float32, barrier_id: Int32) -> Float
         None,
         [Float32(value).ir_value(), Int32(address).ir_value(),
          Int32(cute.arch.make_warp_uniform(barrier_id)).ir_value()],
-        "st.shared.f32 [$1], $0; bar.arrive $2, 256;",
+        "st.shared.f32 [$1], $0; barrier.arrive $2, 256;",
         "f,r,r,~{memory}",
         has_side_effects=True,
         is_align_stack=False,

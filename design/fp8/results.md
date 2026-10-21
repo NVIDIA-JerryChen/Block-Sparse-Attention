@@ -1,4 +1,44 @@
-# SM100 blk64 Sage FP8 最终验证结果
+# SM100/SM103 FP8 验证结果
+
+## 2026-10-21：blk128 warp 子集同步修复（cuDNN PR #1752 P1）
+
+[cuDNN review](https://github.com/NVIDIA/cudnn-frontend/pull/1752#pullrequestreview-5594779337)
+指出的 P1 同样存在于本仓库 FP8 blk128 路径。TMEM 的 416 个线程、S-read 的
+160 个线程，以及统计量交接中的 64/256 个线程从不同 warp 分支到达同步点，
+原 `bar.sync` / `bar.arrive` 的 aligned 约束不成立。
+
+修复覆盖 TMEM 分配和释放、S-read、统计量和 terminal handoff，以及 inline
+row-max publication。使用已有 blk64 unaligned helpers，保留 barrier ID、线程数
+与调用顺序；全 CTA 的初始化 barrier 保持原实现。直接调用 TMEM barrier，避免
+`TmemAllocator.wait_for_alloc()` 重新构造 aligned barrier。
+
+基线为 `b1e4cc9`。环境为 PyTorch 26.05（CUDA 13.2）、CUTLASS DSL 4.5.2、
+apache-tvm-ffi 0.1.14.post1、Compute Sanitizer 2026.1.1。
+
+| 设备 | 基线 synccheck（split=1） | 修复后 synccheck | 修复后 memcheck | 原有回归 |
+|---|---|---|---|---|
+| B200 / SM100 | 704 errors，含 divergent barrier | 2 passed，0 errors | 2 passed，0 errors | 22 passed |
+| GB110 开发板 / SM103 | 320 errors，含 divergent barrier | 2 passed，0 errors | 2 passed，0 errors | 22 passed |
+
+B200 作业为 `5175441`（`umbriel-b200-068`）；SM103 作业为 `5175669`
+（`2u2g-gen-0471`）。后者设备名为 NVIDIA Graphics Device，运行时确认
+capability=(10,3)，为 GB110 bring-up board。原计划 B300 作业因资源排队取消。
+
+新增 `tests/test_sm100_blk128_sync.py` 以 split=1/4 覆盖 CUDA Graph 和缓存重用，
+并在重放之间切换动态 block counts。输入包含空行、零长度块、Q/KV 尾块、pipeline
+环绕和无效闲置索引；结果对照 FP32 reference。旧版在同一输入上触发 synccheck，
+说明单看数值测试不足以发现该问题。
+
+原有 22 项测试覆盖不传及 rank-1/2/3 `block_sizes`、online rescaling、空块、
+scale views、独立 stream/graph，以及 split=2/3/4/8。本次验证 JIT 路径，已有
+blk128 AOT bundle 需重新生成。
+
+```bash
+compute-sanitizer --tool synccheck --error-exitcode=1 \
+  python -m pytest -q tests/test_sm100_blk128_sync.py
+compute-sanitizer --tool memcheck --error-exitcode=1 \
+  python -m pytest -q tests/test_sm100_blk128_sync.py
+```
 
 ## 2026-10-21：blk64 warp 分工下的同步检查修复
 
@@ -111,8 +151,8 @@ FP8 早已改为保留真实序列长度的视图，不受影响。
   BF16 432）新旧输出逐位一致；非对齐形状上 FP8 逐位一致，BF16 只在旧代码出错
   的用例上不同。旧代码在非对齐矩阵第 48 例再次卡死，新代码 270 例全部完成。
 - **compute-sanitizer**：racecheck、memcheck 0 错误；synccheck 仍为既有的
-  correction warp divergent 报告，与本改动无关。该告警随后由本页开头的
-  warp 同步修复消除。
+  correction warp divergent 报告，与本改动无关。该告警随后由上方的
+  blk64 warp 同步修复消除。
 - **测试套件**：FP8 相关 B200 257、B300 258 passed；`test_flash_fwd.py -k sm100`
   190 passed（含新增 4 个尾块多 head 回归用例）；AOT 测试 34 passed；AOT-only
   660 例与 JIT 逐位一致（未构建的 BF16 rank-3 `block_sizes` 变体除外）。
