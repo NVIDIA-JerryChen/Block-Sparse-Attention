@@ -816,6 +816,8 @@ class BlockSparseAttnForwardSm100Blk64:
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
+        # These barriers are reached from different warp-specialized paths.
+        # Use unaligned arrive/wait operations rather than CTA-aligned barriers.
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierFwdSm100.TmemPtr),
             num_threads=cute.arch.WARP_SIZE * len((self.mma_warp_id, *self.softmax0_warp_ids, *self.softmax1_warp_ids, *self.correction_warp_ids)),
@@ -1070,7 +1072,7 @@ class BlockSparseAttnForwardSm100Blk64:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
             # Alloc tensor memory buffer
             tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.wait_unaligned()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             self.mma(
                 tiled_mma_qk,
@@ -1099,7 +1101,7 @@ class BlockSparseAttnForwardSm100Blk64:
                 bsa_fwd_helpers.tcgen05_fence_before_thread_sync()
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
-            tmem_alloc_barrier.arrive_and_wait()
+            tmem_alloc_barrier.wait_unaligned()
             tmem.free(tmem_ptr)
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1128,7 +1130,7 @@ class BlockSparseAttnForwardSm100Blk64:
             # increase register after decreasing
             cute.arch.setmaxregister_increase(self.num_regs_softmax)
             # sync with mma warp before retrieving tmem ptr
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.wait_unaligned()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             softmax_loop = partial(
                 self.softmax_loop,
@@ -1178,7 +1180,7 @@ class BlockSparseAttnForwardSm100Blk64:
                 else:
                     softmax_loop(stage=1, mask_physical_tail=True)
 
-            tmem_alloc_barrier.arrive()
+            tmem_alloc_barrier.arrive_unaligned()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Correction
@@ -1186,7 +1188,7 @@ class BlockSparseAttnForwardSm100Blk64:
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_correction)
             # sync with mma warp before retrieving tmem ptr
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.wait_unaligned()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             self.correction_loop(
                 thr_mma_pv,
@@ -1215,7 +1217,7 @@ class BlockSparseAttnForwardSm100Blk64:
                 mBlockNums,
                 mSplitOffsets,
             )
-            tmem_alloc_barrier.arrive()
+            tmem_alloc_barrier.arrive_unaligned()
 
         return
 
@@ -2058,10 +2060,10 @@ class BlockSparseAttnForwardSm100Blk64:
                 sScale[tidx + stage * self.stats_stride] = softmax.row_sum[0]
                 if const_expr(mLSE is not None or self.q_stage == 1):
                     sScale[tidx + stage * self.stats_stride + self.s_stage * self.stats_stride] = softmax.row_max[0]
-                sm_stats_barrier.arrive_w_index(index=sm_stats_bar_index)
+                bsa_fwd_helpers.named_barrier_arrive_unaligned(sm_stats_barrier, sm_stats_bar_index)
             else:
                 # Empty tile: arrive barrier once (synthetic "no work" signal for correction)
-                sm_stats_barrier.arrive_w_index(index=sm_stats_bar_index)
+                bsa_fwd_helpers.named_barrier_arrive_unaligned(sm_stats_barrier, sm_stats_bar_index)
 
             # Advance to next tile
             work_tile = tile_scheduler.consumer_advance()
@@ -2418,7 +2420,7 @@ class BlockSparseAttnForwardSm100Blk64:
             sm_stats_producer_phase ^= 1
             sScale[tidx + stage * self.stats_stride] = acc_scale
         # Notify correction wg that row_max is ready
-        sm_stats_barrier.arrive_w_index(index=sm_stats_bar_index)
+        bsa_fwd_helpers.named_barrier_arrive_unaligned(sm_stats_barrier, sm_stats_bar_index)
 
         if const_expr(self.is_sage_fp8):
             # Generate P * 256 directly in exp2.  The softmax numerator and
@@ -2610,10 +2612,10 @@ class BlockSparseAttnForwardSm100Blk64:
 
             if has_work:
                 # Ignore first signal from softmax as no correction is required
-                sm_stats_barrier.arrive_and_wait_w_index(index=0 * 4 + warp_idx)
+                bsa_fwd_helpers.named_barrier_wait_unaligned(sm_stats_barrier, 0 * 4 + warp_idx)
                 pipeline_sm_stats.consumer_release_w_index(0)
                 # Wait for both softmax warp groups.
-                sm_stats_barrier.arrive_and_wait_w_index(index=1 * 4 + warp_idx)
+                bsa_fwd_helpers.named_barrier_wait_unaligned(sm_stats_barrier, 1 * 4 + warp_idx)
                 sm_stats_consumer_phase ^= 1
 
                 # q_stage=1 correction loop
@@ -2622,7 +2624,7 @@ class BlockSparseAttnForwardSm100Blk64:
                 # Rescale the two alternating stages as a pair.
                 for i in cutlass.range(corr_pair_count, unroll=1):
                     for stage in cutlass.range_constexpr(self.s_stage):
-                        sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
+                        bsa_fwd_helpers.named_barrier_wait_unaligned(sm_stats_barrier, stage * 4 + warp_idx)
                         scale = sScale[tidx + stage * self.stats_stride]
                         should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
                         if should_rescale:
@@ -2636,7 +2638,7 @@ class BlockSparseAttnForwardSm100Blk64:
 
                 # Read final softmax stats for both stages
                 for stage in cutlass.range_constexpr(self.s_stage):
-                    sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
+                    bsa_fwd_helpers.named_barrier_wait_unaligned(sm_stats_barrier, stage * 4 + warp_idx)
                     row_sum = sScale[tidx + stage * self.stats_stride]
                     if const_expr(mLSE is not None or self.q_stage == 1):
                         row_max = sScale[tidx + stage * self.stats_stride + self.s_stage * self.stats_stride]
@@ -2705,7 +2707,7 @@ class BlockSparseAttnForwardSm100Blk64:
                 # Empty tile (block_count == 0): sync pipelines and write O=0.
                 # Match softmax's 1 barrier arrive per stage.
                 for stage_idx in cutlass.range_constexpr(self.s_stage):
-                    sm_stats_barrier.arrive_and_wait_w_index(index=stage_idx * 4 + warp_idx)
+                    bsa_fwd_helpers.named_barrier_wait_unaligned(sm_stats_barrier, stage_idx * 4 + warp_idx)
                     pipeline_sm_stats.consumer_release_w_index(stage_idx)
                 sm_stats_consumer_phase ^= 1
                 # Write O=0 through the raw WS exchange path without reading stale TMEM.
@@ -2814,7 +2816,9 @@ class BlockSparseAttnForwardSm100Blk64:
         exchange_addr = Int32((oExchange.iterator + exchange_warp_base + lane_idx * 4).toint())
         if const_expr(self.allow_empty_block_nums):
             is_zero_output = my_scale0 == Float32(0.0) and my_scale1 == Float32(0.0)
-            if not is_zero_output:
+            # TMEM loads are warp collective, including rows whose weights
+            # underflow to zero. Entirely empty warps must skip stale TMEM.
+            if cute.arch.vote_ballot_sync(not is_zero_output) != 0:
                 bsa_fwd_helpers.tmem_combine_store_exchange_4x32dp32b32x(
                     Int32(tmem_o0_addr),
                     Int32(tmem_o1_addr),
@@ -2822,7 +2826,7 @@ class BlockSparseAttnForwardSm100Blk64:
                     my_scale0,
                     my_scale1,
                 )
-            else:
+            if is_zero_output:
                 bsa_fwd_helpers.smem_zero_store_exchange_4x32dp32b32x(exchange_addr)
         else:
             bsa_fwd_helpers.tmem_combine_store_exchange_4x32dp32b32x(

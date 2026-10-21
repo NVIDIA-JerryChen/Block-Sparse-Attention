@@ -1,5 +1,71 @@
 # SM100 blk64 Sage FP8 最终验证结果
 
+## 2026-10-21：blk64 warp 分工下的同步检查修复
+
+### 原因与修改
+
+TMEM 分配/释放和 softmax 统计量交换只同步指定的 warp，但原实现调用的是
+CTA-aligned named barrier（`bar.sync` / `bar.arrive`）。这些指令要求参与者的
+控制流满足 aligned 约束，不能用于这里分开的 warp 执行路径。改为
+`barrier.sync` / `barrier.arrive`（CUTLASS 的 unaligned API），保留原 barrier
+编号、参与线程数和调用次序。这里的 unaligned 指控制流，不是内存地址对齐。
+
+另一个问题在输出合并：某些行的 softmax 权重下溢为 0 时，原来的逐行判断会让
+部分 lane 跳过整 warp 必须共同执行的 TMEM load。现在由 warp 投票决定是否读取，
+再将零权重行写为 0；整 warp 都为空时仍跳过未初始化的 TMEM。
+
+同步约束依据：[PTX named barrier 文档](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-bar)。
+
+### 已完成的验证
+
+基线为 `c514e9a`，环境为 PyTorch 26.05（CUDA 13.2）、CUTLASS DSL 4.5.2、
+apache-tvm-ffi 0.1.14.post1；Compute Sanitizer 2026.1.1。
+
+- **最小复现（B300）**：不含 attention 的 416-thread named barrier 例子，aligned
+  指令在复用和不复用 barrier 两种情况下都触发 synccheck；仅改为 unaligned
+  指令后，两种情况均为 0 错误。
+- **B300 原问题复现**：旧内核在动态候选数、含空块和极端权重输入上触发
+  `Divergent thread(s) in block`；修复后同样输入输出校验通过，synccheck 0 错误。
+- **新增 16 例回归（B300）**：FP8/BF16 × split 1/2 × CLC 开/关 × Q 长度 65/128。
+  同时覆盖逐行权重下溢、候选数为 0、奇数候选数、部分 KV 块和 Q 尾块；
+  检查 O、LSE 以及空行的 O=0、LSE=-inf。synccheck 和 memcheck 各 16 passed，
+  均 0 错误；混合候选数用例 racecheck 为 0 errors / 0 warnings。
+- **B300 原有测试**：FP8 forward/quant、编译缓存键和 AOT dispatch 共 146 passed、
+  16 skipped；`tests/test_flash_fwd.py -k sm100` 为 190 passed、294 skipped、
+  12 deselected。无失败。
+- **B200（SM100）针对性复查**：同一组新增 16 例全部通过，O/LSE 校验通过，
+  synccheck 为 0 错误；覆盖 FP8/BF16、split 1/2、CLC 开关和 Q 尾块。
+  作业 `5175059`，相同软件版本；此处没有重复 B300 的完整旧测试套件。
+
+复现回归：
+
+```bash
+compute-sanitizer --tool synccheck --error-exitcode=1 \
+  python -m pytest -q tests/test_sm100_blk64_sync.py
+compute-sanitizer --tool memcheck --error-exitcode=1 \
+  python -m pytest -q tests/test_sm100_blk64_sync.py
+```
+
+源码指纹变化，已有 blk64 AOT bundle 需要重新生成。
+
+### 性能抽查（B300）
+
+同一张 B300 上依次运行 `c514e9a` 和修复版本，每个用例用 CUDA Graph 重放
+5 次调用，测量 11 轮取中位数。FP8 输入预先量化，表中只计 attention，不计
+量化和 Python 调用开销。未锁定时钟；这组数据未见明显性能回退，不据此声称加速。
+4 个用例的新旧 O 和 LSE 均逐位一致。
+
+| 用例（B=1，D=128） | 修复前 ms | 修复后 ms | 变化 |
+|---|---:|---:|---:|
+| FP8，H=14，Q=KV=39756，top-k≤160，split=1 | 1.98107 | 1.97516 | -0.3% |
+| BF16，同上 | 2.68296 | 2.71678 | +1.3% |
+| FP8，H=8，Q=KV=8192，固定 top-k=32，split=1 | 0.07939 | 0.07917 | -0.3% |
+| FP8，H=4，Q=64，KV=32768，top-k≤128，split=4 | 0.04303 | 0.04269 | -0.8% |
+
+变长候选数用例包含 0，所有用例均包含短 `block_sizes`。记录来自 B300 作业
+`5174215` 的 `candidate5` 检查阶段和一组修复前/后性能结果。GPU 验证使用 JIT
+路径；本次未重建 AOT bundle。
+
 ## 2026-10-21：BF16 blk64 KV 尾块越界读取
 
 ### 问题
@@ -45,7 +111,8 @@ FP8 早已改为保留真实序列长度的视图，不受影响。
   BF16 432）新旧输出逐位一致；非对齐形状上 FP8 逐位一致，BF16 只在旧代码出错
   的用例上不同。旧代码在非对齐矩阵第 48 例再次卡死，新代码 270 例全部完成。
 - **compute-sanitizer**：racecheck、memcheck 0 错误；synccheck 仍为既有的
-  correction warp divergent 报告，与本改动无关。
+  correction warp divergent 报告，与本改动无关。该告警随后由本页开头的
+  warp 同步修复消除。
 - **测试套件**：FP8 相关 B200 257、B300 258 passed；`test_flash_fwd.py -k sm100`
   190 passed（含新增 4 个尾块多 head 回归用例）；AOT 测试 34 passed；AOT-only
   660 例与 JIT 逐位一致（未构建的 BF16 rank-3 `block_sizes` 变体除外）。
@@ -102,14 +169,15 @@ nsys 统计 604 次 kernel，B200 平均 36.90→36.34 µs（-1.5%）。
   ≤2.3%，满足 <2.9% 合同。
 - **compute-sanitizer**：racecheck、memcheck 新旧均 0 错误。synccheck 在
   `q2k_block_nums` 变体上新旧都报 correction warp 的 "Divergent thread(s) in
-  block"（固定 top-k 变体干净），属于既有问题，与本改动无关。
+  block"（固定 top-k 变体干净），属于既有问题，与本改动无关。该告警随后由
+  本页开头的 warp 同步修复消除。
 - **AOT**：重建精简 blk64 bundle（BF16 split 1/2、FP8 split 1/4、
   `block_sizes` 0/1/3）后官方 AOT 测试 B200 34 passed、B300 35 passed，0 failed；
   AOT-only 模式下 35 个用例与 JIT 输出逐位一致。
 - **测试套件**：FP8 相关 B200 257 passed、B300 258 passed；
   `tests/test_flash_fwd.py -k sm100` 两卡均 186 passed；均 0 failed。
 
-### 验证中发现的既有问题（`f953680` 同样存在，本次未修改；1、2 已在 2026-10-21 修复）
+### 验证中发现的既有问题（`f953680` 同样存在；1、2、3 已在 2026-10-21 修复）
 
 1. BF16 blk64 在客户形状、大动态范围数据、`kv_splits=2`、无 `block_sizes`
    的调用上，按特定调用历史可稳定卡死（GPU 100%、停在 synchronize），单独

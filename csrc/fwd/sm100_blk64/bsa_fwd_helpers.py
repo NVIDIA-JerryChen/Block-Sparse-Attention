@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import tcgen05
 from cutlass import Float32, Int32, Uint32, Boolean, const_expr
 from cutlass.cutlass_dsl import T
@@ -15,6 +16,24 @@ from block_sparse_attention.csrc.utils.tcgen05_mma_helpers import (
     _tcgen05_mma_kind,
     i64_to_i32x2,
 )
+
+
+@cute.jit
+def named_barrier_arrive_unaligned(barrier: pipeline.NamedBarrier, index: Int32) -> None:
+    """Signal a warp-pair barrier from independently executing warp roles."""
+    pipeline.NamedBarrier(
+        barrier_id=barrier.barrier_id + index,
+        num_threads=barrier.num_threads,
+    ).arrive_unaligned()
+
+
+@cute.jit
+def named_barrier_wait_unaligned(barrier: pipeline.NamedBarrier, index: Int32) -> None:
+    """Arrive and wait without requiring CTA-uniform control flow."""
+    pipeline.NamedBarrier(
+        barrier_id=barrier.barrier_id + index,
+        num_threads=barrier.num_threads,
+    ).wait_unaligned()
 
 
 @cute.jit
