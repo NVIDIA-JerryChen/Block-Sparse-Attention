@@ -1,5 +1,137 @@
 # SM100/SM103 FP8 验证结果
 
+## 2026-10-21：两处同步修复的完整复测
+
+复测内核固定为 `86e40ad`，修复前基线为 `c514e9a`。两处正向修复的专项检查
+通过，但扩大检查后确认 **BF16 反向 blk64 和 blk128 仍有原有的同步错误**。
+因此本次结果不能解释为整个项目已经没有 bug；本轮没有修改反向内核。
+性能方面，B200 的波动项复测通过；SM103 测试设备确认发生热降频，稳定性未通过。
+
+环境：PyTorch 26.05 / CUDA 13.2、CUTLASS DSL 4.5.2、apache-tvm-ffi
+0.1.14.post1、Compute Sanitizer 2026.1.1。SM100 使用 B200；SM103 使用
+GB110 bring-up board（运行时 capability=(10,3)），不能将其绝对耗时当作 B300 数据。
+
+### 正确性与预编译验证
+
+| 检查 | B200 / SM100 | GB110 / SM103 |
+|---|---|---|
+| 两处修复的数值回归 | 18 passed | 18 passed |
+| 同一组用例的 synccheck | 18 passed，0 errors | 18 passed，0 errors |
+| 同一组用例的 memcheck | 18 passed，0 errors | 18 passed，0 errors |
+| 尾块、多 batch/head、动态 metadata 的 memcheck | 37 passed，0 errors | 37 passed，0 errors |
+| 原始完整 pytest 回归 | 588 passed，2 failed，425 skipped | 589 passed，2 failed，424 skipped |
+| 修正旧兼容性测试后，相关测试重跑 | 11 passed | 11 passed |
+| 重新生成 blk64 AOT 后的测试 | 15 passed，3 skipped | 16 passed，2 skipped |
+| 重新生成 blk128 AOT 后的测试 | 46 passed | 46 passed |
+| blk128 AOT 专项 synccheck | 2 passed，0 errors | 2 passed，0 errors |
+
+完整回归的两个失败均来自 `tests/test_cutedsl_compat.py` 的旧预期：4.6.2 以后的
+bulk-copy election 策略，以及 DSL 对静态 dataclass 字段的省略方式。相同失败在
+`c514e9a` 上也存在；测试修正提交为 `5d11217`，没有改动内核。表中保留原始
+完整运行的失败数；修正后只重跑受影响的 11 项，并未将它们冒充为第二次全量运行。
+跳过项包括其他架构、当前不支持的 GQA/head dimension、双 GPU、可选量化依赖
+和未开启的构建集成检查；AOT 运行检查已在后续独立启用。
+
+旧版 blk64 首个用例触发 synccheck 后会破坏当前 CUDA context，因此另开进程检查
+旧版 FP8 blk128。B200 的旧 blk64 / blk128 分别报告 224 / 416 errors，SM103
+分别为 192 / 640 errors；对应修复版均为 0。错误条数受运行调度影响，不用于
+比较问题严重程度。AOT 均重新生成，blk128 覆盖 variable counts 开/关、四种
+block-sizes 形式与 split=1/2/4/8，共 32 个 producer 变体。
+
+### 扩大检查发现的反向旧问题
+
+两个反向用例分别在独立进程中运行，避免首个错误影响第二个用例。初次检查还
+遇到工具无法跟踪 PyTorch reference 的 cuBLAS `nvjet_` kernel；重新运行时只
+排除这些 reference kernel，BSA kernel 仍完整接受检查，且工具内部错误数为 0。
+
+| 独立 synccheck | B200：旧版 / 修复版 | SM103：旧版 / 修复版 |
+|---|---|---|
+| BF16 backward blk64 | 2528 / 3040 errors | 2976 / 1760 errors |
+| BF16 backward blk128 | 672 / 736 errors | 576 / 480 errors |
+
+报错均为 BSA 反向 kernel 内的 `Divergent thread(s) in block`，旧版与修复版
+均包含相同的 kernel 指令偏移（blk64 `+0xa110`，blk128 `+0xa2a0`）；
+SM103 的部分运行还报告其他同步点。
+两次正向修复没有改动 `csrc/bwd/`。普通梯度数值回归通过不能排除这些同步错误。
+
+```bash
+compute-sanitizer --tool synccheck --error-exitcode=86 \
+  --kernel-name-exclude kns=nvjet_ python -m pytest -v \
+  'tests/test_flash_bwd.py::test_flash_bwd_blk64_sparse[64-256-False]'
+compute-sanitizer --tool synccheck --error-exitcode=86 \
+  --kernel-name-exclude kns=nvjet_ python -m pytest -v \
+  'tests/test_flash_bwd.py::test_flash_bwd_sm100_blk128_topk_correctness[256-512-2-True]'
+```
+
+### 性能与证据
+
+每次 A/B 对比在同一 GPU 上交替运行旧版和修复版，完整矩阵各 4 轮；编译、
+参考校验与预热均在计时外。覆盖 BF16 blk64、FP8
+blk64/blk128，以及量化加 FP8 的 GPU 总耗时，另记录 Python eager 调用耗时。
+9 组输入包括短输入、动态 metadata、blk128 split=4、39756-token 客户形状，
+以及 119040 / 349440 / 695040-token 长输入。blk64 FP8 公开接口保留自动 split
+策略，显式 split=4 只传给 blk128。
+
+B200 的 9 组已完成，每组均通过采样 FP32 reference、全输出 finite、重复输出
+一致性及 A/B 输入摘要匹配。下表是 9 组 GPU 耗时比值的几何平均，正数表示修复版
+更慢。量化加计算采用 CUDA Graph，包含量化的 GPU 工作，不包括 Python 调度。
+
+| 路径 | B200 修复版相对旧版 |
+|---|---:|
+| BF16 blk64 | -0.73% |
+| FP8 blk64 | -0.20% |
+| FP8 blk128 | +0.90% |
+| 量化 + FP8 blk64 | +0.00% |
+| 量化 + FP8 blk128 | +1.22% |
+
+首次 B200 矩阵中，39756-token 与 119040-token/H=4 两组出现 10% 以上的轮间波动，
+个别量化加计算耗时比旧版高 6.49%。保留这些原始数据，并在另一张 B200 上将
+每个路径的持续预热延长至 500ms，交替运行各 8 轮（作业 `2331121`）。复测中
+10 个 GPU 指标的最大轮间跨度为 2.00%，修复版相对旧版的最大增幅为 0.65%，
+未复现原来的退化。轮间跨度定义为 `(max(各轮中位数)-min(各轮中位数))/中位数`。
+换卡和延长预热同时发生，不能仅据此断言最初波动只由预热不足造成。
+
+SM103 初次性能设备 `2u2g-gen-0468` 在持续负载下达到 87℃，SM 时钟下降到
+数百 MHz；旧版和修复版均出现明显波动。该轮在最终长输入计时中停止，保留原始
+结果作为环境异常记录，不作为性能稳定的证明。完整矩阵已转移至 B300 PCIe
+分区的 `2u2g-gen-0149`（作业 `5180997`），并对每个路径持续预热 500ms；
+运行时设备名仍为 `NVIDIA Graphics Device`，capability=(10,3)，因此本报告
+按 SM103 设备记录，分区标签不作为具体产品规格的证明。
+
+新节点的 9 组输入、每版各 4 轮已全部跑完，数值检查通过。各路径的 GPU 耗时
+几何平均变化如下；这些是在变频条件下取得的原始观测，不能用于证明稳定性。
+
+| 路径 | SM103 修复版相对旧版 |
+|---|---:|
+| BF16 blk64 | +0.06% |
+| FP8 blk64 | -0.10% |
+| FP8 blk128 | +0.40% |
+| 量化 + FP8 blk64 | +0.04% |
+| 量化 + FP8 blk128 | -0.63% |
+
+虽然没有观察到一致的平均性能退化，119040-token/H=4 的修复版仍有
+10.73%～19.05% 的轮间跨度，695040-token/H=8 的 FP8 blk128 为 12.54%。
+新节点最高 89℃，繁忙时最低采样 SM 时钟为 682MHz；现场额外查询确认
+`clocks_event_reasons.sw_thermal_slowdown=Active`，当时为 88℃、885MHz，
+power-cap slowdown 未激活。故 **SM103 的整体性能稳定性本轮不予确认**。
+需要散热与频率稳定的设备才能继续作稳定性判断；此次没有更改机器的功耗、
+时钟或散热设置。
+
+完整数值回归作业：B200 `2330834`、SM103 `5179562`；补充检查及 AOT 作业：
+B200 `2330990`、SM103 `5180217`。首次性能脚本误把显式 split 参数传入 blk64
+公开接口，已修正；完整性能重新安排为 B200 `2331063`、SM103 `5180550`，
+此前的局部计时不作为完整性能结论。
+本轮申请的作业均已退出，GPU 已释放。最终验收记录为
+`agent/agent_profiles/full-retest-20261021/acceptance.json`，明确保留整体未通过状态。
+
+原始日志、JUnit XML、环境、GPU telemetry 与分阶段返回码保存在
+`agent/agent_profiles/full-retest-20261021/`；固定源码归档及 SHA256 在
+`agent/agent_space/full-retest-20261021/manifest.json`，性能脚本在
+`agent/agent_benchmark/full-retest-20261021/benchmark.py`，持续预热复测脚本为
+同目录的 `benchmark_stability.py`；三个最终性能数据集另导出了 CSV。
+测试期间另修复了 `tools/ssh-gw` 在 cluster scratch 为空时忽略显式 workdir 的
+作业文件路径问题（独立工具提交 `5cc9ae4`，69 项测试通过，CPU 作业验证成功）。
+
 ## 2026-10-21：blk128 warp 子集同步修复（cuDNN PR #1752 P1）
 
 [cuDNN review](https://github.com/NVIDIA/cudnn-frontend/pull/1752#pullrequestreview-5594779337)
