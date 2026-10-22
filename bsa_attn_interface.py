@@ -1530,6 +1530,172 @@ _bsa_attn_fwd_sm120_fp8_blk64.compile_cache = get_jit_cache(
 )
 
 
+def _bsa_attn_fwd_sm120_nvfp4_blk64(
+    q_fp4: torch.Tensor,
+    k_fp4: torch.Tensor,
+    v_fp8: torch.Tensor,
+    q_sf: torch.Tensor,
+    k_sf: torch.Tensor,
+    v_scale: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    block_sparse_num: int,
+    softmax_scale: float,
+    block_sizes: Optional[torch.Tensor] = None,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Launch native SM120 blk64 BSA with NVFP4 Q/K and Sage FP8 P/V.
+
+    ``q_fp4``/``k_fp4`` are packed E2M1 bytes ``[B, H, S, 64]``; ``q_sf``/``k_sf``
+    are E4M3 scales ``[B, H, ceil(S/64)*64, 8]`` (one per 16 head-dim elements,
+    zero-padded to whole tiles), as produced by ``_nvfp4_quant.quantize_nvfp4_bhsd``.
+    """
+    from block_sparse_attention.csrc.fwd.sm120_blk64.bsa_fwd_sm120_nvfp4 import (
+        BlockSparseAttnForwardNvfp4Sm120Blk64 as Kernel,
+    )
+
+    sparse_block_size = 64
+    batch, num_heads, seqlen_q, packed_dim = q_fp4.shape
+    head_dim = packed_dim * 2
+    seqlen_k = k_fp4.shape[2]
+    assert head_dim == 128
+    assert q_fp4.dtype == k_fp4.dtype == torch.uint8
+    assert k_fp4.shape == (batch, num_heads, seqlen_k, packed_dim)
+    assert v_fp8.dtype == torch.float8_e4m3fn
+    assert v_fp8.shape == (batch, num_heads, seqlen_k, head_dim)
+    num_q_blocks = _ceil_div_int(seqlen_q, sparse_block_size)
+    num_kv_blocks = _ceil_div_int(seqlen_k, sparse_block_size)
+    assert q_sf.dtype == k_sf.dtype == torch.float8_e4m3fn
+    assert q_sf.shape == (batch, num_heads, num_q_blocks * sparse_block_size, head_dim // 16)
+    assert k_sf.shape == (batch, num_heads, num_kv_blocks * sparse_block_size, head_dim // 16)
+    assert v_scale.shape == (num_heads, head_dim)
+    q_fp4, k_fp4, v_fp8 = q_fp4.contiguous(), k_fp4.contiguous(), v_fp8.contiguous()
+
+    assert q2k_block_index.dtype == torch.int32
+    assert q2k_block_index.shape[:3] == (batch, num_heads, num_q_blocks)
+    q2k_block_index = q2k_block_index.contiguous()
+
+    has_block_nums = q2k_block_nums is not None and q2k_block_nums.numel() > 0
+    if has_block_nums:
+        assert q2k_block_nums.dtype == torch.int32
+        assert q2k_block_nums.shape == (batch, num_heads, num_q_blocks)
+        q2k_block_nums = q2k_block_nums.contiguous()
+        fixed_block_sparse_num = 0
+    else:
+        assert 1 <= block_sparse_num <= q2k_block_index.shape[-1]
+        fixed_block_sparse_num = int(block_sparse_num)
+
+    has_block_sizes = block_sizes is not None and block_sizes.numel() > 0
+    block_sizes_mode = 0
+    if has_block_sizes:
+        assert block_sizes.dtype == torch.int32
+        if block_sizes.ndim == 1:
+            assert block_sizes.shape == (num_kv_blocks,)
+            block_sizes_t = block_sizes.contiguous()
+            block_sizes_mode = 1
+        elif block_sizes.ndim == 2:
+            assert block_sizes.shape == (batch, num_kv_blocks)
+            block_sizes_t = block_sizes.contiguous().permute(1, 0)
+            block_sizes_mode = 2
+        else:
+            assert block_sizes.ndim == 3
+            assert block_sizes.shape == (batch, num_heads, num_kv_blocks)
+            block_sizes_t = block_sizes.contiguous().permute(2, 1, 0)
+            block_sizes_mode = 3
+
+    out = torch.empty((batch, num_heads, seqlen_q, head_dim), dtype=torch.bfloat16, device=q_fp4.device)
+    lse = torch.empty((batch, num_heads, seqlen_q), dtype=torch.float32, device=q_fp4.device)
+
+    # Scales go to the kernel as 16-byte rows so each 64-token tile is one
+    # (16, 32) TMA box.
+    q_sf_rows = q_sf.contiguous().view(batch, num_heads, -1, 16)
+    k_sf_rows = k_sf.contiguous().view(batch, num_heads, -1, 16)
+
+    q_t = q_fp4.permute(2, 3, 1, 0)
+    k_t = k_fp4.permute(2, 3, 1, 0)
+    v_t = v_fp8.permute(3, 2, 1, 0)
+    out_t = out.permute(2, 3, 1, 0)
+    lse_t = lse.permute(2, 1, 0)
+    q_sf_t = q_sf_rows.permute(3, 2, 1, 0)
+    k_sf_t = k_sf_rows.permute(3, 2, 1, 0)
+    v_scale_t = v_scale.contiguous().permute(1, 0)
+    q2k_t = q2k_block_index.permute(3, 2, 1, 0)
+    q2k_nums_t = q2k_block_nums.permute(2, 1, 0) if has_block_nums else q2k_t
+    if not has_block_sizes:
+        block_sizes_t = q2k_nums_t
+
+    runtime_tensors = (
+        q_t,
+        k_t,
+        v_t,
+        out_t,
+        lse_t,
+        q_sf_t,
+        k_sf_t,
+        v_scale_t,
+        q2k_t,
+        q2k_nums_t,
+        block_sizes_t,
+    )
+    leading_dims = (1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0)
+    cute_tensors = tuple(
+        _to_cute_tensor(
+            tensor,
+            assumed_align=(128 if index < 4 else 16 if index in (5, 6) else 4 if index in (4, 7) else None),
+            leading_dim=leading_dims[index],
+            enable_tvm_ffi=False,
+        )
+        for index, tensor in enumerate(runtime_tensors)
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
+    fwd_kernel = Kernel(
+        gqa_ratio=1,
+        head_dim=head_dim,
+        value_dim=head_dim,
+        blocksparse_blocksize_q=sparse_block_size,
+        blocksparse_blocksize_k=sparse_block_size,
+        acc_dtype=cutlass.Float32,
+        has_block_sizes=has_block_sizes,
+        has_block_nums=has_block_nums,
+        block_sizes_mode=block_sizes_mode,
+    )
+    compile_key = _dynamic_tensors_compile_key(
+        "sm120_nvfp4_blk64",
+        (
+            _get_device_arch(),
+            head_dim,
+            has_block_nums,
+            has_block_sizes,
+            block_sizes_mode,
+        ),
+        runtime_tensors,
+        leading_dims=leading_dims,
+    )
+    args = (
+        *cute_tensors[:10],
+        fixed_block_sparse_num,
+        cute_tensors[10],
+        softmax_scale,
+    )
+    if compile_key not in _bsa_attn_fwd_sm120_nvfp4_blk64.compile_cache:
+        _bsa_attn_fwd_sm120_nvfp4_blk64.compile_cache[compile_key] = cute.compile(
+            fwd_kernel,
+            *args,
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+        )
+
+    with torch.cuda.nvtx.range("bsa_attn_fwd_sm120_nvfp4_blk64_kernel"):
+        _bsa_attn_fwd_sm120_nvfp4_blk64.compile_cache[compile_key](
+            *args,
+            current_stream,
+        )
+    return out, lse
+
+
+_bsa_attn_fwd_sm120_nvfp4_blk64.compile_cache = get_jit_cache(
+    "bsa_fwd_sm120_nvfp4_blk64"
+)
+
+
 def _bsa_attn_fwd_sm120_sage_blk64(
     q_int8: torch.Tensor,
     k_int8: torch.Tensor,

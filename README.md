@@ -38,6 +38,7 @@ BSA/
 ├── block_sparse_attention/
 │   └── __init__.py                # Public package facade for source checkouts
 ├── bsa_attn_interface.py          # Public API implementation (fwd, bwd)
+├── bsa_nvfp4_quant.py             # SM120 NVFP4 Q/K (+ Sage FP8 V) quantization kernels
 ├── setup.py                       # Maps root sources into the installed package
 ├── pyproject.toml                 # Unified wheel metadata
 ├── tests/
@@ -45,7 +46,9 @@ BSA/
 │   ├── test_flash_bwd.py          # Backward tests & benchmarks (blk64 + blk128)
 │   ├── test_sm90_aot.py           # SM90 producer/combine AOT validation
 │   ├── test_sm100_aot.py          # SM100/SM103 CuTe DSL AOT validation
-│   └── test_sm120_aot.py          # SM120 forward AOT validation
+│   ├── test_sm120_aot.py          # SM120 forward AOT validation
+│   ├── test_bsa_nvfp4_sm120.py    # SM120 NVFP4-QK forward and quantization tests
+│   └── bench_sm120_nvfp4_blk64.py # SM120 NVFP4-QK vs Sage FP8 blk64 benchmark
 ├── requirements.txt               # Python dependencies
 ├── Makefile                       # Build & test automation
 │
@@ -65,6 +68,7 @@ BSA/
 │   ├── sm120_blk64/                  # blk64 — SM120 CuTe DSL / AOT + JIT
 │   │   ├── bsa_fwd_sm120.py          # SM120 forward kernel
 │   │   ├── bsa_fwd_sm120_fp8.py      # SM120 Sage FP8 forward kernel
+│   │   ├── bsa_fwd_sm120_nvfp4.py    # SM120 NVFP4 Q/K + Sage FP8 P/V forward kernel
 │   │   ├── bsa_fwd_sm120_sage.py     # SM120 Sage INT8/FP8 forward kernel
 │   │   ├── bsa_quant_sm120_sage.py   # Native Sage quantization kernels
 │   │   ├── aot_build.py              # Offline native-ABI artifact builder
