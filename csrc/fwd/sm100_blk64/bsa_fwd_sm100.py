@@ -1719,6 +1719,30 @@ class BlockSparseAttnForwardSm100Blk64:
                 sK_cur = sK[None, None, None, Ki_index]
 
                 pair_count = block_loop_count // 2  # N even => block_loop_count = N-2 is even
+                # FP8 K scales are software-pipelined: each stage keeps the
+                # next scale value one step ahead and its sparse block index
+                # two steps ahead, so the MMA warp never waits on that load.
+                kpre0 = Float32(0.0)
+                kpre1 = Float32(0.0)
+                kidx0 = Int32(0)
+                kidx1 = Int32(0)
+                if const_expr(self.is_sage_fp8 and not self.is_split_kv):
+                    kpre0 = self.load_k_scale_value(
+                        mKScale,
+                        self.load_k_block_index(n_block, block_iter_count - 3, tidx),
+                        batch_idx,
+                        head_idx,
+                        tidx,
+                    )
+                    kpre1 = self.load_k_scale_value(
+                        mKScale,
+                        self.load_k_block_index(n_block, block_iter_count - 4, tidx),
+                        batch_idx,
+                        head_idx,
+                        tidx,
+                    )
+                    kidx0 = self.load_k_block_index(n_block, block_iter_count - 5, tidx)
+                    kidx1 = self.load_k_block_index(n_block, block_iter_count - 6, tidx)
                 for i in cutlass.range(pair_count, unroll=1):
                     for stage in cutlass.range_constexpr(self.s_stage):
                         if const_expr(stage == 0):
@@ -1731,16 +1755,15 @@ class BlockSparseAttnForwardSm100Blk64:
                             tOrP_stage = tOrP1
                         bsa_fwd_helpers.mbar_wait(spo_empty_mbar, phase_cur)
                         if const_expr(self.is_sage_fp8 and not self.is_split_kv):
-                            self.publish_k_scales(
-                                mKScale,
-                                sKScale,
-                                n_block,
-                                block_iter_count - 3 - (i * self.s_stage + stage),
-                                stage,
-                                batch_idx,
-                                head_idx,
-                                tidx,
-                            )
+                            next2_kv = block_iter_count - 3 - ((i + 2) * self.s_stage + stage)
+                            if const_expr(stage == 0):
+                                self.store_k_scale(sKScale, stage, tidx, kpre0)
+                                kpre0 = self.load_k_scale_value(mKScale, kidx0, batch_idx, head_idx, tidx)
+                                kidx0 = self.load_k_block_index(n_block, next2_kv, tidx)
+                            else:
+                                self.store_k_scale(sKScale, stage, tidx, kpre1)
+                                kpre1 = self.load_k_scale_value(mKScale, kidx1, batch_idx, head_idx, tidx)
+                                kidx1 = self.load_k_block_index(n_block, next2_kv, tidx)
                         # Wait V
                         bsa_fwd_helpers.mbar_wait(
                             Int32(pipeline_kv.sync_object_full.get_barrier(mma_kv_consumer_state.index).toint()),
@@ -1864,6 +1887,55 @@ class BlockSparseAttnForwardSm100Blk64:
                 head_idx,
                 scale_idx,
             ]
+        cute.arch.sync_warp()
+        cute.arch.fence_view_async_shared()
+
+    @cute.jit
+    def load_k_block_index(
+        self,
+        n_block: Callable,
+        kv_block_idx: Int32,
+        tidx: Int32,
+    ) -> Int32:
+        """Sparse block that holds K-scale lane tidx of one KV tile."""
+        key_block = Int32(0)
+        if tidx < 16:
+            key_block = n_block(
+                cutlass.max(kv_block_idx, Int32(0)) * self.sparse_blocks_per_kv
+                + tidx // 4
+            )
+        return key_block
+
+    @cute.jit
+    def load_k_scale_value(
+        self,
+        mKScale: cute.Tensor,
+        key_block: Int32,
+        batch_idx: Int32,
+        head_idx: Int32,
+        tidx: Int32,
+    ) -> Float32:
+        """Global K scale for lane tidx of a KV tile (see publish_k_scales)."""
+        value = Float32(0.0)
+        if tidx < 16:
+            scale_idx = cutlass.min(
+                key_block * 4 + tidx % 4,
+                mKScale.shape[2] - 1,
+            )
+            value = mKScale[batch_idx, head_idx, scale_idx]
+        return value
+
+    @cute.jit
+    def store_k_scale(
+        self,
+        sKScale: cute.Tensor,
+        score_stage: int,
+        tidx: Int32,
+        value: Float32,
+    ):
+        """Publish one prefetched K-scale vector for a score stage."""
+        if tidx < 16:
+            sKScale[score_stage * 16 + tidx] = value
         cute.arch.sync_warp()
         cute.arch.fence_view_async_shared()
 
