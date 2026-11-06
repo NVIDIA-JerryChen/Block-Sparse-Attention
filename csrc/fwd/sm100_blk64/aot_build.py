@@ -372,7 +372,7 @@ def _create_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dtypes", default="bf16,fp8")
     parser.add_argument("--kv-splits", default="1,2,4,8")
-    parser.add_argument("--fp8-kv-splits", default="1,4,8,16")
+    parser.add_argument("--fp8-kv-splits", default="1,2,4,8,16")
     parser.add_argument("--fp8-block-sizes-modes", default="0,1,2,3")
     parser.add_argument(
         "--fp8-ldred",

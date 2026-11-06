@@ -15,50 +15,36 @@ def test_bsa_fp8_probability_scale_contract():
 
 
 @pytest.mark.parametrize(
-    "heads,seqlen_q,topk,expected_splits",
+    "heads,seqlen_q,kv_blocks,expected_splits",
     [
-        # Short-Q rows retain the split policy tuned for launch parallelism.
+        # Fewer Q tiles than SMs: use the largest power of two that keeps the
+        # CTA count within the SMs, while every split keeps >= 8 blocks.
         (4, 64, 1, 1),
-        (4, 64, 127, 1),
+        (4, 64, 31, 1),
+        (4, 64, 127, 8),
         (4, 64, 128, 16),
-        (4, 64, 256, 8),
-        (4, 64, 368, 8),
-        (4, 64, 450, 16),
         (4, 64, 548, 16),
-        (8, 64, 188, 4),
-        (8, 64, 548, 16),
+        (8, 64, 188, 16),
         (8, 64, 1089, 16),
-        # Long-Q rows already expose enough independent Q tiles.  Avoid the
-        # partial-workspace/combine tax until a CTA traverses at least 900
-        # sparse KV blocks, then use four splits.
+        (1, 64 * 37, 32, 4),
+        (1, 64 * 74, 127, 1),
+        (1, 64 * 74, 128, 2),
+        (1, 64 * 100, 2048, 1),
+        # Q tiles already fill every SM; splitting only adds CTA setup,
+        # FP32 partials and the combine pass.
+        (1, 64 * 148, 2048, 1),
         (4, 119040, 188, 1),
-        (8, 119040, 188, 1),
-        (4, 234240, 368, 1),
-        (8, 234240, 368, 1),
-        (4, 349440, 548, 1),
         (8, 349440, 548, 1),
-        (4, 464640, 729, 1),
-        (8, 464640, 729, 1),
-        (4, 579840, 909, 4),
-        (8, 579840, 909, 4),
-        (4, 695040, 1089, 4),
-        (8, 695040, 1089, 4),
-        # SLA 0709 customer benchmark rows.
-        (4, 116160, 186, 1),
-        (8, 116160, 186, 1),
-        (4, 109312, 174, 1),
-        (8, 109312, 174, 1),
-        (4, 216832, 342, 1),
-        (8, 216832, 342, 1),
-        (4, 695040, 1090, 4),
-        (8, 695040, 1090, 4),
+        (4, 579840, 909, 1),
+        (8, 695040, 1089, 1),
+        (4, 49290 + 2216 + 752, 915, 1),
     ],
 )
-def test_bsa_fp8_split_policy(heads, seqlen_q, topk, expected_splits):
+def test_bsa_fp8_split_policy(heads, seqlen_q, kv_blocks, expected_splits):
     from bsa_attn_interface import _sm100_blk64_auto_fp8_kv_splits
 
     assert (
-        _sm100_blk64_auto_fp8_kv_splits(topk, heads, seqlen_q)
+        _sm100_blk64_auto_fp8_kv_splits(kv_blocks, heads, seqlen_q, 1, 148)
         == expected_splits
     )
 
@@ -66,8 +52,9 @@ def test_bsa_fp8_split_policy(heads, seqlen_q, topk, expected_splits):
 def test_bsa_fp8_split_policy_counts_batch_tiles():
     from bsa_attn_interface import _sm100_blk64_auto_fp8_kv_splits
 
-    assert _sm100_blk64_auto_fp8_kv_splits(188, 4, 4096, batch=1) == 16
-    assert _sm100_blk64_auto_fp8_kv_splits(188, 4, 4096, batch=2) == 1
+    assert _sm100_blk64_auto_fp8_kv_splits(188, 4, 64, 1, 148) == 16
+    assert _sm100_blk64_auto_fp8_kv_splits(188, 4, 64, 8, 148) == 4
+    assert _sm100_blk64_auto_fp8_kv_splits(188, 4, 64, 37, 148) == 1
 
 
 @pytest.mark.parametrize(

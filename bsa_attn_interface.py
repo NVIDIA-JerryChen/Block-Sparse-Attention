@@ -691,31 +691,37 @@ def _sm100_blk64_kv_splits_from_count(
 
 
 def _sm100_blk64_auto_fp8_kv_splits(
-    topk_num: int,
-    heads: int = 4,
-    seqlen_q: int = 64,
-    batch: int = 1,
+    kv_blocks: int,
+    heads: int,
+    seqlen_q: int,
+    batch: int,
+    num_sms: int,
 ) -> int:
-    """Choose FP8 splits for short-Q parallelism without over-splitting long Q."""
-    topk_num = int(topk_num)
-    heads = int(heads)
-    q_tiles = int(batch) * heads * ((int(seqlen_q) + 63) // 64)
-    if q_tiles >= 512:
-        # SLA-scale Q already exposes thousands of independent CTAs.  Splitting
-        # medium top-k rows only adds FP32 partial workspace and a combine pass;
-        # a small split remains useful once each CTA traverses at least 900 KV
-        # blocks.  These buckets are tuned on the full SLA 0709 shapes.
-        return 4 if topk_num >= 900 else 1
-    if topk_num < 128:
+    """Choose FP8 splits only when Q tiles cannot fill the GPU.
+
+    The FP8 kernel runs one CTA per SM, so splitting KV only helps by adding
+    CTAs when there are fewer Q tiles than SMs.  Each extra CTA costs roughly
+    seven KV iterations of fixed work plus the FP32 partials and combine, so
+    every split must keep at least 8 sparse blocks (128 for two splits).
+    ``kv_blocks`` is the largest per-tile sparse block count.
+    """
+    kv_blocks = int(kv_blocks)
+    q_tiles = int(batch) * int(heads) * _ceil_div_int(int(seqlen_q), 64)
+    if q_tiles >= int(num_sms):
         return 1
-    if heads == 8:
-        if topk_num < 256:
-            return 4
-        if topk_num < 500:
-            return 8
-    elif 224 <= topk_num < 400:
-        return 8
-    return 16
+    splits = 1
+    while splits < 16 and splits * 2 * q_tiles <= int(num_sms):
+        splits *= 2
+    while splits > 1 and (
+        kv_blocks < 8 * splits or (splits == 2 and kv_blocks < 128)
+    ):
+        splits //= 2
+    return splits
+
+
+@lru_cache(maxsize=None)
+def _get_device_num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
 _SM103_SAGE_FP8_LDRED_MIN_Q_TILES = 512
@@ -3092,14 +3098,30 @@ def bsa_fp8_blk64_fwd(
     else:
         block_sizes = None
 
-    policy_topk = (
-        q2k_block_index.shape[-1] if has_block_nums else topk_num
+    num_sms = _get_device_num_sms(
+        q_fp8.device.index
+        if q_fp8.device.index is not None
+        else torch.cuda.current_device()
     )
+    policy_blocks = topk_num
+    if has_block_nums:
+        # Variable counts are usually far below the index width.  Splits are
+        # only considered when Q tiles cannot fill the GPU, so read the real
+        # per-tile maximum only then (the index width bounds it otherwise,
+        # including during stream capture).
+        policy_blocks = q2k_block_index.shape[-1]
+        if (
+            batch * heads * num_q_blocks < num_sms
+            and not is_fake_mode()
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            policy_blocks = int(q2k_block_nums.max())
     kv_splits = _sm100_blk64_auto_fp8_kv_splits(
-        policy_topk,
+        policy_blocks,
         heads,
         seqlen_q,
         batch,
+        num_sms,
     )
 
     # Q/K/V and scale metadata keep their true extents. The SM100 kernel itself
