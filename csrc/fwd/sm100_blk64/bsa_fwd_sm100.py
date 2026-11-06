@@ -261,6 +261,10 @@ class BlockSparseAttnForwardSm100Blk64:
             expected_o_dtype = Float32 if const_expr(self.is_split_kv) else cutlass.BFloat16
             if const_expr(self.o_dtype != expected_o_dtype):
                 raise TypeError("Sage FP8 output must be FP32 partials for split-KV, otherwise BF16")
+            # The lean FP8 softmax needs fewer registers; giving them to the
+            # correction warps removes their spills and recomputation.
+            self.num_regs_softmax = 176
+            self.num_regs_correction = 104
         elif const_expr(mKScale is not None or mVScale is not None):
             raise TypeError("Q, K, and V scales must be provided together")
         # Persistent FP8 tiles give the epilogue its own shared memory so the
