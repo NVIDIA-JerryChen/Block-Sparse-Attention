@@ -2580,6 +2580,9 @@ class BlockSparseAttnForwardSm100Blk64:
             out_head_idx = head_idx + split_idx * num_heads if const_expr(self.is_split_kv) else head_idx
 
             if const_expr(self.is_sage_fp8 and not self.is_split_kv):
+                # Persistent tiles reuse this warp's slice: order the previous
+                # tile's epilogue reads before overwriting it.
+                cute.arch.sync_warp()
                 lane_idx = tidx % cute.arch.WARP_SIZE
                 for vec in cutlass.range_constexpr(
                     self.head_dim_v_padded // cute.arch.WARP_SIZE
