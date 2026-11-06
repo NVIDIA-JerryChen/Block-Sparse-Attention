@@ -256,7 +256,10 @@ def test_sm100_aot_default_matrix_is_deterministic_and_includes_fp8(capsys):
         2,
         3,
     }
-    assert all(not variant.use_clc_scheduler for variant in fp8_variants)
+    assert all(
+        variant.use_clc_scheduler == (variant.kv_splits == 1)
+        for variant in fp8_variants
+    )
     assert all(not variant.use_int64_kv_strides for variant in fp8_variants)
 
     assert (

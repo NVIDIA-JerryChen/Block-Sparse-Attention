@@ -3195,7 +3195,7 @@ def bsa_fp8_blk64_fwd(
         softmax_scale=softmax_scale,
         layout="bhsd",
         block_sparse_num=topk_num,
-        use_clc=False,
+        use_clc=kv_splits == 1,
         kv_splits=kv_splits,
         allow_empty_block_nums=has_block_nums,
         q_scale=q_scale,

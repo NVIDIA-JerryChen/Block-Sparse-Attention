@@ -263,6 +263,12 @@ class BlockSparseAttnForwardSm100Blk64:
                 raise TypeError("Sage FP8 output must be FP32 partials for split-KV, otherwise BF16")
         elif const_expr(mKScale is not None or mVScale is not None):
             raise TypeError("Q, K, and V scales must be provided together")
+        # Persistent FP8 tiles give the epilogue its own shared memory so the
+        # next tile's K/V loads overlap it.  Split-KV FP32 scratch would not
+        # fit next to three K/V stages.
+        self.separate_epi_smem = (
+            self.is_sage_fp8 and self.is_persistent and not self.is_split_kv
+        )
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         Q_layout_transpose = [2, 3, 1, 0]
         mQ_seq = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
@@ -661,10 +667,16 @@ class BlockSparseAttnForwardSm100Blk64:
         sO_size_in_k_elements = (
             sO_size * self.o_dtype.width + self.k_dtype.width - 1
         ) // self.k_dtype.width
-        sKV_size = max(
-            cute.cosize(sK_layout),
-            self.epi_sO_input_offset + sO_size_in_k_elements,
-        )
+        if const_expr(self.separate_epi_smem):
+            # A persistent tile can then load its first K/V while the previous
+            # tile's epilogue still reads the exchange and O scratch.
+            sKV_size = cute.cosize(sK_layout)
+            sEpi_size = self.epi_sO_input_offset + sO_size_in_k_elements
+        else:
+            sKV_size = max(
+                cute.cosize(sK_layout),
+                self.epi_sO_input_offset + sO_size_in_k_elements,
+            )
 
         clc_response_size = self.sched_stages * 4 if self.use_clc_scheduler else 0
         clc_mbar_size = self.sched_stages * 2 if self.use_clc_scheduler else 0
@@ -710,6 +722,11 @@ class BlockSparseAttnForwardSm100Blk64:
                 cute.struct.MemRange[self.k_dtype, sKV_size],
                 self.buffer_align_bytes,
             ]
+            if const_expr(self.separate_epi_smem):
+                sEpi: cute.struct.Align[
+                    cute.struct.MemRange[self.k_dtype, sEpi_size],
+                    self.buffer_align_bytes,
+                ]
 
         self.shared_storage = SharedStorage
 
@@ -914,7 +931,7 @@ class BlockSparseAttnForwardSm100Blk64:
             defer_sync=True,
         )
         pipeline_load_epi = None
-        if const_expr(self.is_persistent):
+        if const_expr(self.is_persistent and not self.separate_epi_smem):
             # Protect aliased KV/O storage across persistent work tiles.
             pipeline_load_epi = pipeline_custom.PipelineAsync.create(
                 barrier_storage=storage.mbar_load_epi.data_ptr(),
@@ -942,9 +959,11 @@ class BlockSparseAttnForwardSm100Blk64:
         # Strip swizzle info to reuse smem
         sV = cute.make_tensor(cute.recast_ptr(sKV_ptr, sV_layout.inner), sV_layout.outer)
         # The epilogue exchange and sO reuse
-        # the large KV buffer after the mainloop has finished consuming it.
+        # the large KV buffer after the mainloop has finished consuming it,
+        # unless they have their own storage.
+        sEpi_ptr = storage.sEpi.data_ptr() if const_expr(self.separate_epi_smem) else sKV_ptr
         sO = cute.make_tensor(
-            cute.recast_ptr(sKV_ptr + self.epi_sO_input_offset, sO_layout.inner, self.o_dtype),
+            cute.recast_ptr(sEpi_ptr + self.epi_sO_input_offset, sO_layout.inner, self.o_dtype),
             sO_layout.outer,
         )
 
@@ -961,7 +980,7 @@ class BlockSparseAttnForwardSm100Blk64:
             else sScale
         )
         oExchange = cute.make_tensor(
-            cute.recast_ptr(sKV_ptr, dtype=Float32),
+            cute.recast_ptr(sEpi_ptr, dtype=Float32),
             cute.make_layout(self.epi_exchange_f32_count),
         )
 
