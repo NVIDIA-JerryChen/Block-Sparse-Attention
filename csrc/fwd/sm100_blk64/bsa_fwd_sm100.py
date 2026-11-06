@@ -1188,19 +1188,31 @@ class BlockSparseAttnForwardSm100Blk64:
                 else True
             )
 
-            # Keep stage constexpr so each softmax path has a fixed stage.
-            # Runtime stage selection leaves TMEM offsets, barrier indices, and
-            # stats strides as uniform arithmetic in the hot softmax loop.
-            if warp_idx < self.softmax1_warp_ids[0]:
+            if const_expr(self.is_sage_fp8):
+                # The FP8 softmax body is large enough that two constexpr-stage
+                # copies stall on instruction fetch.  Both warpgroups share one
+                # body and select their stage with a warp-uniform value.
+                stage = cute.arch.make_warp_uniform(
+                    warp_idx // len(self.softmax0_warp_ids)
+                )
                 if aligned_k_storage:
-                    softmax_loop(stage=0, mask_physical_tail=False)
+                    softmax_loop(stage=stage, mask_physical_tail=False)
                 else:
-                    softmax_loop(stage=0, mask_physical_tail=True)
-            if warp_idx < self.correction_warp_ids[0] and warp_idx >= self.softmax1_warp_ids[0]:
-                if aligned_k_storage:
-                    softmax_loop(stage=1, mask_physical_tail=False)
-                else:
-                    softmax_loop(stage=1, mask_physical_tail=True)
+                    softmax_loop(stage=stage, mask_physical_tail=True)
+            else:
+                # Keep stage constexpr so each softmax path has a fixed stage.
+                # Runtime stage selection leaves TMEM offsets, barrier indices, and
+                # stats strides as uniform arithmetic in the hot softmax loop.
+                if warp_idx < self.softmax1_warp_ids[0]:
+                    if aligned_k_storage:
+                        softmax_loop(stage=0, mask_physical_tail=False)
+                    else:
+                        softmax_loop(stage=0, mask_physical_tail=True)
+                if warp_idx < self.correction_warp_ids[0] and warp_idx >= self.softmax1_warp_ids[0]:
+                    if aligned_k_storage:
+                        softmax_loop(stage=1, mask_physical_tail=False)
+                    else:
+                        softmax_loop(stage=1, mask_physical_tail=True)
 
             if const_expr(not self.is_sage_fp8):
                 tmem_alloc_barrier.arrive_unaligned()
