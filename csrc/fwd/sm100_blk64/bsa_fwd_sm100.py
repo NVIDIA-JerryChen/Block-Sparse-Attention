@@ -404,10 +404,13 @@ class BlockSparseAttnForwardSm100Blk64:
         if const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
         self._setup_attributes()
-        # Sage V has a different scale for every output channel.  The FP8
-        # path therefore uses the register epilogue so that scale can be
-        # applied immediately before the BF16 store.
-        self.use_tma_O = self.arch >= Arch.sm_90 and not self.is_sage_fp8
+        # Sage V has a different scale for every output channel.  Unsplit FP8
+        # applies it in the correction epilogue before sO, so TMA can store O;
+        # split-KV FP8 partials keep the register epilogue, which applies the
+        # scale immediately before the store.
+        self.use_tma_O = self.arch >= Arch.sm_90 and not (
+            self.is_sage_fp8 and self.is_split_kv
+        )
         # This can be tuned
         # This is currently very ad-hoc, we should tune it systematically
         self.ex2_emu_freq = 0
@@ -3030,11 +3033,17 @@ class BlockSparseAttnForwardSm100Blk64:
         bsa_fwd_helpers.mbar_arrive_and_wait(reduce_mbar_addr, Int32(1))
 
         out_row = (corr_warp & 1) * cute.arch.WARP_SIZE + lane_idx
-        if corr_warp < 2 and out_row < self.m_block_size:
+        # FP8 lets both warps of a row pair drain the exchange: warps 0/1 own
+        # column chunks 0-1 and warps 2/3 own chunks 2-3.
+        drain_warps = 4 if const_expr(self.is_sage_fp8) else 2
+        chunks_per_warp = 2 if const_expr(self.is_sage_fp8) else 4
+        chunk_base = (corr_warp // 2) * 2 if const_expr(self.is_sage_fp8) else 0
+        if corr_warp < drain_warps and out_row < self.m_block_size:
             own_warp_base = corr_warp * 4 * 32 * 32
             partner_warp_base = partner_warp * 4 * 32 * 32
             lane_col_swizzle = lane_idx & 7
-            for c in cutlass.range_constexpr(4):
+            for chunk in cutlass.range_constexpr(chunks_per_warp):
+                c = chunk_base + chunk
                 off = c * 32 * 32 + lane_idx * 4
                 col0 = (((c * 4) + 0) ^ lane_col_swizzle) * 8
                 col1 = (((c * 4) + 1) ^ lane_col_swizzle) * 8
