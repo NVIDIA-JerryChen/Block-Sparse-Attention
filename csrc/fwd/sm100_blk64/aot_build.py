@@ -428,11 +428,8 @@ def main(argv=None) -> int:
             _parse_bool_matrix(args.int64_kv_strides),
         )
     if "fp8" in dtypes:
-        if args.fp8_ldred == "auto":
-            ldred_values = (
-                (False, True) if args.target_arch == "sm_103a" else (False,)
-            )
-        elif args.fp8_ldred == "both":
+        # The public FP8 path never selects ld.red; build it only on request.
+        if args.fp8_ldred == "both":
             ldred_values = (False, True)
         else:
             ldred_values = (args.fp8_ldred == "enabled",)

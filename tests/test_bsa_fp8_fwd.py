@@ -57,38 +57,6 @@ def test_bsa_fp8_split_policy_counts_batch_tiles():
     assert _sm100_blk64_auto_fp8_kv_splits(188, 4, 64, 37, 148) == 1
 
 
-@pytest.mark.parametrize(
-    "arch,batch,heads,seqlen_q,kv_splits,expected",
-    [
-        (100, 1, 4, 8192, 1, False),
-        (103, 1, 4, 8128, 1, False),
-        (103, 1, 4, 8192, 1, True),
-        (103, 1, 8, 4096, 1, True),
-        (103, 1, 4, 8192, 4, False),
-    ],
-)
-def test_sm103_sage_fp8_ldred_policy(
-    arch,
-    batch,
-    heads,
-    seqlen_q,
-    kv_splits,
-    expected,
-):
-    from bsa_attn_interface import _sm103_blk64_use_sage_fp8_ldred
-
-    assert (
-        _sm103_blk64_use_sage_fp8_ldred(
-            arch,
-            batch,
-            heads,
-            seqlen_q,
-            kv_splits,
-        )
-        is expected
-    )
-
-
 def _require_sm100_or_sm110() -> None:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 11):
         pytest.skip("FP8 blk64 BSA requires SM100/SM110")

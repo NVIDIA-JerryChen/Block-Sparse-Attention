@@ -291,8 +291,8 @@ def test_sm100_aot_default_matrix_is_deterministic_and_includes_fp8(capsys):
         == 0
     )
     output = capsys.readouterr().out
-    assert "Main variants: 48" in output
-    assert "Dtype variants: fp8=48" in output
+    assert "Main variants: 40" in output
+    assert "Dtype variants: fp8=40" in output
 
 
 def test_sm100_aot_variant_round_trip_and_validation():

@@ -724,29 +724,6 @@ def _get_device_num_sms(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-_SM103_SAGE_FP8_LDRED_MIN_Q_TILES = 512
-
-
-def _sm103_blk64_use_sage_fp8_ldred(
-    arch: int,
-    batch_size: int,
-    heads: int,
-    seqlen_q: int,
-    kv_splits: int,
-) -> bool:
-    """Use 16-token hardware row-max only where it wins on SM103."""
-    q_tiles = (
-        int(batch_size)
-        * int(heads)
-        * _ceil_div_int(int(seqlen_q), 64)
-    )
-    return (
-        int(arch) == 103
-        and int(kv_splits) == 1
-        and q_tiles >= _SM103_SAGE_FP8_LDRED_MIN_Q_TILES
-    )
-
-
 # The public FP8 contract has fixed ranks, dtypes, layouts, and feature flags.
 # Cache the warmed compiled function separately so repeated hot-path calls do
 # not rebuild the general-purpose dynamic compile key and validation state.
@@ -759,14 +736,12 @@ def _bsa_fp8_blk64_fast_key(
     q: torch.Tensor,
     kv_splits: int,
     block_sizes_mode: int = 0,
-    use_sage_ldred_rowmax: bool = False,
 ) -> tuple:
     return (
         _get_device_arch(q.device),
         q.device.index,
         int(kv_splits),
         int(block_sizes_mode),
-        bool(use_sage_ldred_rowmax),
         fa_logging.get_fa_log_level(),
     )
 
@@ -2537,13 +2512,6 @@ def _bsa_attn_fwd_sm100_blk64(
         kv_splits_i,
         allow_fallback=auto_kv_splits,
     )
-    use_sage_ldred_rowmax = is_sage_fp8 and _sm103_blk64_use_sage_fp8_ldred(
-        arch,
-        batch_size,
-        num_head,
-        seqlen_q,
-        kv_splits_i,
-    )
     allow_empty_block_nums = (
         allow_empty_block_nums and has_variable_block_nums
     ) or kv_splits_i > 1
@@ -2639,7 +2607,6 @@ def _bsa_attn_fwd_sm100_blk64(
             input_layout,
             use_exact_kv_layout,
             is_sage_fp8,
-            use_sage_ldred_rowmax,
             "tvm_ffi_env_stream_v1",
         ),
         (
@@ -2670,7 +2637,6 @@ def _bsa_attn_fwd_sm100_blk64(
             use_clc_scheduler=use_clc_scheduler,
             use_int64_kv_strides=use_exact_kv_layout,
             block_sizes_mode=block_sizes_mode,
-            use_sage_ldred_rowmax=use_sage_ldred_rowmax,
         )
         aot_runtime_tensors = (
             q_bhsd,
@@ -2739,7 +2705,6 @@ def _bsa_attn_fwd_sm100_blk64(
             has_block_sizes=has_block_sizes,
             block_sizes_mode=block_sizes_mode,
             num_splits=kv_splits_i,
-            use_sage_ldred_rowmax=use_sage_ldred_rowmax,
             use_exact_kv_layout=use_exact_kv_layout,
         )
 
@@ -2794,7 +2759,6 @@ def _bsa_attn_fwd_sm100_blk64(
                         q_bhsd,
                         kv_splits_i,
                         block_sizes_mode,
-                        use_sage_ldred_rowmax,
                     )
                 ] = compiled_fn
             if compiled_fn is not None:
@@ -2857,7 +2821,6 @@ def _bsa_attn_fwd_sm100_blk64(
                 q_bhsd,
                 kv_splits_i,
                 block_sizes_mode,
-                use_sage_ldred_rowmax,
             )
             _bsa_fp8_blk64_aot_fast_cache[fast_key] = (
                 manifest_token,
@@ -3126,18 +3089,10 @@ def bsa_fp8_blk64_fwd(
 
     # Q/K/V and scale metadata keep their true extents. The SM100 kernel itself
     # detects and masks its final physical KV block, matching SM120's contract.
-    use_sage_ldred_rowmax = _sm103_blk64_use_sage_fp8_ldred(
-        _get_device_arch(q_fp8.device),
-        batch,
-        heads,
-        seqlen_q,
-        kv_splits,
-    )
     fast_key = _bsa_fp8_blk64_fast_key(
         q_fp8,
         kv_splits,
         block_sizes_mode,
-        use_sage_ldred_rowmax,
     )
     aot_fast_entry = (
         None
