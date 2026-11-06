@@ -897,7 +897,7 @@ def test_sm100_aot_only_fp8_split_matches_reference(monkeypatch):
     not _RUNTIME_TEST_ENABLED or _DEVICE_ARCH != 103,
     reason="Set BSA_TEST_SM100_AOT_RUNTIME=1 and run on SM103",
 )
-def test_sm103_aot_only_fp8_ldred_matches_reference(monkeypatch):
+def test_sm103_aot_only_fp8_large_q_matches_reference(monkeypatch):
     artifact_root = os.getenv(SM100_AOT_DIR_ENV)
     assert artifact_root, f"{SM100_AOT_DIR_ENV} must be set"
     monkeypatch.setenv(SM100_AOT_ONLY_ENV, "1")

@@ -57,6 +57,13 @@ def test_bsa_fp8_split_policy_counts_batch_tiles():
     assert _sm100_blk64_auto_fp8_kv_splits(188, 4, 64, 37, 148) == 1
 
 
+def test_bsa_fp8_split_policy_uses_sm_count():
+    from bsa_attn_interface import _sm100_blk64_auto_fp8_kv_splits
+
+    assert _sm100_blk64_auto_fp8_kv_splits(2048, 1, 64 * 100, 1, 148) == 1
+    assert _sm100_blk64_auto_fp8_kv_splits(2048, 1, 64 * 100, 1, 200) == 2
+
+
 def _require_sm100_or_sm110() -> None:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 11):
         pytest.skip("FP8 blk64 BSA requires SM100/SM110")
@@ -501,6 +508,70 @@ def test_bsa_fp8_blk64_sm100_split_keeps_tail_metadata_zero_copy(monkeypatch):
     assert captured["block_sizes"] is None
 
 
+@pytest.mark.parametrize(
+    "seqlen_q,real_blocks,expected_splits,expected_clc",
+    [
+        # Few Q tiles: the real per-tile count, not the index width, decides.
+        (64, 4, 1, True),
+        (64, 512, 16, False),
+        # Q tiles fill the GPU: never split, whatever the counts are.
+        (64 * 64, 512, 1, True),
+    ],
+)
+def test_bsa_fp8_blk64_split_policy_uses_real_block_nums(
+    monkeypatch, seqlen_q, real_blocks, expected_splits, expected_clc
+):
+    _require_sm100_or_sm110()
+    import bsa_attn_interface as interface
+
+    batch, heads, sk, width = 1, 4, 64 * 1024, 1024
+    num_q_blocks = (seqlen_q + 63) // 64
+    q_fp8 = torch.empty(
+        (batch, heads, seqlen_q, 128), dtype=torch.float8_e4m3fn, device="cuda"
+    )
+    k_fp8 = torch.empty(
+        (batch, heads, sk, 128), dtype=torch.float8_e4m3fn, device="cuda"
+    )
+    v_fp8 = torch.empty_like(k_fp8)
+    q_scale = torch.ones((batch, heads, seqlen_q), device="cuda")
+    k_scale = torch.ones((batch, heads, sk // 16), device="cuda")
+    v_scale = torch.ones((heads, 128), device="cuda")
+    block_index = torch.zeros(
+        (batch, heads, num_q_blocks, width), dtype=torch.int32, device="cuda"
+    )
+    block_nums = torch.full(
+        (batch, heads, num_q_blocks), real_blocks, dtype=torch.int32, device="cuda"
+    )
+    block_nums[0, 0, 0] = real_blocks // 2
+    captured = {}
+
+    def fake_sm100_forward(q, k, v, indices, block_sizes, **kwargs):
+        captured.update(kv_splits=kwargs["kv_splits"], use_clc=kwargs["use_clc"])
+        return (
+            torch.empty_like(q, dtype=torch.bfloat16),
+            torch.empty(q.shape[:3], dtype=torch.float32, device=q.device),
+        )
+
+    monkeypatch.setattr(interface, "_get_device_num_sms", lambda _index: 148)
+    monkeypatch.setattr(
+        interface, "_bsa_attn_fwd_sm100_blk64", fake_sm100_forward
+    )
+    interface.bsa_fp8_blk64_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_scale,
+        k_scale,
+        v_scale,
+        block_index,
+        width,
+        q2k_block_nums=block_nums,
+    )
+
+    assert captured["kv_splits"] == expected_splits
+    assert captured["use_clc"] is expected_clc
+
+
 def test_bsa_fp8_blk64_sm100_leaves_tail_block_sizes_for_kernel(monkeypatch):
     _require_sm100_or_sm110()
     import bsa_attn_interface as interface
@@ -612,6 +683,118 @@ def test_bsa_fp8_blk64_dynamic_heads_all_splits_sm100(heads, kv_splits):
 
 
 @pytest.mark.parametrize(
+    "batch,heads,sq,sk,topk",
+    [
+        (1, 1, 65, 127, 1),
+        (2, 3, 65, 127, 2),
+        (1, 8, 64, 320, 4),
+        (1, 4, 556, 556, 5),
+        (1, 4, 1000, 4097, 9),
+    ],
+)
+@pytest.mark.parametrize("use_clc", [True, False])
+def test_bsa_fp8_blk64_writes_every_output_element_sm100(
+    batch, heads, sq, sk, topk, use_clc
+):
+    _require_sm100_or_sm110()
+    from bsa_attn_interface import _bsa_attn_fwd_sm100_blk64
+    from bsa_fp8_quant import quantize_sage_bhsd
+
+    torch.manual_seed(1106 + sq + sk)
+    q = torch.randn((batch, heads, sq, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, heads, sk, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q_fp8, k_fp8, v_fp8, q_sfs, k_sfs, v_sfs = quantize_sage_bhsd(q, k, v)
+    block_index = _make_block_index(heads, sq, sk, topk, batch)
+    out = torch.full(
+        (batch, heads, sq, 128), float("nan"), device="cuda", dtype=torch.bfloat16
+    )
+    lse = torch.full(
+        (batch, heads, sq), float("nan"), device="cuda", dtype=torch.float32
+    )
+    _bsa_attn_fwd_sm100_blk64(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        block_index,
+        None,
+        softmax_scale=1.0 / math.sqrt(128),
+        block_sparse_num=topk,
+        use_clc=use_clc,
+        out=out,
+        lse=lse,
+        q_scale=q_sfs,
+        k_scale=k_sfs,
+        v_scale=v_sfs,
+    )
+    assert not torch.isnan(out).any()
+    assert not torch.isnan(lse).any()
+
+
+def test_bsa_fp8_blk64_persistent_and_split_paths_sm100():
+    """CLC persistent tiles, the static scheduler and split-KV agree."""
+    _require_sm100_or_sm110()
+    from bsa_attn_interface import _bsa_attn_fwd_sm100_blk64
+    from bsa_fp8_quant import quantize_sage_bhsd
+
+    torch.manual_seed(1105)
+    heads, sq, sk, topk = 4, 64 * 300 - 17, 64 * 40 + 23, 24
+    q = torch.randn((1, heads, sq, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, heads, sk, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q_fp8, k_fp8, v_fp8, q_sfs, k_sfs, v_sfs = quantize_sage_bhsd(q, k, v)
+    block_index = _make_block_index(heads, sq, sk, topk)
+    num_q_blocks = block_index.shape[2]
+    block_nums = torch.randint(
+        0, topk + 1, (1, heads, num_q_blocks), device="cuda", dtype=torch.int32
+    )
+    block_sizes = torch.full((math.ceil(sk / 64),), 64, device="cuda", dtype=torch.int32)
+    block_sizes[1::7] = 17
+    block_sizes[-1] = sk % 64
+    scale = 1.0 / math.sqrt(128)
+    ref = _dequantized_sparse_reference(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_sfs,
+        k_sfs,
+        v_sfs,
+        block_index,
+        scale,
+        block_nums=block_nums,
+        block_sizes=block_sizes,
+    )
+
+    outputs = {}
+    for use_clc, kv_splits in ((True, 1), (False, 1), (False, 2)):
+        out, lse = _bsa_attn_fwd_sm100_blk64(
+            q_fp8,
+            k_fp8,
+            v_fp8,
+            block_index,
+            block_sizes,
+            q2k_block_nums=block_nums,
+            softmax_scale=scale,
+            use_clc=use_clc,
+            kv_splits=kv_splits,
+            q_scale=q_sfs,
+            k_scale=k_sfs,
+            v_scale=v_sfs,
+        )
+        diff = (out.float() - ref).abs()
+        assert diff.max().item() < 0.15
+        assert (diff.mean() / ref.abs().mean()).item() < 0.035
+        empty_rows = (block_nums == 0).repeat_interleave(64, dim=-1)[..., :sq]
+        assert torch.isneginf(lse[empty_rows]).all()
+        assert torch.isfinite(lse[~empty_rows]).all()
+        outputs[(use_clc, kv_splits)] = (out, lse)
+
+    # Scheduling must not change the arithmetic.
+    assert torch.equal(outputs[(True, 1)][0], outputs[(False, 1)][0])
+    assert torch.equal(outputs[(True, 1)][1], outputs[(False, 1)][1])
+
+
+@pytest.mark.parametrize(
     "heads,topk",
     [
         (4, 4),
@@ -682,7 +865,7 @@ def test_bsa_fp8_blk64_block_sizes_sm100(heads, topk):
     assert (diff.mean() / ref.abs().mean()).item() < 0.029
 
 
-def test_bsa_fp8_blk64_sm103_ldred_with_partial_block():
+def test_bsa_fp8_blk64_sm103_large_q_partial_block():
     _require_sm103()
     from bsa_fp8_blk64 import bsa_fp8_blk64_fwd, quantize_sage_bhsd
 
