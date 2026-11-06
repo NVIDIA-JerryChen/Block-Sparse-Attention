@@ -816,17 +816,32 @@ class BlockSparseAttnForwardSm100Blk64:
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        # These barriers are reached from different warp-specialized paths.
-        # Use unaligned arrive/wait operations rather than CTA-aligned barriers.
-        tmem_alloc_barrier = pipeline.NamedBarrier(
-            barrier_id=int(NamedBarrierFwdSm100.TmemPtr),
-            num_threads=cute.arch.WARP_SIZE * len((self.mma_warp_id, *self.softmax0_warp_ids, *self.softmax1_warp_ids, *self.correction_warp_ids)),
-        )
+        if const_expr(self.is_sage_fp8):
+            # FP8: the whole CTA meets at one allocation barrier and one
+            # teardown barrier.  Correction is the last TMEM user, so it owns
+            # the allocation.
+            tmem_alloc_barrier = pipeline.NamedBarrier(
+                barrier_id=int(NamedBarrierFwdSm100.TmemPtr),
+                num_threads=self.threads_per_cta,
+            )
+            tmem_dealloc_barrier = pipeline.NamedBarrier(
+                barrier_id=int(NamedBarrierFwdSm100.Epilogue),
+                num_threads=self.threads_per_cta,
+            )
+            tmem_allocator_warp_id = self.correction_warp_ids[0]
+        else:
+            # These barriers are reached from different warp-specialized paths.
+            # Use unaligned arrive/wait operations rather than CTA-aligned barriers.
+            tmem_alloc_barrier = pipeline.NamedBarrier(
+                barrier_id=int(NamedBarrierFwdSm100.TmemPtr),
+                num_threads=cute.arch.WARP_SIZE * len((self.mma_warp_id, *self.softmax0_warp_ids, *self.softmax1_warp_ids, *self.correction_warp_ids)),
+            )
+            tmem_allocator_warp_id = self.mma_warp_id
         # Tensor memory allocator
         tmem = cutlass.utils.TmemAllocator(
             storage.tmem_holding_buf,
             barrier_for_retrieve=tmem_alloc_barrier,
-            allocator_warp_id=self.mma_warp_id,
+            allocator_warp_id=tmem_allocator_warp_id,
         )
 
         ThreadCooperativeGroup = partial(pipeline.CooperativeGroup, pipeline.Agent.Thread)
@@ -1017,6 +1032,10 @@ class BlockSparseAttnForwardSm100Blk64:
 
         # Synchronize the CTA before tensor memory allocation.
         pipeline_init_wait()
+        if const_expr(self.is_sage_fp8):
+            if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
+                tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
+            tmem.wait_for_alloc()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  EMPTY / CLC SCHEDULER WARP
@@ -1070,9 +1089,10 @@ class BlockSparseAttnForwardSm100Blk64:
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
-            # Alloc tensor memory buffer
-            tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
-            tmem_alloc_barrier.wait_unaligned()
+            if const_expr(not self.is_sage_fp8):
+                # Alloc tensor memory buffer
+                tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
+                tmem_alloc_barrier.wait_unaligned()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             self.mma(
                 tiled_mma_qk,
@@ -1097,12 +1117,13 @@ class BlockSparseAttnForwardSm100Blk64:
             )
             if const_expr(self.is_sage_fp8):
                 # Order the final asynchronous tcgen05 operations before the
-                # allocator synchronization/deallocation sequence.
+                # teardown barrier that precedes deallocation.
                 bsa_fwd_helpers.tcgen05_fence_before_thread_sync()
-            # Dealloc the tensor memory buffer
-            tmem.relinquish_alloc_permit()
-            tmem_alloc_barrier.wait_unaligned()
-            tmem.free(tmem_ptr)
+            else:
+                # Dealloc the tensor memory buffer
+                tmem.relinquish_alloc_permit()
+                tmem_alloc_barrier.wait_unaligned()
+                tmem.free(tmem_ptr)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Epilogue
@@ -1129,8 +1150,9 @@ class BlockSparseAttnForwardSm100Blk64:
         if warp_idx <= self.softmax1_warp_ids[-1]:
             # increase register after decreasing
             cute.arch.setmaxregister_increase(self.num_regs_softmax)
-            # sync with mma warp before retrieving tmem ptr
-            tmem_alloc_barrier.wait_unaligned()
+            if const_expr(not self.is_sage_fp8):
+                # sync with mma warp before retrieving tmem ptr
+                tmem_alloc_barrier.wait_unaligned()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             softmax_loop = partial(
                 self.softmax_loop,
@@ -1180,15 +1202,17 @@ class BlockSparseAttnForwardSm100Blk64:
                 else:
                     softmax_loop(stage=1, mask_physical_tail=True)
 
-            tmem_alloc_barrier.arrive_unaligned()
+            if const_expr(not self.is_sage_fp8):
+                tmem_alloc_barrier.arrive_unaligned()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Correction
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_correction)
-            # sync with mma warp before retrieving tmem ptr
-            tmem_alloc_barrier.wait_unaligned()
+            if const_expr(not self.is_sage_fp8):
+                # sync with mma warp before retrieving tmem ptr
+                tmem_alloc_barrier.wait_unaligned()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             self.correction_loop(
                 thr_mma_pv,
@@ -1217,7 +1241,19 @@ class BlockSparseAttnForwardSm100Blk64:
                 mBlockNums,
                 mSplitOffsets,
             )
-            tmem_alloc_barrier.arrive_unaligned()
+            if const_expr(self.is_sage_fp8):
+                tmem.relinquish_alloc_permit()
+            else:
+                tmem_alloc_barrier.arrive_unaligned()
+
+        if const_expr(self.is_sage_fp8):
+            # Every role has finished with TMEM; the allocator warp frees it.
+            tmem_dealloc_barrier.arrive_and_wait()
+            if warp_idx == self.correction_warp_ids[0]:
+                cute.arch.dealloc_tmem(
+                    tmem.retrieve_ptr(self.qk_acc_dtype),
+                    cute.arch.get_max_tmem_alloc_cols("sm_100"),
+                )
 
         return
 
