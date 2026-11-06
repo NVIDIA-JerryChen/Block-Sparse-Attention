@@ -67,6 +67,7 @@ def packaging_source(tmp_path_factory: pytest.TempPathFactory) -> Path:
         "bsa_fp8_blk64.py",
         "bsa_fp8_blk128.py",
         "bsa_fp8_quant.py",
+        "bsa_nvfp4_quant.py",
         "bsa_sage_blk64.py",
         "bsa_sage_quant.py",
         "pyproject.toml",
@@ -146,6 +147,7 @@ def test_source_tree_keeps_existing_layout() -> None:
     assert (REPO_ROOT / "bsa_fp8_blk64.py").is_file()
     assert (REPO_ROOT / "bsa_fp8_blk128.py").is_file()
     assert (REPO_ROOT / "bsa_fp8_quant.py").is_file()
+    assert (REPO_ROOT / "bsa_nvfp4_quant.py").is_file()
     assert (REPO_ROOT / "bsa_sage_blk64.py").is_file()
     assert (REPO_ROOT / "bsa_sage_quant.py").is_file()
     assert (REPO_ROOT / "csrc" / "__init__.py").is_file()
@@ -171,12 +173,14 @@ def test_wheel_contains_single_import_package(built_wheel: Path) -> None:
         "block_sparse_attention/bsa_fp8_blk64.py",
         "block_sparse_attention/bsa_fp8_blk128.py",
         "block_sparse_attention/bsa_fp8_quant.py",
+        "block_sparse_attention/bsa_nvfp4_quant.py",
         "block_sparse_attention/bsa_sage_blk64.py",
         "block_sparse_attention/bsa_sage_quant.py",
         "block_sparse_attention/csrc/fwd/sm90_blk64/aot_build.py",
         "block_sparse_attention/csrc/fwd/sm90_blk64/aot_runtime.py",
         "block_sparse_attention/csrc/fwd/sm90_blk64/aot_utils.py",
         "block_sparse_attention/csrc/fwd/sm120_blk64/quant_aot_runtime.py",
+        "block_sparse_attention/csrc/fwd/sm120_blk64/bsa_fwd_sm120_nvfp4.py",
         "block_sparse_attention/csrc/fwd/sm100_blk64/bsa_fwd_sm100.py",
         "block_sparse_attention/csrc/fwd/sm100_blk128/bsa_fwd_sm100_fp8.py",
         "block_sparse_attention/csrc/fwd/sm100_blk128/bsa_fwd_sm100_fp8_fused_pv.py",
@@ -215,12 +219,14 @@ def test_sdist_contains_mapped_sources(built_sdist: Path) -> None:
         "bsa_fp8_blk64.py",
         "bsa_fp8_blk128.py",
         "bsa_fp8_quant.py",
+        "bsa_nvfp4_quant.py",
         "bsa_sage_blk64.py",
         "bsa_sage_quant.py",
         "csrc/fwd/sm90_blk64/aot_build.py",
         "csrc/fwd/sm90_blk64/aot_runtime.py",
         "csrc/fwd/sm90_blk64/aot_utils.py",
         "csrc/fwd/sm120_blk64/quant_aot_runtime.py",
+        "csrc/fwd/sm120_blk64/bsa_fwd_sm120_nvfp4.py",
         "csrc/fwd/sm100_blk64/bsa_fwd_sm100.py",
         "csrc/fwd/sm100_blk128/bsa_fwd_sm100_fp8.py",
         "csrc/fwd/sm100_blk128/bsa_fwd_sm100_fp8_fused_pv.py",

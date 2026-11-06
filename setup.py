@@ -46,6 +46,7 @@ class BuildPy(_BuildPy):
                     (package, "bsa_fp8_blk128", "bsa_fp8_blk128.py"),
                     (package, "bsa_fp8", "bsa_fp8.py"),
                     (package, "bsa_fp8_quant", "bsa_fp8_quant.py"),
+                    (package, "bsa_nvfp4_quant", "bsa_nvfp4_quant.py"),
                     (package, "bsa_sage_blk64", "bsa_sage_blk64.py"),
                     (package, "bsa_sage_quant", "bsa_sage_quant.py"),
                 )
