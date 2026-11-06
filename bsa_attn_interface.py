@@ -691,54 +691,37 @@ def _sm100_blk64_kv_splits_from_count(
 
 
 def _sm100_blk64_auto_fp8_kv_splits(
-    topk_num: int,
-    heads: int = 4,
-    seqlen_q: int = 64,
-    batch: int = 1,
-) -> int:
-    """Choose FP8 splits for short-Q parallelism without over-splitting long Q."""
-    topk_num = int(topk_num)
-    heads = int(heads)
-    q_tiles = int(batch) * heads * ((int(seqlen_q) + 63) // 64)
-    if q_tiles >= 512:
-        # SLA-scale Q already exposes thousands of independent CTAs.  Splitting
-        # medium top-k rows only adds FP32 partial workspace and a combine pass;
-        # a small split remains useful once each CTA traverses at least 900 KV
-        # blocks.  These buckets are tuned on the full SLA 0709 shapes.
-        return 4 if topk_num >= 900 else 1
-    if topk_num < 128:
-        return 1
-    if heads == 8:
-        if topk_num < 256:
-            return 4
-        if topk_num < 500:
-            return 8
-    elif 224 <= topk_num < 400:
-        return 8
-    return 16
-
-
-_SM103_SAGE_FP8_LDRED_MIN_Q_TILES = 512
-
-
-def _sm103_blk64_use_sage_fp8_ldred(
-    arch: int,
-    batch_size: int,
+    kv_blocks: int,
     heads: int,
     seqlen_q: int,
-    kv_splits: int,
-) -> bool:
-    """Use 16-token hardware row-max only where it wins on SM103."""
-    q_tiles = (
-        int(batch_size)
-        * int(heads)
-        * _ceil_div_int(int(seqlen_q), 64)
-    )
-    return (
-        int(arch) == 103
-        and int(kv_splits) == 1
-        and q_tiles >= _SM103_SAGE_FP8_LDRED_MIN_Q_TILES
-    )
+    batch: int,
+    num_sms: int,
+) -> int:
+    """Choose FP8 splits only when Q tiles cannot fill the GPU.
+
+    The FP8 kernel runs one CTA per SM, so splitting KV only helps by adding
+    CTAs when there are fewer Q tiles than SMs.  Each extra CTA costs roughly
+    seven KV iterations of fixed work plus the FP32 partials and combine, so
+    every split must keep at least 8 sparse blocks (128 for two splits).
+    ``kv_blocks`` is the largest per-tile sparse block count.
+    """
+    kv_blocks = int(kv_blocks)
+    q_tiles = int(batch) * int(heads) * _ceil_div_int(int(seqlen_q), 64)
+    if q_tiles >= int(num_sms):
+        return 1
+    splits = 1
+    while splits < 16 and splits * 2 * q_tiles <= int(num_sms):
+        splits *= 2
+    while splits > 1 and (
+        kv_blocks < 8 * splits or (splits == 2 and kv_blocks < 128)
+    ):
+        splits //= 2
+    return splits
+
+
+@lru_cache(maxsize=None)
+def _get_device_num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
 # The public FP8 contract has fixed ranks, dtypes, layouts, and feature flags.
@@ -753,14 +736,12 @@ def _bsa_fp8_blk64_fast_key(
     q: torch.Tensor,
     kv_splits: int,
     block_sizes_mode: int = 0,
-    use_sage_ldred_rowmax: bool = False,
 ) -> tuple:
     return (
         _get_device_arch(q.device),
         q.device.index,
         int(kv_splits),
         int(block_sizes_mode),
-        bool(use_sage_ldred_rowmax),
         fa_logging.get_fa_log_level(),
     )
 
@@ -2531,13 +2512,6 @@ def _bsa_attn_fwd_sm100_blk64(
         kv_splits_i,
         allow_fallback=auto_kv_splits,
     )
-    use_sage_ldred_rowmax = is_sage_fp8 and _sm103_blk64_use_sage_fp8_ldred(
-        arch,
-        batch_size,
-        num_head,
-        seqlen_q,
-        kv_splits_i,
-    )
     allow_empty_block_nums = (
         allow_empty_block_nums and has_variable_block_nums
     ) or kv_splits_i > 1
@@ -2633,7 +2607,6 @@ def _bsa_attn_fwd_sm100_blk64(
             input_layout,
             use_exact_kv_layout,
             is_sage_fp8,
-            use_sage_ldred_rowmax,
             "tvm_ffi_env_stream_v1",
         ),
         (
@@ -2664,7 +2637,6 @@ def _bsa_attn_fwd_sm100_blk64(
             use_clc_scheduler=use_clc_scheduler,
             use_int64_kv_strides=use_exact_kv_layout,
             block_sizes_mode=block_sizes_mode,
-            use_sage_ldred_rowmax=use_sage_ldred_rowmax,
         )
         aot_runtime_tensors = (
             q_bhsd,
@@ -2733,7 +2705,6 @@ def _bsa_attn_fwd_sm100_blk64(
             has_block_sizes=has_block_sizes,
             block_sizes_mode=block_sizes_mode,
             num_splits=kv_splits_i,
-            use_sage_ldred_rowmax=use_sage_ldred_rowmax,
             use_exact_kv_layout=use_exact_kv_layout,
         )
 
@@ -2788,7 +2759,6 @@ def _bsa_attn_fwd_sm100_blk64(
                         q_bhsd,
                         kv_splits_i,
                         block_sizes_mode,
-                        use_sage_ldred_rowmax,
                     )
                 ] = compiled_fn
             if compiled_fn is not None:
@@ -2851,7 +2821,6 @@ def _bsa_attn_fwd_sm100_blk64(
                 q_bhsd,
                 kv_splits_i,
                 block_sizes_mode,
-                use_sage_ldred_rowmax,
             )
             _bsa_fp8_blk64_aot_fast_cache[fast_key] = (
                 manifest_token,
@@ -3092,30 +3061,38 @@ def bsa_fp8_blk64_fwd(
     else:
         block_sizes = None
 
-    policy_topk = (
-        q2k_block_index.shape[-1] if has_block_nums else topk_num
+    num_sms = _get_device_num_sms(
+        q_fp8.device.index
+        if q_fp8.device.index is not None
+        else torch.cuda.current_device()
     )
+    policy_blocks = topk_num
+    if has_block_nums:
+        # Variable counts are usually far below the index width.  Splits are
+        # only considered when Q tiles cannot fill the GPU, so read the real
+        # per-tile maximum only then (the index width bounds it otherwise,
+        # including during stream capture).
+        policy_blocks = q2k_block_index.shape[-1]
+        if (
+            batch * heads * num_q_blocks < num_sms
+            and not is_fake_mode()
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            policy_blocks = int(q2k_block_nums.max())
     kv_splits = _sm100_blk64_auto_fp8_kv_splits(
-        policy_topk,
+        policy_blocks,
         heads,
         seqlen_q,
         batch,
+        num_sms,
     )
 
     # Q/K/V and scale metadata keep their true extents. The SM100 kernel itself
     # detects and masks its final physical KV block, matching SM120's contract.
-    use_sage_ldred_rowmax = _sm103_blk64_use_sage_fp8_ldred(
-        _get_device_arch(q_fp8.device),
-        batch,
-        heads,
-        seqlen_q,
-        kv_splits,
-    )
     fast_key = _bsa_fp8_blk64_fast_key(
         q_fp8,
         kv_splits,
         block_sizes_mode,
-        use_sage_ldred_rowmax,
     )
     aot_fast_entry = (
         None
@@ -3195,7 +3172,7 @@ def bsa_fp8_blk64_fwd(
         softmax_scale=softmax_scale,
         layout="bhsd",
         block_sparse_num=topk_num,
-        use_clc=False,
+        use_clc=kv_splits == 1,
         kv_splits=kv_splits,
         allow_empty_block_nums=has_block_nums,
         q_scale=q_scale,

@@ -256,7 +256,10 @@ def test_sm100_aot_default_matrix_is_deterministic_and_includes_fp8(capsys):
         2,
         3,
     }
-    assert all(not variant.use_clc_scheduler for variant in fp8_variants)
+    assert all(
+        variant.use_clc_scheduler == (variant.kv_splits == 1)
+        for variant in fp8_variants
+    )
     assert all(not variant.use_int64_kv_strides for variant in fp8_variants)
 
     assert (
@@ -271,8 +274,8 @@ def test_sm100_aot_default_matrix_is_deterministic_and_includes_fp8(capsys):
     )
     output = capsys.readouterr().out
     assert "Target: sm_100a" in output
-    assert "Main variants: 104" in output
-    assert "Dtype variants: bf16=72, fp8=32" in output
+    assert "Main variants: 112" in output
+    assert "Dtype variants: bf16=72, fp8=40" in output
     assert "Combine variants: 5" in output
 
     assert (
@@ -894,7 +897,7 @@ def test_sm100_aot_only_fp8_split_matches_reference(monkeypatch):
     not _RUNTIME_TEST_ENABLED or _DEVICE_ARCH != 103,
     reason="Set BSA_TEST_SM100_AOT_RUNTIME=1 and run on SM103",
 )
-def test_sm103_aot_only_fp8_ldred_matches_reference(monkeypatch):
+def test_sm103_aot_only_fp8_large_q_matches_reference(monkeypatch):
     artifact_root = os.getenv(SM100_AOT_DIR_ENV)
     assert artifact_root, f"{SM100_AOT_DIR_ENV} must be set"
     monkeypatch.setenv(SM100_AOT_ONLY_ENV, "1")

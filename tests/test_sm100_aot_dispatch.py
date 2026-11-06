@@ -276,6 +276,49 @@ def test_sm100_fp8_aot_hit_precedes_jit(monkeypatch, device_arch):
     assert out.dtype == torch.bfloat16
 
 
+@pytest.mark.parametrize("with_block_sizes", [False, True])
+def test_sm103_fp8_never_selects_ldred(monkeypatch, with_block_sizes):
+    captured = {}
+    monkeypatch.setattr(
+        bsa_attn_interface, "_get_device_arch", lambda _device=None: 103
+    )
+    monkeypatch.setattr(bsa_attn_interface, "is_sm100_aot_only", lambda: False)
+
+    def fake_get_aot(variant, arch, tensors):
+        captured["variant"] = variant
+        return object()
+
+    monkeypatch.setattr(bsa_attn_interface, "get_sm100_aot_kernel", fake_get_aot)
+    with FakeTensorMode():
+        heads, seqlen = 1, 512 * 64
+        q = torch.empty((1, heads, seqlen, 128), dtype=torch.float8_e4m3fn, device="cuda")
+        k = torch.empty((1, heads, 128, 128), dtype=torch.float8_e4m3fn, device="cuda")
+        v = torch.empty_like(k)
+        q_scale = torch.empty((1, heads, seqlen), dtype=torch.float32, device="cuda")
+        k_scale = torch.empty((1, heads, 8), dtype=torch.float32, device="cuda")
+        v_scale = torch.empty((heads, 128), dtype=torch.float32, device="cuda")
+        q2k = torch.empty((1, heads, 512, 2), dtype=torch.int32, device="cuda")
+        block_sizes = (
+            torch.empty((2,), dtype=torch.int32, device="cuda")
+            if with_block_sizes
+            else None
+        )
+        bsa_attn_interface._bsa_attn_fwd_sm100_blk64(
+            q,
+            k,
+            v,
+            q2k,
+            block_sizes,
+            block_sparse_num=2,
+            use_clc=True,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+
+    assert captured["variant"].use_sage_ldred_rowmax is False
+
+
 def test_sm100_aot_only_missing_fp8_never_uses_fast_cache_or_jit(monkeypatch):
     monkeypatch.setattr(
         bsa_attn_interface, "_get_device_arch", lambda _device=None: 100

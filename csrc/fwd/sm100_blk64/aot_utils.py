@@ -169,7 +169,7 @@ def iter_sm100_fp8_aot_variants(
     kv_splits_values: Iterable[int],
     use_sage_ldred_rowmax_values: Iterable[bool] = (False,),
 ) -> tuple[Sm100AotVariant, ...]:
-    """Build the static-scheduler variants used by the public FP8 API."""
+    """Build the variants used by the public FP8 API."""
     variants = set()
     for has_block_nums in has_block_nums_values:
         for block_sizes_mode in block_sizes_modes:
@@ -186,7 +186,8 @@ def iter_sm100_fp8_aot_variants(
                             ),
                             has_block_sizes=int(block_sizes_mode) != 0,
                             kv_splits=int(kv_splits),
-                            use_clc_scheduler=False,
+                            # Unsplit FP8 launches are persistent CLC kernels.
+                            use_clc_scheduler=int(kv_splits) == 1,
                             use_int64_kv_strides=False,
                             block_sizes_mode=int(block_sizes_mode),
                             use_sage_ldred_rowmax=bool(

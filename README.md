@@ -182,15 +182,16 @@ pair and invalidate that fast entry when the manifest identity changes.
   absent, `[N]`, `[B,N]`, or `[B,H,N]`
 - BF16 AOT supports static or CLC scheduling and 32-bit or 64-bit K/V stride
   lowering; BF16 K/V with a non-64-aligned length uses the 64-bit exact
-  sequence-layout variant; the public FP8 path uses its static scheduler and
-  native sequence layout
+  sequence-layout variant; the public FP8 path uses the persistent CLC
+  scheduler when unsplit, the static scheduler for split-KV, and its native
+  sequence layout
 - Exact split count from 1 through 256; the default BF16 matrix builds 1, 2, 4,
-  and 8, while the FP8 matrix builds the automatically selected 1, 4, 8, and 16
-- SM103 FP8 bundles contain both software and 16-token `ld.red` row-max variants
+  and 8, while the FP8 matrix builds the automatically selected 1, 2, 4, 8,
+  and 16
 - Build and deployment use the same locally installed CuTe DSL version
 - Matching build/runtime CUDA runtime version when both sides can detect it
 
-The default matrix contains 104 forward variants for SM100 and 112 for SM103,
+The default matrix contains 112 forward variants for each of SM100 and SM103,
 plus five deduplicated combine variants per target. Batch/head counts, sequence
 lengths, sparse-index capacity, active topK, and non-leading strides remain
 runtime dynamic. SM100/SM103 keep Q/K/V at their true extents. When K/V has a
@@ -226,7 +227,7 @@ runtime combination used in AOT-only mode must be present:
 
 ```bash
 make aot-sm100 \
-  SM100_AOT_ARGS='--dtypes fp8 --block-nums both --fp8-kv-splits 1,4,8,16 --fp8-block-sizes-modes 0,1,2,3 --fp8-ldred auto'
+  SM100_AOT_ARGS='--dtypes fp8 --block-nums both --fp8-kv-splits 1,2,4,8,16 --fp8-block-sizes-modes 0,1,2,3'
 
 # List one target's variants without compiling.
 python -m csrc.fwd.sm100_blk64.aot_build \
@@ -551,9 +552,17 @@ SM100/SM103 and SM120 keep the true Q/K/V sequence extents in their TMA
 descriptors. The final 64-token tile is zero-filled out of bounds and masked,
 so tail inputs do not require padded Q/K/V allocations or output trimming.
 
-For large, unsplit Sage FP8 workloads, SM103 uses the 16-value
-`tcgen05.ld.red.max` form for K-scale-aligned row maxima. Short or split-KV
-workloads retain the software reduction path selected by the measured policy.
+Unsplit SM100/SM103 FP8 calls reduce row maxima with a three-input max tree
+directly on the score registers. The SM103 16-value `tcgen05.ld.red.max` form is
+slower than that path and is not selected by the public API.
+
+The SM100/SM103 FP8 kernel runs one CTA per SM, so automatic split-KV only adds
+parallelism when the `B * H * ceil(Sq / 64)` Q tiles cannot fill the GPU. It
+then picks the largest power of two (at most 16) whose CTAs still fit on the
+SMs, keeping at least 8 sparse blocks per split (128 blocks for two splits);
+with `q2k_block_nums` the largest per-tile count is used (the index width while
+a CUDA graph is being captured). Otherwise the call is unsplit and runs on the
+persistent CLC scheduler.
 
 The native Sage mixed path uses the following quantization and physical-layout
 contract:
