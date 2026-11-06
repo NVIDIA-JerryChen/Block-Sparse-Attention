@@ -2209,6 +2209,40 @@ class BlockSparseAttnForwardSm100Blk64:
         return tile_block_indices[idx]
 
     @cute.jit
+    def update_sage_row_max(
+        self,
+        softmax: SoftmaxSm100,
+        scaled_group_max: cute.Tensor,
+        is_first: cutlass.Constexpr[bool],
+    ) -> Tuple[Float32, Float32]:
+        """SoftmaxSm100.update_row_max over the eight scaled K16 group maxima.
+
+        Same online update, but reduced with a three-input max tree directly
+        from registers.
+        """
+        m_a = utils.fmax(scaled_group_max[0], scaled_group_max[1], scaled_group_max[2])
+        m_b = utils.fmax(scaled_group_max[3], scaled_group_max[4], scaled_group_max[5])
+        if const_expr(is_first):
+            m_c = utils.fmax(scaled_group_max[6], scaled_group_max[7])
+            row_max_new = utils.fmax(m_a, m_b, m_c)
+            row_max = row_max_new if row_max_new != -Float32.inf else Float32(0.0)
+            acc_scale = Float32(0.0)
+        else:
+            row_max_old = softmax.row_max[0]
+            m_c = utils.fmax(scaled_group_max[6], scaled_group_max[7], row_max_old)
+            row_max_new = utils.fmax(m_a, m_b, m_c)
+            row_max = row_max_new if row_max_new != -Float32.inf else Float32(0.0)
+            acc_scale_ = (row_max_old - row_max) * softmax.scale_log2
+            acc_scale = cute.math.exp2(acc_scale_, fastmath=True)
+            if const_expr(softmax.rescale_threshold > 0.0):
+                if acc_scale_ >= -softmax.rescale_threshold:
+                    row_max_new = row_max_old
+                    row_max = row_max_old
+                    acc_scale = Float32(1.0)
+        softmax.row_max[0] = row_max_new
+        return row_max, acc_scale
+
+    @cute.jit
     def update_row_max_precomputed(
         self,
         softmax: SoftmaxSm100,
@@ -2353,8 +2387,14 @@ class BlockSparseAttnForwardSm100Blk64:
                     tSrS_t2r[c * 32 + j] = vals[j]
 
         tSrS_blocks = cute.logical_divide(tSrS_t2r, cute.make_layout(self.sparse_block_size))
-        bsa_fwd_helpers.apply_block_size_mask_64(tSrS_blocks[None, 0], block_size_lo)
-        bsa_fwd_helpers.apply_block_size_mask_64(tSrS_blocks[None, 1], block_size_hi)
+        if const_expr(self.is_sage_fp8):
+            # A branch inside the mask, combined with the packed group-max
+            # reads below, makes ptxas copy all scores at the join and spill.
+            bsa_fwd_helpers.apply_block_size_mask_64_select(tSrS_blocks[None, 0], block_size_lo)
+            bsa_fwd_helpers.apply_block_size_mask_64_select(tSrS_blocks[None, 1], block_size_hi)
+        else:
+            bsa_fwd_helpers.apply_block_size_mask_64(tSrS_blocks[None, 0], block_size_lo)
+            bsa_fwd_helpers.apply_block_size_mask_64(tSrS_blocks[None, 1], block_size_hi)
 
         if const_expr(self.is_sage_fp8):
             # Q has one scale per row.  K has one scale per 16 consecutive
@@ -2384,12 +2424,11 @@ class BlockSparseAttnForwardSm100Blk64:
                                 group_max * qk_scales[scale_idx]
                             )
                 else:
+                    # Reduce each 16-score group straight from registers.
                     for scale_idx in cutlass.range_constexpr(8):
-                        group_max = softmax._compute_row_max(
-                            tSrS_groups[None, scale_idx].load()
-                        )
                         scaled_group_max[scale_idx] = (
-                            group_max * qk_scales[scale_idx]
+                            bsa_fwd_helpers.max16_tree(tSrS_t2r, scale_idx * 16)
+                            * qk_scales[scale_idx]
                         )
             else:
                 qk_scales = cute.make_rmem_tensor((8,), Float32)
@@ -2421,9 +2460,14 @@ class BlockSparseAttnForwardSm100Blk64:
                             tSrS_groups[None, scale_idx].load()
                         )
                         scaled_group_max[scale_idx] = group_max * qk_scale
-            row_max, acc_scale = softmax.update_row_max(
-                scaled_group_max.load(), is_first
-            )
+            if const_expr(not self.is_split_kv):
+                row_max, acc_scale = self.update_sage_row_max(
+                    softmax, scaled_group_max, is_first
+                )
+            else:
+                row_max, acc_scale = softmax.update_row_max(
+                    scaled_group_max.load(), is_first
+                )
         else:
             if const_expr(use_ldred_rowmax):
                 full_blocks = (

@@ -12,6 +12,7 @@ from cutlass.cutlass_dsl import T
 from cutlass._mlir.dialects import llvm
 
 from block_sparse_attention.csrc.utils import mma_sm100_desc as sm100_desc
+from block_sparse_attention.csrc.utils.kernel_utils import fmax
 from block_sparse_attention.csrc.utils.tcgen05_mma_helpers import (
     _tcgen05_mma_kind,
     i64_to_i32x2,
@@ -340,6 +341,60 @@ def mask_f32x32_by_u32_branch(acc_s: cute.Tensor, mask: Uint32, base: cutlass.Co
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
     return tuple(Float32(llvm.extractvalue(T.f32(), out, [i])) for i in range(32))
+
+
+@cute.jit
+def mask_f32x32_by_u32_select(acc_s: cute.Tensor, mask: Uint32, base: cutlass.Constexpr[int]) -> Tuple[Float32, ...]:
+    """Set element i to -inf where bit i of mask is clear.
+
+    Unlike the branch form, every lane takes the same bit-test/select path, so
+    no control-flow join is created around the score registers.
+    """
+    mask_ops = "\n\t".join(
+        f"and.b32 tmp, $64, {hex(1 << i)};\n\t" "setp.eq.u32 p, tmp, 0;\n\t" f"selp.f32 ${i}, neg_inf, ${i}, p;" for i in range(32)
+    )
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 32),
+        [Float32(acc_s[base + i]).ir_value() for i in range(32)] + [Uint32(mask).ir_value()],
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        ".reg .u32 tmp;\n\t"
+        ".reg .f32 neg_inf;\n\t"
+        "mov.f32 neg_inf, 0fFF800000;\n\t"
+        f"{mask_ops}\n\t"
+        "}\n",
+        ",".join(["=f"] * 32 + [str(i) for i in range(32)] + ["r"]),
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(Float32(llvm.extractvalue(T.f32(), out, [i])) for i in range(32))
+
+
+@cute.jit
+def apply_block_size_mask_64_select(acc_s: cute.Tensor, block_size: Int32) -> None:
+    """Select-only variant of apply_block_size_mask_64 for the FP8 softmax."""
+    if block_size < 64:
+        for s in cutlass.range_constexpr(2):
+            shift = cutlass.max((s + 1) * 32 - block_size, 0)
+            mask = shr_u32(Uint32(0xFFFFFFFF), Uint32(shift))
+            if mask != Uint32(0xFFFFFFFF):
+                vals = mask_f32x32_by_u32_select(acc_s, mask, s * 32)
+                for i in cutlass.range_constexpr(32):
+                    acc_s[s * 32 + i] = vals[i]
+
+
+@cute.jit
+def max16_tree(v: cute.Tensor, base: cutlass.Constexpr[int]) -> Float32:
+    """Maximum of 16 consecutive register values with three-input max."""
+    a = fmax(v[base + 0], v[base + 1], v[base + 2])
+    b = fmax(v[base + 3], v[base + 4], v[base + 5])
+    c = fmax(v[base + 6], v[base + 7], v[base + 8])
+    d = fmax(v[base + 9], v[base + 10], v[base + 11])
+    e = fmax(v[base + 12], v[base + 13], v[base + 14])
+    f = fmax(a, b, c)
+    g = fmax(d, e, v[base + 15])
+    return fmax(f, g)
 
 
 @cute.jit
